@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Lance integration for Daft - compaction, indexing, merge columns, and REST operations"
 requires-python = ">=3.10"
 license = "Apache-2.0"
+readme = "README.md"
 dependencies = [
     "daft>=0.7.5",
     "pylance<0.40.0",
