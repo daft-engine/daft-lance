@@ -11,8 +11,13 @@ dependencies = [
 
 [project.optional-dependencies]
 rest = ["lance-namespace", "lance-namespace-urllib3-client"]
+
+[dependency-groups]
 dev = [
     "pytest",
     "packaging",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
