@@ -1,5 +1,6 @@
 # ruff: noqa: I002
-# isort: dont-add-import: from __future__ import annotations
+from __future__ import annotations
+
 import pathlib
 import warnings
 from typing import TYPE_CHECKING, Any, Optional, Union
