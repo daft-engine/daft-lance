@@ -17,6 +17,7 @@ rest = ["lance-namespace", "lance-namespace-urllib3-client"]
 dev = [
     "pytest",
     "packaging",
+    "pandas",
 ]
 
 [build-system]
