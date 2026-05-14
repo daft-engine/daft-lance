@@ -422,7 +422,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         point_column_set = set(point_columns)
 
         try:
-            indices = self._ds.list_indices()
+            indices = self._ds.describe_indices()
         except Exception:
             logger.warning("Unable to fetch Lance indices for dataset %s", self._ds.uri, exc_info=True)
             return False
@@ -434,13 +434,9 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         # Rationale: avoid partial/non-exact indices (e.g., bitmap/bloom) and Lance lacks composite-prefix semantics.
         btree_indexed_columns: set[str] = set()
         for index in indices:
-            index_type = str(getattr(index, "type", None) or "").upper()
-            if index_type != "BTREE":
+            if str(index.index_type or "").upper() != "BTREE":
                 continue
-            fields = getattr(index, "fields", None)
-            if not fields:
-                continue
-            for field in fields:
+            for field in index.field_names or ():
                 btree_indexed_columns.add(field)
         # Use index-driven scan only if every point-lookup column has a BTREE index.
         if point_column_set and point_column_set.issubset(btree_indexed_columns):

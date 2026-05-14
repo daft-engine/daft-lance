@@ -218,6 +218,10 @@ def create_scalar_index_internal(
     )
     removed_indices = []
     if replace:
+        # NOTE: kept on list_indices() until the distributed-index commit path is
+        # rewritten to populate index_details (e.g. via commit_existing_index_segments).
+        # describe_indices() raises on indices produced by this flow because their
+        # index_details field is empty.
         for idx_info_raw in lance_ds.list_indices():
             idx_info = cast(dict[str, Any], idx_info_raw)
             if idx_info["name"] == name:

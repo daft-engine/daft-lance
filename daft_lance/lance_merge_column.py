@@ -6,6 +6,7 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 import lance
+from lance.schema import LanceSchema
 
 import daft.pickle
 from daft import from_pylist
@@ -445,7 +446,7 @@ def _merge_fast_path(
         if frag.fragment_id not in enriched_frag_ids:
             fragment_metas.append(frag.metadata)
 
-    op = lance.LanceOperation.Merge(fragment_metas, new_schema)
+    op = lance.LanceOperation.Merge(fragment_metas, LanceSchema.from_pyarrow(new_schema))
     return lance.LanceDataset.commit(
         str(uri),
         op,
