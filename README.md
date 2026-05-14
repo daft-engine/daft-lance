@@ -1,17 +1,15 @@
 # daft-lance
 
-Lance integration for [Daft](https://github.com/Eventual-Inc/Daft). Provides distributed compaction, scalar indexing, column merging, and REST catalog operations for Lance datasets.
+Lance integration for [Daft](https://github.com/Eventual-Inc/Daft).
 
 ## Install
 
 ```
+# Install just the daft-lance extension
 pip install daft-lance
-```
 
-For REST catalog support:
-
-```
-pip install daft-lance[rest]
+# Install daft with the daft-lance extension
+pip install 'daft[lance]'
 ```
 
 ## Usage
@@ -40,13 +38,16 @@ from daft_lance import merge_columns_df
 merge_columns_df(df, "s3://bucket/my_dataset")
 ```
 
-### REST Catalog
+## Migration
 
-```python
-from daft_lance import LanceRestConfig, write_lance_rest
+The migration only requires replacing `daft.io.lance` with `daft_lance`.
 
-config = LanceRestConfig(base_url="https://api.lancedb.com", api_key="...")
-write_lance_rest(mp, config, namespace="default", table_name="my_table")
+```sh
+# See changes in current directory and all subdirectories
+find . -type f -name "*.py" -exec sed 's/daft\.io\.lance/daft_lance/g' {} +
+
+# Apply the changes
+find . -type f -name "*.py" -exec sed -i 's/daft\.io\.lance/daft_lance/g' {} +
 ```
 
 ## Development

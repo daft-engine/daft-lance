@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import daft
 from daft import execution_config_ctx, from_pylist
@@ -13,7 +13,8 @@ if TYPE_CHECKING:
 import lance
 
 from daft.dependencies import pa
-from daft_lance.utils import distribute_fragments_balanced
+
+from .utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,10 @@ class FragmentIndexHandler:
 
         self.lance_ds.create_scalar_index(
             column=self.column,
-            index_type=self.index_type,
+            index_type=self.index_type,  # type: ignore[arg-type]
             name=self.name,
             replace=self.replace,
-            fragment_uuid=self.fragment_uuid,
+            index_uuid=self.fragment_uuid,
             fragment_ids=fragment_ids,
             **self.kwargs,
         )
@@ -74,20 +75,13 @@ def create_scalar_index_internal(
 ) -> None:
     """Internal implementation of distributed scalar index creation.
 
-    INVERTED and BTREE use a 3-phase distributed workflow (fragment-parallel build,
-    merge_index_metadata, then commit). ``FTS`` is normalized to ``INVERTED`` (same Lance
-    index); see Lance Rust/Python bindings: ``INVERTED`` and ``FTS`` map to the same
-    inverted full-text index type.
+    Supports INVERTED, FTS, and BTREE index types and runs as a 3-phase workflow:
+    Phase 1: Fragment-parallel processing using Daft distributed execution
+    Phase 2: Index metadata merging
+    Phase 3: Atomic index creation and commit
     """
     if not column:
         raise ValueError("Column name cannot be empty")
-
-    index_type = index_type.upper()
-    if index_type == "FTS":
-        logger.info(
-            "index_type FTS maps to INVERTED for scalar index creation (equivalent Lance index type).",
-        )
-        index_type = "INVERTED"
 
     # Validate column exists and has correct type
     try:
@@ -102,9 +96,9 @@ def create_scalar_index_internal(
         value_type = field.type.value_type
 
     match index_type:
-        case "INVERTED":
+        case "INVERTED" | "FTS":
             if not pa.types.is_string(value_type) and not pa.types.is_large_string(value_type):
-                raise TypeError(f"Column {column} must be string type for INVERTED index, got {value_type}")
+                raise TypeError(f"Column {column} must be string type for INVERTED or FTS index, got {value_type}")
         case "BTREE":
             if (
                 not pa.types.is_integer(value_type)
@@ -114,12 +108,12 @@ def create_scalar_index_internal(
                 raise TypeError(f"Column {column} must be numeric or string type for BTREE index, got {value_type}")
         case _:
             logger.warning(
-                "Distributed indexing currently only supports 'INVERTED' and 'BTREE' index types, not '%s'. So we are falling back to single-threaded index creation.",
+                "Distributed indexing currently only supports 'INVERTED', 'FTS', and 'BTREE' index types, not '%s'. So we are falling back to single-threaded index creation.",
                 index_type,
             )
             lance_ds.create_scalar_index(
                 column=column,
-                index_type=index_type,
+                index_type=index_type,  # type: ignore[arg-type]
                 name=name,
                 replace=replace,
                 **kwargs,
@@ -133,11 +127,11 @@ def create_scalar_index_internal(
     if not replace:
         existing_indices = []
         try:
-            existing_indices = lance_ds.list_indices()
+            existing_indices = lance_ds.describe_indices()
         except Exception:
             # If we can't check existing indices, continue
             pass
-        existing_names = {idx["name"] for idx in existing_indices}
+        existing_names = {idx.name for idx in existing_indices}
         if name in existing_names:
             raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
 
@@ -215,9 +209,27 @@ def create_scalar_index_internal(
         fragment_ids=set(fragment_ids_to_use),
         index_version=0,
     )
+    removed_indices = []
+    if replace:
+        for idx_info_raw in lance_ds.list_indices():
+            idx_info = cast(dict[str, Any], idx_info_raw)
+            if idx_info["name"] == name:
+                field_ids = [lance_ds.schema.get_field_index(f) for f in idx_info["fields"]]
+                removed_indices.append(
+                    lance.Index(
+                        uuid=idx_info["uuid"],
+                        name=idx_info["name"],
+                        fields=field_ids,
+                        dataset_version=lance_ds.version,
+                        fragment_ids=idx_info["fragment_ids"],
+                        index_version=idx_info["version"],
+                        base_id=idx_info.get("base_id"),
+                    )
+                )
+
     create_index_op = lance.LanceOperation.CreateIndex(
         new_indices=[index],
-        removed_indices=[],
+        removed_indices=removed_indices,
     )
 
     # Commit the index operation atomically

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from lance.optimize import Compaction, CompactionMetrics, CompactionOptions, CompactionTask, RewriteResult
+from lance import LanceDataset
+from lance.optimize import (
+    Compaction,
+    CompactionMetrics,
+    CompactionOptions,
+    CompactionTask,
+    RewriteResult,
+)
 
-if TYPE_CHECKING:
-    import lance
 import daft
 
 logger = logging.getLogger(__name__)
@@ -17,7 +22,7 @@ class CompactionTaskUDF:
 
     def __init__(
         self,
-        lance_ds: lance.LanceDataset,
+        lance_ds: LanceDataset,
     ) -> None:
         self.lance_ds = lance_ds
 
@@ -27,7 +32,7 @@ class CompactionTaskUDF:
 
 
 def compact_files_internal(
-    lance_ds: lance.LanceDataset,
+    lance_ds: LanceDataset,
     *,
     compaction_options: dict[str, Any] | None = None,
     partition_num: int | None = None,
@@ -37,9 +42,7 @@ def compact_files_internal(
     logger.info("Starting UDF-style distributed compaction")
     plan = Compaction.plan(
         lance_ds,
-        CompactionOptions(
-            **(compaction_options or {}),
-        ),
+        CompactionOptions(**(compaction_options or {})),  # type: ignore[typeddict-item]
     )
     num_tasks = plan.num_tasks()
     logger.info("Compaction plan created with %d tasks", num_tasks)
