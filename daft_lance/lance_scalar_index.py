@@ -13,8 +13,7 @@ if TYPE_CHECKING:
 import lance
 
 from daft.dependencies import pa
-
-from .utils import distribute_fragments_balanced
+from daft_lance.utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
 

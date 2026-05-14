@@ -11,13 +11,14 @@ from lance.schema import LanceSchema
 import daft.pickle
 from daft import from_pylist
 from daft.datatype import DataType
-from daft.dependencies import pa
 from daft.udf import cls as daft_cls
 from daft.udf import method
 
 if TYPE_CHECKING:
     import pathlib
     from collections.abc import Callable
+
+    from daft.dependencies import pa
 
 
 _FRAGMENT_HANDLER_RETURN_DTYPE = DataType.struct({"fragment_meta": DataType.binary(), "schema": DataType.binary()})
@@ -125,6 +126,8 @@ class GroupFragmentMergeUDF:
 
     @method.batch(return_dtype=_FRAGMENT_HANDLER_RETURN_DTYPE)
     def __call__(self, *cols: Any) -> list[dict[str, bytes]]:
+        from daft.dependencies import pa as _pa
+
         if len(cols) == 0:
             return []
         # Last argument is the fragment_id series, preceding args are data columns as per read_columns
@@ -139,31 +142,31 @@ class GroupFragmentMergeUDF:
                 f"GroupFragmentMergeUDF expected {len(self.read_columns)} data columns, received {len(data_cols)}."
             )
 
-        arrays: list[pa.Array] = []
+        arrays: list[_pa.Array] = []
 
         for col_name, s in zip(self.read_columns, data_cols):
             pylist = s.to_pylist() if hasattr(s, "to_pylist") else list(s)
 
             if col_name == self.right_on:
-                key_arr: pa.Array
+                key_arr: _pa.Array
                 if self.right_on == "_rowaddr":
-                    key_arr = pa.array(pylist, type=pa.uint64())
+                    key_arr = _pa.array(pylist, type=_pa.uint64())
                 else:
                     pylist_int = [None if v is None else int(v) for v in pylist]
-                    key_arr = pa.array(pylist_int, type=pa.int64())
+                    key_arr = _pa.array(pylist_int, type=_pa.int64())
 
                 # Convert all arrays to a consistent type to avoid mypy errors
-                arrays.append(key_arr.cast(pa.int64()))
+                arrays.append(key_arr.cast(_pa.int64()))
             else:
-                arr = pa.array(pylist)
-                if pa.types.is_floating(arr.type):
+                arr = _pa.array(pylist)
+                if _pa.types.is_floating(arr.type):
                     arrays.append(arr)
-                elif pa.types.is_integer(arr.type):
-                    arrays.append(arr.cast(pa.int64()))
+                elif _pa.types.is_integer(arr.type):
+                    arrays.append(arr.cast(_pa.int64()))
                 else:
                     arrays.append(arr)
 
-        tbl = pa.Table.from_arrays(arrays, names=self.read_columns)
+        tbl = _pa.Table.from_arrays(arrays, names=self.read_columns)
 
         # Ensure the join key exists in the reader data
         if self.right_on not in tbl.schema.names:
@@ -176,15 +179,15 @@ class GroupFragmentMergeUDF:
         if join_idx != -1:
             join_field = tbl.schema.field(join_idx)
             # Use appropriate type based on the join key name
-            expected_type = pa.uint64() if self.right_on == "_rowaddr" else pa.int64()
+            expected_type = _pa.uint64() if self.right_on == "_rowaddr" else _pa.int64()
             if join_field.type != expected_type:
                 fields = []
                 for i, name in enumerate(tbl.schema.names):
                     if name == self.right_on:
-                        fields.append(pa.field(name, expected_type))
+                        fields.append(_pa.field(name, expected_type))
                     else:
                         fields.append(tbl.schema.field(i))
-                coerced_schema = pa.schema(fields)
+                coerced_schema = _pa.schema(fields)
                 tbl = tbl.cast(coerced_schema)
 
         # Enforce that reader stream contains only join key + new columns (exclude existing dataset fields)
@@ -214,7 +217,7 @@ class GroupFragmentMergeUDF:
 
         # Build RecordBatchReader from table batches
         batches = tbl.to_batches(max_chunksize=self.batch_size) if self.batch_size is not None else tbl.to_batches()
-        reader = pa.RecordBatchReader.from_batches(tbl.schema, batches)
+        reader = _pa.RecordBatchReader.from_batches(tbl.schema, batches)
 
         fragment = self.lance_ds.get_fragment(frag_id)
         if fragment is None:
@@ -251,6 +254,8 @@ class FastPathFragmentWriter:
         from lance.file import LanceFileWriter
         from lance.fragment import FragmentMetadata
 
+        from daft.dependencies import pa as _pa
+
         if len(cols) == 0:
             return []
 
@@ -265,13 +270,13 @@ class FastPathFragmentWriter:
         # Build table of new columns
         arrays = []
         for s in data_cols:
-            arr = pa.array(s.to_pylist() if hasattr(s, "to_pylist") else list(s))
+            arr = _pa.array(s.to_pylist() if hasattr(s, "to_pylist") else list(s))
             arrays.append(arr)
-        tbl = pa.table({name: arr for name, arr in zip(self.new_column_names, arrays)})
+        tbl = _pa.table({name: arr for name, arr in zip(self.new_column_names, arrays)})
 
         # Sort by _rowaddr to restore positional order
-        sort_indices = pa.compute.sort_indices(
-            pa.table({"_rowaddr": pa.array(rowaddrs, type=pa.uint64())}),
+        sort_indices = _pa.compute.sort_indices(
+            _pa.table({"_rowaddr": _pa.array(rowaddrs, type=_pa.uint64())}),
             sort_keys=[("_rowaddr", "ascending")],
         )
         tbl = tbl.take(sort_indices)
@@ -321,7 +326,7 @@ class FastPathFragmentWriter:
         new_schema = self.lance_ds.schema
         for col_name in self.new_column_names:
             col_idx = tbl.schema.get_field_index(col_name)
-            new_schema = new_schema.append(pa.field(col_name, tbl.schema.field(col_idx).type))
+            new_schema = new_schema.append(_pa.field(col_name, tbl.schema.field(col_idx).type))
 
         return [{"fragment_meta": daft.pickle.dumps(new_frag_meta), "schema": daft.pickle.dumps(new_schema)}]
 
@@ -391,20 +396,22 @@ def merge_columns_from_df(
         read_columns = [join_key] + new_cols
 
     # Decide: fast path (raw file write) or slow path (keyed join)
-    if _can_use_fast_path(df, lance_ds, join_key):
-        return _merge_fast_path(df, lance_ds, uri, new_cols, storage_options=storage_options)
+    use_fast_path = _can_use_fast_path(df, lance_ds, join_key)
 
-    return _merge_slow_path(
-        df,
-        lance_ds,
-        uri,
-        read_columns,
-        left_on,
-        right_on,
-        reader_schema,
-        batch_size,
-        storage_options=storage_options,
-    )
+    if use_fast_path:
+        return _merge_fast_path(df, lance_ds, uri, new_cols, storage_options=storage_options)
+    else:
+        return _merge_slow_path(
+            df,
+            lance_ds,
+            uri,
+            read_columns,
+            left_on,
+            right_on,
+            reader_schema,
+            batch_size,
+            storage_options=storage_options,
+        )
 
 
 def _merge_fast_path(
@@ -466,6 +473,7 @@ def _merge_slow_path(
     batch_size: int | None,
     storage_options: dict[str, Any] | None = None,
 ) -> lance.LanceDataset:
+    """Original keyed-join merge path: rewrites fragment data."""
     handler_udf = GroupFragmentMergeUDF(
         lance_ds,
         left_on,
@@ -475,7 +483,6 @@ def _merge_slow_path(
         batch_size,
     )
 
-    # map_groups: pass data columns followed by fragment_id
     grouped = df.groupby("fragment_id").map_groups(
         handler_udf(*(df[c] for c in read_columns), df["fragment_id"]).alias("commit_message")  # type: ignore[attr-defined]
     )
@@ -486,14 +493,12 @@ def _merge_slow_path(
     for commit_message in commit_messages:
         fragment_meta = commit_message["fragment_meta"]
         schema = commit_message["schema"]
-        # Skip empty payloads (when there are no new columns to merge)
         if not fragment_meta or not schema:
             continue
         fragment_metas.append(daft.pickle.loads(fragment_meta))
         if new_schema is None:
             new_schema = daft.pickle.loads(schema)
             continue
-    # If there are no new columns to merge, we can return early
     if new_schema is None:
         return lance_ds
     op = lance.LanceOperation.Merge(fragment_metas, new_schema)

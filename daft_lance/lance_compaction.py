@@ -4,13 +4,7 @@ import logging
 from typing import Any
 
 from lance import LanceDataset
-from lance.optimize import (
-    Compaction,
-    CompactionMetrics,
-    CompactionOptions,
-    CompactionTask,
-    RewriteResult,
-)
+from lance.optimize import Compaction, CompactionMetrics, CompactionOptions, CompactionTask, RewriteResult
 
 import daft
 
@@ -42,7 +36,9 @@ def compact_files_internal(
     logger.info("Starting UDF-style distributed compaction")
     plan = Compaction.plan(
         lance_ds,
-        CompactionOptions(**(compaction_options or {})),  # type: ignore[typeddict-item]
+        CompactionOptions(
+            **(compaction_options or {}),  # type: ignore[typeddict-item]
+        ),
     )
     num_tasks = plan.num_tasks()
     logger.info("Compaction plan created with %d tasks", num_tasks)
