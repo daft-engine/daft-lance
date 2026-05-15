@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import uuid
-import warnings
 from typing import TYPE_CHECKING, Any
 
-import daft.pickle
+import lance
+from lance.schema import LanceSchema
 
-# mypy: disable-error-code="import-untyped"
+import daft.pickle
+from daft import from_pylist
 from daft.datatype import DataType
 from daft.udf import cls as daft_cls
 from daft.udf import method
@@ -16,8 +17,6 @@ from daft.udf import method
 if TYPE_CHECKING:
     import pathlib
     from collections.abc import Callable
-
-    import lance
 
     from daft.dependencies import pa
 
@@ -34,11 +33,6 @@ class FragmentHandler:
         read_columns: list[str] | None,
         reader_schema: pa.Schema | None = None,
     ):
-        warnings.warn(
-            "FragmentHandler is deprecated and will be removed in a future version.",
-            category=DeprecationWarning,
-            stacklevel=2,
-        )
         self.lance_ds = lance_ds
         self.transform = transform
         self.read_columns = read_columns
@@ -49,6 +43,8 @@ class FragmentHandler:
         results = []
         for fragment_id in fragment_ids:
             fragment = self.lance_ds.get_fragment(fragment_id)
+            if fragment is None:
+                raise ValueError(f"Fragment {fragment_id} not found in dataset")
             fragment_meta, schema = fragment.merge_columns(self.transform, self.read_columns, None, self.reader_schema)
             results.append({"fragment_meta": daft.pickle.dumps(fragment_meta), "schema": daft.pickle.dumps(schema)})
         return results
@@ -65,15 +61,6 @@ def merge_columns_internal(
     daft_remote_args: dict[str, Any] | None = None,
     concurrency: int | None = None,
 ) -> lance.LanceDataset:
-    warnings.warn(
-        "FragmentHandler is deprecated and will be removed in a future version.",
-        category=DeprecationWarning,
-        stacklevel=2,
-    )
-    import lance
-
-    from daft import from_pylist
-
     # NOTE: Legacy remote args (num_cpus/num_gpus/memory_bytes/batch_size) were
     # only used for resource hints on the old @udf path. The new daft.cls
     # interface does not expose these; functional behavior does not depend on
@@ -233,6 +220,8 @@ class GroupFragmentMergeUDF:
         reader = _pa.RecordBatchReader.from_batches(tbl.schema, batches)
 
         fragment = self.lance_ds.get_fragment(frag_id)
+        if fragment is None:
+            raise ValueError(f"Fragment {frag_id} not found in dataset")
         # Build schema argument: use the table's schema (including join key and new columns) unless an explicit reader_schema is provided
         schema_arg = tbl.schema if self.reader_schema is None else self.reader_schema
         fragment_meta, schema = fragment.merge(reader, left_on=self.left_on, right_on=self.right_on, schema=schema_arg)
@@ -292,26 +281,41 @@ class FastPathFragmentWriter:
         )
         tbl = tbl.take(sort_indices)
 
+        # Determine the existing file format version so the new file matches.
+        # Lance commit rejects fragments whose files mix major/minor versions.
+        fragment = self.lance_ds.get_fragment(frag_id)
+        if fragment is None:
+            raise ValueError(f"Fragment {frag_id} not found in dataset")
+        meta = dict(fragment.metadata.to_json())
+        existing_files = list(meta["files"])
+        if not existing_files:
+            raise ValueError(f"Fragment {frag_id} has no data files; cannot infer version for fast-path write")
+        file_major = int(existing_files[0]["file_major_version"])
+        file_minor = int(existing_files[0]["file_minor_version"])
+
         # Write raw .lance file with only new columns
         filename = uuid.uuid4().hex + ".lance"
         filepath = os.path.join(self.uri, "data", filename)
-        with LanceFileWriter(filepath, tbl.schema, storage_options=self.storage_options) as writer:
+        with LanceFileWriter(
+            filepath,
+            tbl.schema,
+            version=f"{file_major}.{file_minor}",
+            storage_options=self.storage_options,
+        ) as writer:
             for b in tbl.to_batches():
                 writer.write_batch(b)
         file_size = os.path.getsize(filepath)
 
         # Determine field IDs for the new columns
-        fragment = self.lance_ds.get_fragment(frag_id)
         next_fid = max(f.id() for f in self.lance_ds.lance_schema.fields()) + 1
 
         # Stitch new data file into fragment metadata
-        meta = dict(fragment.metadata.to_json())
         new_file_entry = {
             "path": filename,
             "fields": list(range(next_fid, next_fid + len(self.new_column_names))),
             "column_indices": list(range(len(self.new_column_names))),
-            "file_major_version": 2,
-            "file_minor_version": 0,
+            "file_major_version": file_major,
+            "file_minor_version": file_minor,
             "file_size_bytes": file_size,
             "base_id": None,
         }
@@ -357,8 +361,6 @@ def merge_columns_from_df(
     right_on: str | None = None,
     batch_size: int | None = 9223372036854775807,
 ) -> lance.LanceDataset:
-    import lance
-
     # Validate required keys
     if "fragment_id" not in df.column_names:
         raise ValueError("DataFrame must contain 'fragment_id' column for row-level merge workflow")
@@ -397,13 +399,18 @@ def merge_columns_from_df(
     use_fast_path = _can_use_fast_path(df, lance_ds, join_key)
 
     if use_fast_path:
-        return _merge_fast_path(
-            df, lance_ds, uri, new_cols, storage_options=storage_options
-        )
+        return _merge_fast_path(df, lance_ds, uri, new_cols, storage_options=storage_options)
     else:
         return _merge_slow_path(
-            df, lance_ds, uri, read_columns, left_on, right_on,
-            reader_schema, batch_size, storage_options=storage_options,
+            df,
+            lance_ds,
+            uri,
+            read_columns,
+            left_on,
+            right_on,
+            reader_schema,
+            batch_size,
+            storage_options=storage_options,
         )
 
 
@@ -415,11 +422,7 @@ def _merge_fast_path(
     storage_options: dict[str, Any] | None = None,
 ) -> lance.LanceDataset:
     """Metadata-only add_columns: write raw .lance files and stitch into fragment metadata."""
-    import lance
-
-    handler = FastPathFragmentWriter(
-        lance_ds, str(uri), new_column_names, storage_options=storage_options
-    )
+    handler = FastPathFragmentWriter(lance_ds, str(uri), new_column_names, storage_options=storage_options)
 
     grouped = df.groupby("fragment_id").map_groups(
         handler(*(df[c] for c in new_column_names), df["_rowaddr"], df["fragment_id"]).alias("commit_message")  # type: ignore[attr-defined]
@@ -427,7 +430,7 @@ def _merge_fast_path(
 
     commit_messages = grouped.collect().to_pydict()["commit_message"]
     new_schema = None
-    fragment_metas = []
+    fragment_metas: list[Any] = []
     enriched_frag_ids: set[int] = set()
 
     for commit_message in commit_messages:
@@ -437,7 +440,8 @@ def _merge_fast_path(
             continue
         fmeta = daft.pickle.loads(fragment_meta_bytes)
         fragment_metas.append(fmeta)
-        enriched_frag_ids.add(fmeta.id)
+        # pylance 6.0.0 FragmentMetadata exposes the id only via to_json()
+        enriched_frag_ids.add(int(fmeta.to_json()["id"]))
         if new_schema is None:
             new_schema = daft.pickle.loads(schema_bytes)
 
@@ -449,7 +453,7 @@ def _merge_fast_path(
         if frag.fragment_id not in enriched_frag_ids:
             fragment_metas.append(frag.metadata)
 
-    op = lance.LanceOperation.Merge(fragment_metas, new_schema)
+    op = lance.LanceOperation.Merge(fragment_metas, LanceSchema.from_pyarrow(new_schema))
     return lance.LanceDataset.commit(
         str(uri),
         op,
@@ -470,8 +474,6 @@ def _merge_slow_path(
     storage_options: dict[str, Any] | None = None,
 ) -> lance.LanceDataset:
     """Original keyed-join merge path: rewrites fragment data."""
-    import lance
-
     handler_udf = GroupFragmentMergeUDF(
         lance_ds,
         left_on,
@@ -491,14 +493,14 @@ def _merge_slow_path(
     for commit_message in commit_messages:
         fragment_meta = commit_message["fragment_meta"]
         schema = commit_message["schema"]
-        if fragment_meta is None or schema is None:
+        if not fragment_meta or not schema:
             continue
         fragment_metas.append(daft.pickle.loads(fragment_meta))
         if new_schema is None:
             new_schema = daft.pickle.loads(schema)
             continue
     if new_schema is None:
-        return
+        return lance_ds
     op = lance.LanceOperation.Merge(fragment_metas, new_schema)
     return lance_ds.commit(
         uri,

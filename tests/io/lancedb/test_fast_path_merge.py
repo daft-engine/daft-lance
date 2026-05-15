@@ -16,12 +16,12 @@ import pyarrow as pa
 import pytest
 
 import daft
-from daft_lance.merge import _can_use_fast_path, merge_columns_from_df
-
+from daft_lance.lance_merge_column import _can_use_fast_path, merge_columns_from_df
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="function")
 def ds_path(tmp_path_factory):
@@ -54,6 +54,7 @@ def file_md5(filepath: str) -> str:
 # ---------------------------------------------------------------------------
 # 1. Basic correctness
 # ---------------------------------------------------------------------------
+
 
 class TestBasicCorrectness:
     def test_fast_path_single_column_int(self, ds_path):
@@ -95,11 +96,14 @@ class TestBasicCorrectness:
         assert result["c"] == ["row_1", "row_2", "row_3"]
 
     def test_fast_path_multi_fragment(self, ds_path):
-        ds = create_dataset(ds_path, [
-            {"id": [1, 2, 3], "val": [10, 20, 30]},
-            {"id": [4, 5], "val": [40, 50]},
-            {"id": [6, 7], "val": [60, 70]},
-        ])
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [1, 2, 3], "val": [10, 20, 30]},
+                {"id": [4, 5], "val": [40, 50]},
+                {"id": [6, 7], "val": [60, 70]},
+            ],
+        )
         df = read_with_metadata(ds_path)
         df = df.with_column("score", daft.col("val").cast(daft.DataType.float64()) * 1.5)
         ds2 = merge_columns_from_df(df, ds, ds_path)
@@ -109,10 +113,13 @@ class TestBasicCorrectness:
         assert len(result["id"]) == 7
 
     def test_fast_path_computed_column(self, ds_path):
-        ds = create_dataset(ds_path, [
-            {"x": [10, 20], "y": [1, 2]},
-            {"x": [30, 40], "y": [3, 4]},
-        ])
+        ds = create_dataset(
+            ds_path,
+            [
+                {"x": [10, 20], "y": [1, 2]},
+                {"x": [30, 40], "y": [3, 4]},
+            ],
+        )
         df = read_with_metadata(ds_path)
         df = df.with_column("z", daft.col("x").cast(daft.DataType.int64()) + daft.col("y").cast(daft.DataType.int64()))
         ds2 = merge_columns_from_df(df, ds, ds_path)
@@ -124,6 +131,7 @@ class TestBasicCorrectness:
 # ---------------------------------------------------------------------------
 # 2. Fragment integrity
 # ---------------------------------------------------------------------------
+
 
 class TestFragmentIntegrity:
     def test_existing_columns_unchanged(self, ds_path):
@@ -141,10 +149,13 @@ class TestFragmentIntegrity:
         assert after["val"] == before["val"]
 
     def test_fragment_file_count(self, ds_path):
-        ds = create_dataset(ds_path, [
-            {"a": [1, 2]},
-            {"a": [3, 4]},
-        ])
+        ds = create_dataset(
+            ds_path,
+            [
+                {"a": [1, 2]},
+                {"a": [3, 4]},
+            ],
+        )
         df = read_with_metadata(ds_path)
         df = df.with_column("b", daft.lit(0))
         ds2 = merge_columns_from_df(df, ds, ds_path)
@@ -169,10 +180,13 @@ class TestFragmentIntegrity:
             assert file_md5(fpath) == old_hash, f"Original file {fname} was modified"
 
     def test_row_count_preserved(self, ds_path):
-        ds = create_dataset(ds_path, [
-            {"v": list(range(5))},
-            {"v": list(range(5, 8))},
-        ])
+        ds = create_dataset(
+            ds_path,
+            [
+                {"v": list(range(5))},
+                {"v": list(range(5, 8))},
+            ],
+        )
         original_count = ds.count_rows()
         per_frag_counts = [f.count_rows() for f in ds.get_fragments()]
 
@@ -200,6 +214,7 @@ class TestFragmentIntegrity:
 # 3. Row ordering
 # ---------------------------------------------------------------------------
 
+
 class TestRowOrdering:
     def test_rowaddr_sorting_restores_order(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2, 3, 4, 5], "val": [10, 20, 30, 40, 50]}])
@@ -211,11 +226,14 @@ class TestRowOrdering:
         assert result["doubled"] == [20, 40, 60, 80, 100]
 
     def test_multi_fragment_ordering(self, ds_path):
-        ds = create_dataset(ds_path, [
-            {"id": [1, 2, 3]},
-            {"id": [4, 5, 6]},
-            {"id": [7, 8, 9]},
-        ])
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [1, 2, 3]},
+                {"id": [4, 5, 6]},
+                {"id": [7, 8, 9]},
+            ],
+        )
         df = read_with_metadata(ds_path)
         df = df.with_column("neg", daft.col("id").cast(daft.DataType.int64()) * -1)
         ds2 = merge_columns_from_df(df, ds, ds_path)
@@ -227,6 +245,7 @@ class TestRowOrdering:
 # ---------------------------------------------------------------------------
 # 4. Auto-detection
 # ---------------------------------------------------------------------------
+
 
 class TestAutoDetection:
     def test_auto_detects_fast_path(self, ds_path):
@@ -270,9 +289,9 @@ class TestAutoDetection:
         assert _can_use_fast_path(df_no_addr, ds, "_rowaddr") is False
 
         # Without fragment_id → False
-        df_no_frag = daft.read_lance(
-            ds_path, default_scan_options={"with_row_address": True}
-        ).with_column("x", daft.lit(1))
+        df_no_frag = daft.read_lance(ds_path, default_scan_options={"with_row_address": True}).with_column(
+            "x", daft.lit(1)
+        )
         assert _can_use_fast_path(df_no_frag, ds, "_rowaddr") is False
 
         # Non-_rowaddr join key → False
@@ -282,6 +301,7 @@ class TestAutoDetection:
 # ---------------------------------------------------------------------------
 # 5. Multiple merges
 # ---------------------------------------------------------------------------
+
 
 class TestMultipleMerges:
     def test_two_sequential_merges(self, ds_path):
@@ -340,6 +360,7 @@ class TestMultipleMerges:
 # 6. Data types
 # ---------------------------------------------------------------------------
 
+
 class TestDataTypes:
     def test_type_int64(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
@@ -388,7 +409,8 @@ class TestDataTypes:
         # Create a column with nulls: even ids → null, odd ids → id value
         df = df.with_column(
             "maybe",
-            (daft.col("id").cast(daft.DataType.int64()) % 2 != 0).cast(daft.DataType.int64()) * daft.col("id").cast(daft.DataType.int64()),
+            (daft.col("id").cast(daft.DataType.int64()) % 2 != 0).cast(daft.DataType.int64())
+            * daft.col("id").cast(daft.DataType.int64()),
         )
         ds2 = merge_columns_from_df(df, ds, ds_path)
         result = ds2.to_table().sort_by("id").column("maybe").to_pylist()
@@ -399,6 +421,7 @@ class TestDataTypes:
 # ---------------------------------------------------------------------------
 # 7. Edge cases
 # ---------------------------------------------------------------------------
+
 
 class TestEdgeCases:
     def test_single_row_fragment(self, ds_path):
@@ -452,6 +475,7 @@ class TestEdgeCases:
 # 8. Fast vs slow comparison
 # ---------------------------------------------------------------------------
 
+
 class TestFastVsSlowComparison:
     def test_fast_vs_slow_identical_results(self, tmp_path_factory):
         fast_path = str(tmp_path_factory.mktemp("fast"))
@@ -470,15 +494,19 @@ class TestFastVsSlowComparison:
         ds_fast = merge_columns_from_df(df_fast, ds_fast, fast_path)
 
         # Slow path: read with fragment_id only, use business key
-        df_slow = daft.read_lance(slow_path, include_fragment_id=True,
-                                  default_scan_options={"with_row_address": True})
+        df_slow = daft.read_lance(slow_path, include_fragment_id=True, default_scan_options={"with_row_address": True})
         df_slow = df_slow.with_column("score", daft.col("val").cast(daft.DataType.float64()) * 2.5)
-        from daft_lance.merge import _merge_slow_path
+        from daft_lance.lance_merge_column import _merge_slow_path
+
         ds_slow = _merge_slow_path(
-            df_slow, ds_slow, slow_path,
+            df_slow,
+            ds_slow,
+            slow_path,
             read_columns=["_rowaddr", "score"],
-            left_on="_rowaddr", right_on="_rowaddr",
-            reader_schema=None, batch_size=None,
+            left_on="_rowaddr",
+            right_on="_rowaddr",
+            reader_schema=None,
+            batch_size=None,
             storage_options=None,
         )
 
@@ -494,12 +522,16 @@ class TestFastVsSlowComparison:
 # 9. Read-back integrity
 # ---------------------------------------------------------------------------
 
+
 class TestReadBackIntegrity:
     def test_read_after_merge_with_filter(self, ds_path):
-        ds = create_dataset(ds_path, [
-            {"id": [1, 2, 3], "val": [10, 20, 30]},
-            {"id": [4, 5], "val": [40, 50]},
-        ])
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [1, 2, 3], "val": [10, 20, 30]},
+                {"id": [4, 5], "val": [40, 50]},
+            ],
+        )
         df = read_with_metadata(ds_path)
         df = df.with_column("score", daft.col("val").cast(daft.DataType.int64()) * 2)
         merge_columns_from_df(df, ds, ds_path)
@@ -534,10 +566,13 @@ class TestReadBackIntegrity:
         assert result["name"] == ["a", "b", "c"]
 
     def test_scan_fragments_individually(self, ds_path):
-        ds = create_dataset(ds_path, [
-            {"id": [1, 2]},
-            {"id": [3, 4]},
-        ])
+        ds = create_dataset(
+            ds_path,
+            [
+                {"id": [1, 2]},
+                {"id": [3, 4]},
+            ],
+        )
         df = read_with_metadata(ds_path)
         df = df.with_column("doubled", daft.col("id").cast(daft.DataType.int64()) * 2)
         merge_columns_from_df(df, ds, ds_path)

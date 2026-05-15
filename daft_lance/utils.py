@@ -3,12 +3,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+import lance
+
+from daft.dependencies import pa
+from daft.logical.schema import Schema as DaftSchema
+
 if TYPE_CHECKING:
     import pathlib
-
-    import lance
-
-    from daft.dependencies import pa
 
 logger = logging.getLogger(__name__)
 
@@ -83,18 +84,11 @@ def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int
 
 def construct_lance_dataset(
     uri: str | pathlib.Path,
-    version: object | None = None,
+    version: int | str | None = None,
     storage_options: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> lance.LanceDataset:
     """Construct a Lance dataset with common options."""
-    try:
-        import lance
-    except ImportError as e:
-        raise ImportError(
-            "Unable to import the `lance` package, please ensure that Daft is installed with the lance extra dependency: `pip install daft[lance]`"
-        ) from e
-
     original_default_scan_options = kwargs.pop("default_scan_options", None)
     safe_default_scan_options = None
     if isinstance(original_default_scan_options, dict):
@@ -148,9 +142,6 @@ def ensure_arrow_schema(obj: Any) -> pa.Schema:
     Accepts pa.Schema directly, or objects with a `.schema` attribute (e.g., pa.Table, pa.RecordBatch).
     Falls back gracefully for Daft Schema objects.
     """
-    from daft.dependencies import pa
-    from daft.logical.schema import Schema as DaftSchema
-
     if isinstance(obj, pa.Schema):
         return obj
     # pa.Table / pa.RecordBatch
@@ -178,8 +169,6 @@ def select_required_columns(schema: pa.Schema, required_columns: list[str] | Non
 
     If required_columns is None, returns the original schema unchanged.
     """
-    from daft.dependencies import pa
-
     if required_columns is None:
         return schema
     missing = [c for c in required_columns if c not in schema.names]

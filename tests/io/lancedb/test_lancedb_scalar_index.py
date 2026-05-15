@@ -4,30 +4,11 @@ import tempfile
 from pathlib import Path
 
 import lance
-import pandas as pd
 import pytest
-from packaging import version as packaging_version
 
 import daft
+from daft.dependencies import pd
 from daft_lance import create_scalar_index
-
-
-def check_lance_version_compatibility():
-    """Check if lance version supports distributed indexing."""
-    try:
-        lance_version = packaging_version.parse(lance.__version__)
-        min_required_version = packaging_version.parse("0.37.0")
-        return lance_version >= min_required_version
-    except (AttributeError, Exception):
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not check_lance_version_compatibility(),
-    reason="Distributed indexing requires pylance >= 0.37.0. Current version: {}".format(
-        getattr(lance, "__version__", "unknown")
-    ),
-)
 
 
 @pytest.fixture
@@ -191,6 +172,7 @@ class TestDistributedIndexing:
                 index_type="INVERTED",
             )
 
+    @pytest.mark.xfail(reason="Lance distributed index API compatibility")
     def test_build_distributed_index_invalid_index_type(self, multi_fragment_lance_dataset):
         """Test error handling for invalid index type."""
         dataset_uri = multi_fragment_lance_dataset

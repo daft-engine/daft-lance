@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import daft
 from daft import execution_config_ctx, from_pylist
@@ -48,10 +48,10 @@ class FragmentIndexHandler:
 
         self.lance_ds.create_scalar_index(
             column=self.column,
-            index_type=self.index_type,
+            index_type=self.index_type,  # type: ignore[arg-type]
             name=self.name,
             replace=self.replace,
-            fragment_uuid=self.fragment_uuid,
+            index_uuid=self.fragment_uuid,
             fragment_ids=fragment_ids,
             **self.kwargs,
         )
@@ -119,7 +119,7 @@ def create_scalar_index_internal(
             )
             lance_ds.create_scalar_index(
                 column=column,
-                index_type=index_type,
+                index_type=index_type,  # type: ignore[arg-type]
                 name=name,
                 replace=replace,
                 **kwargs,
@@ -133,11 +133,11 @@ def create_scalar_index_internal(
     if not replace:
         existing_indices = []
         try:
-            existing_indices = lance_ds.list_indices()
+            existing_indices = lance_ds.describe_indices()
         except Exception:
             # If we can't check existing indices, continue
             pass
-        existing_names = {idx["name"] for idx in existing_indices}
+        existing_names = {idx.name for idx in existing_indices}
         if name in existing_names:
             raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
 
@@ -215,9 +215,31 @@ def create_scalar_index_internal(
         fragment_ids=set(fragment_ids_to_use),
         index_version=0,
     )
+    removed_indices = []
+    if replace:
+        # NOTE: kept on list_indices() until the distributed-index commit path is
+        # rewritten to populate index_details (e.g. via commit_existing_index_segments).
+        # describe_indices() raises on indices produced by this flow because their
+        # index_details field is empty.
+        for idx_info_raw in lance_ds.list_indices():
+            idx_info = cast(dict[str, Any], idx_info_raw)
+            if idx_info["name"] == name:
+                field_ids = [lance_ds.schema.get_field_index(f) for f in idx_info["fields"]]
+                removed_indices.append(
+                    lance.Index(
+                        uuid=idx_info["uuid"],
+                        name=idx_info["name"],
+                        fields=field_ids,
+                        dataset_version=lance_ds.version,
+                        fragment_ids=idx_info["fragment_ids"],
+                        index_version=idx_info["version"],
+                        base_id=idx_info.get("base_id"),
+                    )
+                )
+
     create_index_op = lance.LanceOperation.CreateIndex(
         new_indices=[index],
-        removed_indices=[],
+        removed_indices=removed_indices,
     )
 
     # Commit the index operation atomically
