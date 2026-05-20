@@ -13,8 +13,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+  "pandas",
   "pytest",
-  "pandas"
+  "daft"
 ]
 lint = [
   "ruff==0.15.1",

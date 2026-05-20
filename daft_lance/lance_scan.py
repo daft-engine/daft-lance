@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Literal
 
 import lance
+import lance.blob  # noqa: F401  # registers the "lance.blob.v2" pyarrow extension type
 
 from daft.context import get_context
 from daft.daft import CountMode, PyExpr, PyPartitionField, PyPushdowns, PyRecordBatch, ScanTask
@@ -32,6 +33,7 @@ def _lancedb_table_factory_function(
     limit: int | None = None,
     include_fragment_id: bool | None = False,
     nearest: dict[str, Any] | None = None,
+    blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"] | None = None,
 ) -> Iterator[PyRecordBatch]:
     if fragment_ids is not None and nearest is not None:
         raise ValueError(
@@ -59,7 +61,14 @@ def _lancedb_table_factory_function(
             if limit is not None:
                 fragment_limit = limit - rows_yielded
 
-            scanner = ds.scanner(fragments=[fragment], columns=cols or None, filter=filter, limit=fragment_limit)
+            scanner = ds.scanner(
+                fragments=[fragment],
+                columns=cols or None,
+                filter=filter,
+                limit=fragment_limit,
+                blob_handling=blob_handling,
+            )
+
             for rb in scanner.to_batches():
                 # If we have a limit, we may need to truncate this batch
                 if limit is not None:
@@ -82,7 +91,13 @@ def _lancedb_table_factory_function(
 
     # If fragment_ids is None, let Lance choose fragments via index; omit the fragments parameter.
     if fragment_ids is None:
-        scanner = ds.scanner(columns=required_columns, filter=filter, limit=limit, nearest=nearest)
+        scanner = ds.scanner(
+            columns=required_columns,
+            filter=filter,
+            limit=limit,
+            nearest=nearest,
+            blob_handling=blob_handling,
+        )
         return (RecordBatch.from_arrow_record_batches([rb], rb.schema)._recordbatch for rb in scanner.to_batches())
     else:
         fragments_raw = [ds.get_fragment(id) for id in (fragment_ids or [])]
@@ -110,18 +125,36 @@ def _lancedb_count_result_function(
     return (result_batch for _ in [1])
 
 
+def _is_lance_blob_field(field: pa.Field) -> bool:
+    md = field.metadata or {}
+    return md.get(b"lance-encoding:blob") == b"true" or md.get(b"ARROW:extension:name") == b"lance.blob.v2"
+
+
+def _materialize_blob_fields_in_schema(schema: pa.Schema) -> pa.Schema:
+    """Replace blob columns (V1 or V2) with plain `large_binary` for `blob_handling='all_binary'` output."""
+    new_fields = []
+    for field in schema:
+        if _is_lance_blob_field(field):
+            new_fields.append(pa.field(field.name, pa.large_binary(), nullable=field.nullable))
+        else:
+            new_fields.append(field)
+    return pa.schema(new_fields, metadata=schema.metadata)
+
+
 class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
     def __init__(
         self,
         ds: lance.LanceDataset,
         fragment_group_size: int | None = None,
         include_fragment_id: bool | None = False,
+        blob_handling: str | None = None,
     ):
         self._ds = ds
         self._pushed_filters: list[PyExpr] | None = None
         self._remaining_filters: list[PyExpr] | None = None
         self._fragment_group_size = fragment_group_size
         self._include_fragment_id = include_fragment_id
+        self._blob_handling = blob_handling
         self._enable_strict_filter_pushdown = get_context().daft_planning_config.enable_strict_filter_pushdown
         # Ensure Daft extension type is registered so PyArrow can deserialize it from Lance
         _ensure_registered_super_ext_type()
@@ -131,6 +164,9 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
             self._schema = Schema.from_pyarrow_schema(new_schema)
         else:
             self._schema = Schema.from_pyarrow_schema(base)
+
+        # if blob_handling == "all_binary":
+        #     base = _materialize_blob_fields_in_schema(base)
 
     def name(self) -> str:
         return "LanceDBScanOperator"
@@ -283,6 +319,10 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                     task_schema_pa = pa.schema(
                         [*task_schema_pa, pa.field("fragment_id", pa.int64())], metadata=task_schema_pa.metadata
                     )
+
+                # if self._blob_handling == "all_binary":
+                #     task_schema_pa = _materialize_blob_fields_in_schema(task_schema_pa)
+
                 task_schema = Schema.from_pyarrow_schema(task_schema_pa)
                 yield ScanTask.python_factory_func_scan_task(
                     module=_lancedb_table_factory_function.__module__,
@@ -295,6 +335,8 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                         None,
                         rows_to_scan,
                         self._include_fragment_id,
+                        None,
+                        self._blob_handling,
                     ),
                     schema=task_schema._schema,
                     num_rows=rows_to_scan,
@@ -330,6 +372,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                     self._compute_limit_pushdown_with_filter(pushdowns),
                     self._include_fragment_id,
                     nearest_option,
+                    self._blob_handling,
                 ),
                 schema=self.schema()._schema,
                 num_rows=num_rows,
