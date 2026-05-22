@@ -92,15 +92,21 @@ def test_large_micropartition_writes_directly(schema, tmp_path):
     assert sum(r.rows_written for r in results) == 30
 
 
-def test_no_accumulation_when_param_missing(schema, tmp_path):
+def test_accumulation_default_batches_across_micropartitions(schema, tmp_path):
+    """Accumulation defaults batch across micropartitions.
+
+    With the new defaults, multiple small micropartitions accumulate into
+    a single write_fragments call (default max_rows_per_file=1_048_576).
+    """
     fake = FakeLanceModule()._bind()
 
     with patch("daft_lance.lance_data_sink.lance", fake):
         sink = LanceDataSink(uri=str(tmp_path / "tbl"), schema=schema, mode="create")
-        mps = [_make_mp(10), _make_mp(5)]
+        mps = [_make_mp(10), _make_mp(10), _make_mp(10)]
         results = list(sink.write(iter(mps)))
 
-    # Expect two separate writes corresponding to each micropartition
-    assert len(fake.calls) == 2
-    assert [t.num_rows for t in fake.calls] == [10, 5]
-    assert [r.rows_written for r in results] == [10, 5]
+    # All three small micropartitions accumulate into a single write under the
+    # default 1_048_576-row threshold.
+    assert len(fake.calls) == 1
+    assert fake.calls[0].num_rows == 30
+    assert sum(r.rows_written for r in results) == 30

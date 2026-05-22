@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pathlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import lance
 
@@ -42,7 +42,6 @@ def read_lance(
     fragment_group_size: int | None = None,
     include_fragment_id: bool | None = None,
     checkpoint: CheckpointConfig | None = None,
-    blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"] | None = None,
 ) -> DataFrame:
     """Create a DataFrame from a LanceDB table.
 
@@ -98,11 +97,6 @@ def read_lance(
         checkpoint: Optional :class:`daft.CheckpointConfig` for progress tracking across runs. Bundles the
             checkpoint store, the source key column (``on=``), and optional anti-join tuning. Rows whose key
             already exists in the store are skipped on re-run. Requires the Ray runner.
-        blob_handling: optional, Literal["all_binary", "blobs_descriptions", "all_descriptions"]
-            Controls how blob columns are returned, see: https://www.lancedb.com/blog/lance-blob-v2
-            - ``"all_binary"``: read blob columns as binary / large_binary values
-            - ``"blobs_descriptions"``: read blob columns as descriptions (default)
-            - ``"all_descriptions"``: read all binary columns as descriptions
 
     Returns:
         DataFrame: a DataFrame with the schema converted from the specified LanceDB table
@@ -157,7 +151,6 @@ def read_lance(
         ds,
         fragment_group_size=fragment_group_size,
         include_fragment_id=include_fragment_id,
-        blob_handling=blob_handling,
     )
 
     handle = ScanOperatorHandle.from_python_scan_operator(lance_operator)

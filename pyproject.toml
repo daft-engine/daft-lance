@@ -15,7 +15,9 @@ dependencies = [
 dev = [
   "pandas",
   "pytest",
-  "daft"
+  "pytest-benchmark",
+  "daft",
+  "pyarrow-stubs"
 ]
 lint = [
   "ruff==0.15.1",
