@@ -1,0 +1,240 @@
+{
+    "machine_info": {
+        "node": "M3.local",
+        "processor": "arm",
+        "machine": "arm64",
+        "python_compiler": "Clang 19.1.6 ",
+        "python_implementation": "CPython",
+        "python_implementation_version": "3.12.8",
+        "python_version": "3.12.8",
+        "python_build": [
+            "main",
+            "Jan  5 2025 06:55:30"
+        ],
+        "release": "24.6.0",
+        "system": "Darwin",
+        "cpu": {
+            "python_version": "3.12.8.final.0 (64 bit)",
+            "cpuinfo_version": [
+                9,
+                0,
+                0
+            ],
+            "cpuinfo_version_string": "9.0.0",
+            "arch": "ARM_8",
+            "bits": 64,
+            "count": 14,
+            "arch_string_raw": "arm64",
+            "brand_raw": "Apple M3 Max"
+        }
+    },
+    "commit_info": {
+        "id": "25c9352be62d2a60eb5caebc3ad300b36c6e8784",
+        "time": "2026-05-22T15:20:37-07:00",
+        "author_time": "2026-05-22T15:20:37-07:00",
+        "dirty": true,
+        "project": "daft-lance",
+        "branch": "rchowell/blob-v2"
+    },
+    "benchmarks": [
+        {
+            "group": null,
+            "name": "test_w4_10m_default_write",
+            "fullname": "tests/benchmarks/test_lance_data_sink_bench.py::test_w4_10m_default_write",
+            "params": null,
+            "param": null,
+            "extra_info": {
+                "n_fragments": 10,
+                "n_lance_files": 10,
+                "n_blob_files": 0,
+                "on_disk_bytes": 380498109,
+                "rows_written": 10000000,
+                "morsel_size": 131072,
+                "max_rows_per_file": null,
+                "data_storage_version": null,
+                "path": "daft"
+            },
+            "options": {
+                "disable_gc": false,
+                "timer": "perf_counter",
+                "min_rounds": 5,
+                "max_time": 1.0,
+                "min_time": 5e-06,
+                "warmup": false
+            },
+            "stats": {
+                "min": 0.7895280001685023,
+                "max": 0.7895280001685023,
+                "mean": 0.7895280001685023,
+                "stddev": 0,
+                "rounds": 1,
+                "median": 0.7895280001685023,
+                "iqr": 0.0,
+                "q1": 0.7895280001685023,
+                "q3": 0.7895280001685023,
+                "iqr_outliers": 0,
+                "stddev_outliers": 0,
+                "outliers": "0;0",
+                "ld15iqr": 0.7895280001685023,
+                "hd15iqr": 0.7895280001685023,
+                "ops": 1.2665795257249628,
+                "total": 0.7895280001685023,
+                "data": [
+                    0.7895280001685023
+                ],
+                "iterations": 1
+            }
+        },
+        {
+            "group": null,
+            "name": "test_w4_10m_chunked_write",
+            "fullname": "tests/benchmarks/test_lance_data_sink_bench.py::test_w4_10m_chunked_write",
+            "params": null,
+            "param": null,
+            "extra_info": {
+                "n_fragments": 80,
+                "n_lance_files": 80,
+                "n_blob_files": 0,
+                "on_disk_bytes": 380618804,
+                "rows_written": 10000000,
+                "morsel_size": 131072,
+                "max_rows_per_file": null,
+                "data_storage_version": null,
+                "path": "daft-chunked",
+                "n_chunks": 80
+            },
+            "options": {
+                "disable_gc": false,
+                "timer": "perf_counter",
+                "min_rounds": 5,
+                "max_time": 1.0,
+                "min_time": 5e-06,
+                "warmup": false
+            },
+            "stats": {
+                "min": 0.9837009999901056,
+                "max": 0.9837009999901056,
+                "mean": 0.9837009999901056,
+                "stddev": 0,
+                "rounds": 1,
+                "median": 0.9837009999901056,
+                "iqr": 0.0,
+                "q1": 0.9837009999901056,
+                "q3": 0.9837009999901056,
+                "iqr_outliers": 0,
+                "stddev_outliers": 0,
+                "outliers": "0;0",
+                "ld15iqr": 0.9837009999901056,
+                "hd15iqr": 0.9837009999901056,
+                "ops": 1.016569059104401,
+                "total": 0.9837009999901056,
+                "data": [
+                    0.9837009999901056
+                ],
+                "iterations": 1
+            }
+        },
+        {
+            "group": null,
+            "name": "test_w4_10m_lance_native",
+            "fullname": "tests/benchmarks/test_lance_data_sink_bench.py::test_w4_10m_lance_native",
+            "params": null,
+            "param": null,
+            "extra_info": {
+                "n_fragments": 10,
+                "n_lance_files": 10,
+                "n_blob_files": 0,
+                "on_disk_bytes": 340150785,
+                "rows_written": 10000000,
+                "morsel_size": 131072,
+                "max_rows_per_file": null,
+                "data_storage_version": null,
+                "path": "lance-native"
+            },
+            "options": {
+                "disable_gc": false,
+                "timer": "perf_counter",
+                "min_rounds": 5,
+                "max_time": 1.0,
+                "min_time": 5e-06,
+                "warmup": false
+            },
+            "stats": {
+                "min": 0.6352879591286182,
+                "max": 0.6352879591286182,
+                "mean": 0.6352879591286182,
+                "stddev": 0,
+                "rounds": 1,
+                "median": 0.6352879591286182,
+                "iqr": 0.0,
+                "q1": 0.6352879591286182,
+                "q3": 0.6352879591286182,
+                "iqr_outliers": 0,
+                "stddev_outliers": 0,
+                "outliers": "0;0",
+                "ld15iqr": 0.6352879591286182,
+                "hd15iqr": 0.6352879591286182,
+                "ops": 1.574089333239737,
+                "total": 0.6352879591286182,
+                "data": [
+                    0.6352879591286182
+                ],
+                "iterations": 1
+            }
+        },
+        {
+            "group": null,
+            "name": "test_r3_10m_full_scan",
+            "fullname": "tests/benchmarks/test_lance_data_sink_bench.py::test_r3_10m_full_scan",
+            "params": null,
+            "param": null,
+            "extra_info": {
+                "n_fragments": 10,
+                "n_lance_files": 10,
+                "n_blob_files": 0,
+                "on_disk_bytes": 380450045,
+                "rows_written": 10000000,
+                "morsel_size": 131072,
+                "max_rows_per_file": null,
+                "data_storage_version": null,
+                "path": "daft-read"
+            },
+            "options": {
+                "disable_gc": false,
+                "timer": "perf_counter",
+                "min_rounds": 5,
+                "max_time": 1.0,
+                "min_time": 5e-06,
+                "warmup": false
+            },
+            "stats": {
+                "min": 0.27845858270302415,
+                "max": 0.2983607919886708,
+                "mean": 0.28790723336860535,
+                "stddev": 0.007528035868805804,
+                "rounds": 5,
+                "median": 0.28744179103523493,
+                "iqr": 0.010564865195192397,
+                "q1": 0.28254811465740204,
+                "q3": 0.29311297985259444,
+                "iqr_outliers": 0,
+                "stddev_outliers": 2,
+                "outliers": "2;0",
+                "ld15iqr": 0.27845858270302415,
+                "hd15iqr": 0.2983607919886708,
+                "ops": 3.4733410074477282,
+                "total": 1.4395361668430269,
+                "data": [
+                    0.27845858270302415,
+                    0.283911291975528,
+                    0.2983607919886708,
+                    0.29136370914056897,
+                    0.28744179103523493
+                ],
+                "iterations": 1
+            }
+        }
+    ],
+    "datetime": "2026-05-22T22:30:18.746717+00:00",
+    "version": "5.2.3"
+}

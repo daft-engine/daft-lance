@@ -26,6 +26,12 @@ lint = [
   "mypy==1.19.1"
 ]
 
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+  "slow: long-running benchmarks (run with `-m slow` to include)",
+]
+
 [tool.mypy]
 files = ["daft_lance/**/*.py", "tests/**/*.py"]
 python_version = "3.10"
