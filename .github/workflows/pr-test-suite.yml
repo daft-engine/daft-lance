@@ -7,6 +7,26 @@ on:
     branches: [main]
 
 jobs:
+  style:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UV_PYTHON: "3.10"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: ${{ runner.os }}-python-${{ env.UV_PYTHON }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Run style checks
+        run: make precommit
+
   test:
     runs-on: ubuntu-latest
     strategy:

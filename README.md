@@ -95,9 +95,25 @@ df.write_lance("s3://bucket/my_dataset", blob_columns=["data"]).collect()
 
 Requires [uv](https://docs.astral.sh/uv/).
 
-```
-uv sync
-uv run pytest tests/ -v
+```sh
+# Sync the development environment
+make sync
+
+# Run tests
+make test
+
+# Run linting and type checks
+make lint
+make typecheck
+
+# Format code
+make format
+
+# Run all pre-commit hooks
+make precommit
+
+# Build sdist and wheel packages
+make build
 ```
 
 ## License

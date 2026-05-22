@@ -16,7 +16,7 @@ dev = [
   "pandas",
   "pytest",
   "pytest-benchmark",
-  "daft",
+  "daft>=0.7.0",
   "pyarrow-stubs"
 ]
 lint = [

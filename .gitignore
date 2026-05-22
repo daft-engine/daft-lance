@@ -12,3 +12,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# IDE
+.idea/
+
+# macOS
+.DS_Store
