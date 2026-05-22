@@ -46,8 +46,8 @@ def test_merge_evolution_rowaddr(lance_dataset_path):
         .select("_rowaddr", "fragment_id", "double_lat")
     )
 
-    # Merge mode column evolution by _rowaddr
-    df_subset.write_lance(lance_dataset_path, mode="merge")
+    # Merge column evolution by _rowaddr
+    daft_lance.merge_columns_df(df_subset, lance_dataset_path)
 
     # New column exists with correct values; row count unchanged
     df_after = daft.read_lance(lance_dataset_path)
@@ -98,7 +98,7 @@ def test_merge_evolution_business_key(lance_dataset_path):
     )
 
     # Merge by business key
-    df_subset.write_lance(lance_dataset_path, mode="merge", left_on="frame_key", right_on="frame_key")
+    daft_lance.merge_columns_df(df_subset, lance_dataset_path, left_on="frame_key", right_on="frame_key")
 
     df_after = daft.read_lance(lance_dataset_path)
     assert "double_frame_key" in df_after.column_names

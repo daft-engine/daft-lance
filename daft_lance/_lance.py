@@ -148,7 +148,9 @@ def read_lance(
     )
 
     lance_operator = LanceDBScanOperator(
-        ds, fragment_group_size=fragment_group_size, include_fragment_id=include_fragment_id
+        ds,
+        fragment_group_size=fragment_group_size,
+        include_fragment_id=include_fragment_id,
     )
 
     handle = ScanOperatorHandle.from_python_scan_operator(lance_operator)
