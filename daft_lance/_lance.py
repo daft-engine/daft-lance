@@ -42,6 +42,7 @@ def read_lance(
     fragment_group_size: int | None = None,
     include_fragment_id: bool | None = None,
     checkpoint: CheckpointConfig | None = None,
+    base_store_params: dict[str, dict[str, str]] | None = None,
 ) -> DataFrame:
     """Create a DataFrame from a LanceDB table.
 
@@ -97,6 +98,12 @@ def read_lance(
         checkpoint: Optional :class:`daft.CheckpointConfig` for progress tracking across runs. Bundles the
             checkpoint store, the source key column (``on=``), and optional anti-join tuning. Rows whose key
             already exists in the store are skipped on re-run. Requires the Ray runner.
+        base_store_params : optional, dict of str to dict
+            Runtime-only object store parameters keyed by base path URI. Each key
+            is a base path URI (e.g., "s3://bucket/path") and each value is a dict
+            of storage options (credentials, endpoint, etc.) for that base. These
+            are not persisted to the manifest. When a base has no explicit entry
+            here, the top-level ``storage_options`` is used as a fallback.
 
     Returns:
         DataFrame: a DataFrame with the schema converted from the specified LanceDB table
@@ -145,6 +152,7 @@ def read_lance(
         index_cache_size=index_cache_size,
         default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
+        base_store_params=base_store_params,
     )
 
     lance_operator = LanceDBScanOperator(
