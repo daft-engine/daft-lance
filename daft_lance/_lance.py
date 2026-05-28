@@ -551,3 +551,72 @@ def compact_files(
         partition_num=partition_num,
         concurrency=concurrency,
     )
+
+
+@PublicAPI
+def update_lance(
+    uri: str | pathlib.Path,
+    updates: dict[str, str],
+    *,
+    where: str | None = None,
+    io_config: IOConfig | None = None,
+) -> dict[str, int]:
+    """Update rows in a Lance dataset matching the given SQL predicate.
+
+    Args:
+        uri: The URI of the Lance dataset. Accepts a local path or an
+            object-store URI like ``"s3://bucket/path"``.
+        updates: Mapping of column names to SQL expressions,
+            e.g. ``{"age": "age + 1", "name": "'updated'"}``.
+        where: Optional SQL predicate indicating which rows to update,
+            e.g. ``"age > 30"``. If not provided, all rows are updated.
+        io_config: Optional IOConfig to use when accessing Lance data.
+
+    Returns:
+        dict with a ``"num_rows_updated"`` key.
+
+    Example:
+        >>> import daft_lance
+        >>> result = daft_lance.update_lance(
+        ...     "/path/to/dataset", updates={"age": "age + 1"}, where="age > 40"
+        ... )
+        >>> print(result["num_rows_updated"])
+
+    See Also:
+        `Lance docs — Updating rows <https://lance.org/guide/read_and_write/>`_
+    """
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    storage_options = io_config_to_storage_options(io_config, str(uri) if isinstance(uri, pathlib.Path) else uri)
+
+    dataset = lance.dataset(uri, storage_options=storage_options)
+    return dataset.update(updates, where=where)
+
+
+@PublicAPI
+def delete_from_lance(
+    uri: str | pathlib.Path,
+    where: str,
+    *,
+    io_config: IOConfig | None = None,
+) -> None:
+    """Delete rows from a Lance dataset matching the given SQL predicate.
+
+    Args:
+        uri: The URI of the Lance dataset. Accepts a local path or an
+            object-store URI like ``"s3://bucket/path"``.
+        where: SQL predicate indicating which rows to delete,
+            e.g. ``"name IS NULL"``.
+        io_config: Optional IOConfig to use when accessing Lance data.
+
+    Example:
+        >>> import daft_lance
+        >>> daft_lance.delete_from_lance("/path/to/dataset", where="name IS NULL")
+
+    See Also:
+        `Lance docs — Deleting rows <https://lance.org/guide/read_and_write/>`_
+    """
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    storage_options = io_config_to_storage_options(io_config, str(uri) if isinstance(uri, pathlib.Path) else uri)
+
+    dataset = lance.dataset(uri, storage_options=storage_options)
+    dataset.delete(where)
