@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any, cast
+
 import pyarrow as pa
 import pytest
 
@@ -26,7 +29,7 @@ def _scan(ds):
 @pytest.mark.parametrize(
     "idx_type",
     [
-        pytest.param("BTREE", marks=pytest.mark.xfail(reason="Lance BTREE point lookup detection issue")),
+        "BTREE",
         "BITMAP",
         "BLOOMFILTER",
     ],
@@ -46,7 +49,7 @@ def test_point_lookup_equal_hits_scalar_index(lance_dataset, idx_type):
 @pytest.mark.parametrize(
     "idx_type",
     [
-        pytest.param("BTREE", marks=pytest.mark.xfail(reason="Lance BTREE point lookup detection issue")),
+        "BTREE",
         "BITMAP",
         "BLOOMFILTER",
     ],
@@ -129,3 +132,42 @@ def test_to_scan_tasks_runs(lance_dataset, idx_type):
     # Ensure to_scan_tasks yields at least one task and the factory runs without error
     tasks = list(scan.to_scan_tasks(py_pushdowns))
     assert len(tasks) >= 1
+
+
+def test_point_lookup_uses_pushdown_filters(tmp_path: Path) -> None:
+    table = pa.table({"id": list(range(10)), "value": [f"value-{i}" for i in range(10)]})
+    ds: Any = lance.write_dataset(table, tmp_path, max_rows_per_file=1)
+    ds.create_scalar_index("id", "BTREE")
+
+    from daft.daft import PyPushdowns
+
+    scan = lance_scan.LanceDBScanOperator(ds)
+    py_pushdowns = PyPushdowns(columns=["id", "value"], filters=cast(Any, col("id") == 2)._expr, limit=5)
+
+    assert scan._should_use_index_for_point_lookup(py_pushdowns) is True
+    tasks = list(scan.to_scan_tasks(py_pushdowns))
+    assert len(tasks) == 1
+
+
+def test_point_lookup_skips_index_when_row_identity_requested(tmp_path: Path) -> None:
+    table = pa.table({"id": list(range(10)), "value": [f"value-{i}" for i in range(10)]})
+    ds: Any = lance.write_dataset(table, tmp_path, max_rows_per_file=1)
+    ds.create_scalar_index("id", "BTREE")
+    setattr(ds, "_daft_default_scan_options", {"with_row_id": True})
+
+    from daft.daft import PyPushdowns
+
+    scan = lance_scan.LanceDBScanOperator(ds)
+    py_pushdowns = PyPushdowns(columns=["id", "value"], filters=cast(Any, col("id") == 2)._expr, limit=5)
+
+    assert scan._should_use_index_for_point_lookup(py_pushdowns) is False
+
+
+def test_point_lookup_skips_index_when_fragment_id_requested(lance_dataset: Any) -> None:
+    ds = lance_dataset
+    ds.create_scalar_index("id", "BTREE")
+
+    scan = lance_scan.LanceDBScanOperator(ds, include_fragment_id=True)
+    scan.push_filters([cast(Any, col("id") == 2)._expr])
+
+    assert scan._should_use_index_for_point_lookup() is False
