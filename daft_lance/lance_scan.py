@@ -409,7 +409,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         return pushdowns.limit
 
     def _should_use_index_for_point_lookup(self) -> bool:
-        """Use index-driven scan only when all point-lookup columns have BTREE.
+        """Use index-driven scan only when all point-lookup columns have BTREE or ZONEMAP.
 
         Otherwise fall back to fragment enumeration. Passing fragment_ids=None signals
         index-driven scan; factory omits fragments so Lance selects them using indices.
@@ -439,16 +439,17 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         if not indices:
             return False
 
-        # Decision: point-lookup uses index only if each column in the predicate has a BTREE index.
+        # Decision: point-lookup uses index only if each column in the predicate has a BTREE or ZONEMAP index.
         # Rationale: avoid partial/non-exact indices (e.g., bitmap/bloom) and Lance lacks composite-prefix semantics.
-        btree_indexed_columns: set[str] = set()
+        scalar_indexed_columns: set[str] = set()
         for index in indices:
-            if str(index.index_type or "").upper() != "BTREE":
+            idx_type = str(index.index_type or "").upper()
+            if idx_type not in ("BTREE", "ZONEMAP"):
                 continue
             for field in index.field_names or ():
-                btree_indexed_columns.add(field)
-        # Use index-driven scan only if every point-lookup column has a BTREE index.
-        if point_column_set and point_column_set.issubset(btree_indexed_columns):
+                scalar_indexed_columns.add(field)
+        # Use index-driven scan only if every point-lookup column has a BTREE or ZONEMAP index.
+        if point_column_set and point_column_set.issubset(scalar_indexed_columns):
             return True
         return False
 

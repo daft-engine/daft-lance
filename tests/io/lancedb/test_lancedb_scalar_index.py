@@ -522,3 +522,77 @@ class TestDistributedIndexing:
         updated_dataset = lance.dataset(path)
         indices = updated_dataset.list_indices()
         assert len(indices) == 0, f"Expected no indices for empty dataset, got {len(indices)}"
+
+    def test_build_distributed_index_zonemap_type(self, temp_dir):
+        """Test building ZONEMAP index on numeric column (falls back to single-threaded)."""
+        data = {
+            "id": [1, 2, 3, 4, 5, 6, 7, 8],
+            "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
+            "name": ["item1", "item2", "item3", "item4", "item5", "item6", "item7", "item8"],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "zonemap_test.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        # ZONEMAP is not supported by merge_index_metadata, so it falls back
+        # to single-threaded creation via Lance's create_scalar_index.
+        create_scalar_index(
+            uri=path,
+            column="price",
+            index_type="ZONEMAP",
+            name="price_zonemap_index",
+        )
+
+        updated_dataset = lance.dataset(path)
+        indices = updated_dataset.list_indices()
+        assert len(indices) > 0, "No indices found after building"
+        index_names = [idx["name"] for idx in indices]
+        assert "price_zonemap_index" in index_names, f"ZONEMAP index not found in {index_names}"
+
+        # Test that we can query using the index
+        results = updated_dataset.scanner(
+            filter="price > 30.0",
+            columns=["id", "price", "name"],
+        ).to_table()
+        assert results.num_rows > 0, "No results found for ZONEMAP index query"
+
+    def test_build_distributed_index_zonemap_integer_column(self, temp_dir):
+        """Test building ZONEMAP index on integer column (falls back to single-threaded)."""
+        data = {
+            "id": [1, 2, 3, 4, 5, 6, 7, 8],
+            "score": [100, 200, 300, 400, 500, 600, 700, 800],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "zonemap_int_test.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        create_scalar_index(
+            uri=path,
+            column="score",
+            index_type="ZONEMAP",
+            name="score_zonemap_index",
+        )
+
+        updated_dataset = lance.dataset(path)
+        indices = updated_dataset.list_indices()
+        index_names = [idx["name"] for idx in indices]
+        assert "score_zonemap_index" in index_names, f"ZONEMAP index not found in {index_names}"
+
+    def test_build_distributed_index_zonemap_invalid_string_column(self, temp_dir):
+        """Test that ZONEMAP index rejects string columns via Lance."""
+        data = {
+            "id": [1, 2, 3, 4],
+            "text": ["a", "b", "c", "d"],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "zonemap_string_test.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        # ZONEMAP falls back to single-threaded Lance, which will reject
+        # unsupported column types at the Lance level.
+        with pytest.raises(Exception):
+            create_scalar_index(
+                uri=path,
+                column="text",
+                index_type="ZONEMAP",
+            )
