@@ -22,7 +22,6 @@ def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int
     if not fragments:
         return []
 
-    num_groups = max(1, len(fragments) // fragment_group_size)
     num_groups = max(1, (len(fragments) + fragment_group_size - 1) // fragment_group_size)
     # Get fragment information (ID and size)
     fragment_info = []
