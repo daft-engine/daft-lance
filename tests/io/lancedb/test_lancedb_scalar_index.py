@@ -596,3 +596,249 @@ class TestDistributedIndexing:
                 column="text",
                 index_type="ZONEMAP",
             )
+
+
+class TestSegmentedBTreeIndex:
+    """Test cases for segmented BTree index functionality."""
+
+    def test_segmented_btree_basic(self, temp_dir):
+        """Test basic segmented BTree index creation and query."""
+        data = {
+            "id": [1, 2, 3, 4, 5, 6, 7, 8],
+            "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
+            "name": ["item1", "item2", "item3", "item4", "item5", "item6", "item7", "item8"],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "segmented_btree_basic.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        create_scalar_index(
+            uri=path,
+            column="price",
+            index_type="BTREE",
+            name="price_seg_idx",
+            segmented=True,
+            max_concurrency=2,
+        )
+
+        updated_dataset = lance.dataset(path)
+
+        # describe_indices must work (the whole point of the segmented flow)
+        described = updated_dataset.describe_indices()
+        assert len(described) == 1
+        assert described[0].name == "price_seg_idx"
+        assert "BTree" in described[0].type_url
+
+        # Query must work
+        results = updated_dataset.scanner(
+            filter="price > 50.0",
+            columns=["id", "price"],
+        ).to_table()
+        assert results.num_rows == 4
+        prices = sorted(results.column("price").to_pylist())
+        assert prices == [50.5, 60.75, 70.0, 80.25]
+
+    def test_segmented_btree_multiple_segments(self, temp_dir):
+        """Test segmented BTree with small fragment_group_size to force multiple segments."""
+        data = {
+            "id": list(range(16)),
+            "score": [i * 10.0 for i in range(16)],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "segmented_btree_multi.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        create_scalar_index(
+            uri=path,
+            column="score",
+            index_type="BTREE",
+            name="score_seg_idx",
+            segmented=True,
+            fragment_group_size=2,
+            max_concurrency=2,
+        )
+
+        updated_dataset = lance.dataset(path)
+        described = updated_dataset.describe_indices()
+        assert len(described) == 1
+        assert len(described[0].segments) >= 2, "Expected multiple segments with fragment_group_size=2"
+
+        # Query must work across segment boundaries
+        results = updated_dataset.scanner(
+            filter="score >= 100.0",
+            columns=["id", "score"],
+        ).to_table()
+        assert results.num_rows == 6  # ids 10..15
+
+    def test_segmented_btree_describe_indices_works(self, temp_dir):
+        """Test that describe_indices returns valid details for segmented index.
+
+        This is the core regression that the segmented flow resolves: the legacy
+        partitioned-and-merged flow produces indices with empty index_details,
+        causing describe_indices() to fail.
+        """
+        data = {
+            "id": [1, 2, 3, 4],
+            "value": [100, 200, 300, 400],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "segmented_describe.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        create_scalar_index(
+            uri=path,
+            column="value",
+            index_type="BTREE",
+            name="value_idx",
+            segmented=True,
+        )
+
+        updated_dataset = lance.dataset(path)
+
+        # This must not raise — it would with the legacy flow.
+        described = updated_dataset.describe_indices()
+        assert len(described) == 1
+        desc = described[0]
+        assert desc.name == "value_idx"
+        assert desc.type_url == "/lance.table.BTreeIndexDetails"
+        assert desc.num_rows_indexed == 4
+
+    def test_segmented_btree_replace_existing(self, temp_dir):
+        """Test replacing an existing segmented BTree index."""
+        data = {
+            "id": [1, 2, 3, 4, 5, 6, 7, 8],
+            "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "segmented_btree_replace.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        # Create initial index
+        create_scalar_index(
+            uri=path,
+            column="price",
+            index_type="BTREE",
+            name="price_idx",
+            segmented=True,
+        )
+
+        ds1 = lance.dataset(path)
+        assert len(ds1.describe_indices()) == 1
+
+        # Replace it
+        create_scalar_index(
+            uri=path,
+            column="price",
+            index_type="BTREE",
+            name="price_idx",
+            segmented=True,
+            replace=True,
+        )
+
+        ds2 = lance.dataset(path)
+        described = ds2.describe_indices()
+        assert len(described) == 1
+        assert described[0].name == "price_idx"
+
+        # Query still works after replacement
+        results = ds2.scanner(filter="price > 50.0", columns=["id", "price"]).to_table()
+        assert results.num_rows == 4
+
+    def test_segmented_btree_string_column(self, temp_dir):
+        """Test segmented BTree index on a string column."""
+        import pyarrow as pa
+
+        # Explicitly use pa.string() (not large_string) to satisfy the BTREE type check.
+        table = pa.table(
+            {
+                "id": pa.array([1, 2, 3, 4], type=pa.int64()),
+                "category": pa.array(["alpha", "beta", "gamma", "delta"], type=pa.string()),
+            }
+        )
+        path = Path(temp_dir) / "segmented_btree_string.lance"
+        lance.write_dataset(table, str(path), max_rows_per_file=2)
+
+        create_scalar_index(
+            uri=path,
+            column="category",
+            index_type="BTREE",
+            name="cat_idx",
+            segmented=True,
+        )
+
+        updated_dataset = lance.dataset(path)
+        described = updated_dataset.describe_indices()
+        assert len(described) == 1
+        assert described[0].name == "cat_idx"
+        assert "BTree" in described[0].type_url
+
+    def test_segmented_btree_integer_column(self, temp_dir):
+        """Test segmented BTree index on an integer column."""
+        data = {
+            "id": [1, 2, 3, 4, 5, 6, 7, 8],
+            "count": [100, 200, 300, 400, 500, 600, 700, 800],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "segmented_btree_int.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        create_scalar_index(
+            uri=path,
+            column="count",
+            index_type="BTREE",
+            name="count_idx",
+            segmented=True,
+        )
+
+        updated_dataset = lance.dataset(path)
+        described = updated_dataset.describe_indices()
+        assert len(described) == 1
+        assert described[0].name == "count_idx"
+
+        results = updated_dataset.scanner(filter="count > 500", columns=["id", "count"]).to_table()
+        assert results.num_rows == 3  # 600, 700, 800
+
+    def test_segmented_false_uses_legacy_flow(self, temp_dir):
+        """Test that segmented=False still uses the legacy partitioned-and-merged flow."""
+        data = {
+            "id": [1, 2, 3, 4, 5, 6, 7, 8],
+            "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
+        }
+        dataset = daft.from_pydict(data)
+        path = Path(temp_dir) / "segmented_false.lance"
+        dataset.write_lance(uri=path, max_rows_per_file=2)
+
+        # segmented=False (default) should use the legacy flow
+        create_scalar_index(
+            uri=path,
+            column="price",
+            index_type="BTREE",
+            name="price_legacy_idx",
+            segmented=False,
+        )
+
+        updated_dataset = lance.dataset(path)
+        indices = updated_dataset.list_indices()
+        index_names = [idx["name"] for idx in indices]
+        assert "price_legacy_idx" in index_names
+
+    def test_segmented_inverted_falls_back_to_legacy(self, multi_fragment_lance_dataset):
+        """Test that segmented=True with INVERTED still uses the legacy flow.
+
+        The segmented workflow currently only supports BTREE.
+        """
+        dataset_uri = multi_fragment_lance_dataset
+
+        # segmented=True but INVERTED => legacy flow is used
+        create_scalar_index(
+            uri=dataset_uri,
+            column="text",
+            index_type="INVERTED",
+            name="text_inv_idx",
+            segmented=True,
+        )
+
+        updated_dataset = lance.dataset(dataset_uri)
+        indices = updated_dataset.list_indices()
+        index_names = [idx["name"] for idx in indices]
+        assert "text_inv_idx" in index_names
