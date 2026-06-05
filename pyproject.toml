@@ -1,6 +1,6 @@
 [project]
 name = "daft-lance"
-version = "0.3.3"
+version = "0.4.0"
 description = "Lance integration for Daft - compaction, indexing, merge columns, and REST operations"
 requires-python = ">=3.10"
 license = "Apache-2.0"
