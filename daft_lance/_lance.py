@@ -374,6 +374,7 @@ def create_scalar_index(
     fragment_group_size: int | None = None,
     num_partitions: int | None = None,
     max_concurrency: int | None = None,
+    segmented: bool = False,
     **kwargs: Any,
 ) -> None:
     """Build a distributed scalar index using Daft's distributed execution.
@@ -406,6 +407,11 @@ def create_scalar_index(
             greater than 1 enable additional parallelism on distributed runners; values <= 1 or None will use the default partitioning.
         max_concurrency: Maximum number of concurrent tasks to use for processing fragment batches.
             If None, Daft will use its default concurrency setting. Must be a positive integer.
+        segmented: If True and ``index_type`` is ``"BTREE"``, use the segmented index
+            workflow where each worker builds a fully independent index segment and the
+            coordinator commits them atomically via ``commit_existing_index_segments``.
+            This produces proper ``index_details`` metadata so ``describe_indices()``
+            works correctly.  Defaults to False (legacy partitioned-and-merged flow).
         **kwargs: Additional keyword arguments forwarded to ``lance.LanceDataset.create_scalar_index``.
 
     Returns:
@@ -434,6 +440,11 @@ def create_scalar_index(
         Create a BTREE index for numeric or string columns:
         >>> daft_lance.create_scalar_index(
         ...     "s3://my-bucket/dataset/", column="price", index_type="BTREE", name="price_idx"
+        ... )
+
+        Create a segmented BTREE index (supports describe_indices):
+        >>> daft_lance.create_scalar_index(
+        ...     "s3://my-bucket/dataset/", column="price", index_type="BTREE", segmented=True
         ... )
 
         Create an index with custom fragment grouping and partitioning:
@@ -470,6 +481,7 @@ def create_scalar_index(
         fragment_group_size=fragment_group_size,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
+        segmented=segmented,
         **kwargs,
     )
 
