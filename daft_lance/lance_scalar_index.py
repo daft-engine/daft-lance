@@ -98,7 +98,7 @@ class SegmentedFragmentIndexHandler:
 
         # _ds.create_index returns a lance.Index dataclass when fragment_ids
         # is provided (uncommitted segment mode).
-        index_meta: lance.Index = self.lance_ds._ds.create_index(  # type: ignore[call-arg, arg-type]
+        index_meta: lance.Index = self.lance_ds._ds.create_index(  # type: ignore[call-arg]
             [self.column],
             self.index_type,
             name=self.name,
