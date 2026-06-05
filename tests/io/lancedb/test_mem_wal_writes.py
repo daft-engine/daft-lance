@@ -31,9 +31,7 @@ class TestMemWalSinkConstruction:
 
     def test_use_mem_wal_flag(self, lance_dataset_path):
         schema = pa.schema([("id", pa.int64()), ("value", pa.float64())])
-        sink = LanceDataSink(
-            uri=lance_dataset_path, schema=schema, mode="create", use_mem_wal=True
-        )
+        sink = LanceDataSink(uri=lance_dataset_path, schema=schema, mode="create", use_mem_wal=True)
         assert sink._use_mem_wal is True
         assert sink._compact_after_write is True
 
@@ -125,9 +123,7 @@ class TestMemWalAppendPath:
 
 class TestMemWalDeterministicSharding:
     def test_each_micropartition_gets_unique_shard(self, lance_dataset_path):
-        df = daft.from_pydict(
-            {"id": list(range(100)), "value": [float(x) for x in range(100)]}
-        ).repartition(4)
+        df = daft.from_pydict({"id": list(range(100)), "value": [float(x) for x in range(100)]}).repartition(4)
         df.write_lance(
             lance_dataset_path,
             mode="create",
@@ -137,17 +133,11 @@ class TestMemWalDeterministicSharding:
 
         mem_wal_dir = os.path.join(lance_dataset_path, "_mem_wal")
         assert os.path.isdir(mem_wal_dir)
-        shard_dirs = [
-            d
-            for d in os.listdir(mem_wal_dir)
-            if os.path.isdir(os.path.join(mem_wal_dir, d))
-        ]
+        shard_dirs = [d for d in os.listdir(mem_wal_dir) if os.path.isdir(os.path.join(mem_wal_dir, d))]
         assert len(shard_dirs) >= 1
 
     def test_parallel_shards_no_contention(self, lance_dataset_path):
-        df = daft.from_pydict(
-            {"id": list(range(1000)), "value": [float(x) for x in range(1000)]}
-        ).repartition(8)
+        df = daft.from_pydict({"id": list(range(1000)), "value": [float(x) for x in range(1000)]}).repartition(8)
         result = df.write_lance(
             lance_dataset_path,
             mode="create",
@@ -161,9 +151,7 @@ class TestMemWalDeterministicSharding:
 class TestMemWalCompactAfterWrite:
     def test_compact_after_write_true(self, lance_dataset_path):
         df = daft.from_pydict(data_simple)
-        result = df.write_lance(
-            lance_dataset_path, mode="create", use_mem_wal=True, compact_after_write=True
-        )
+        result = df.write_lance(lance_dataset_path, mode="create", use_mem_wal=True, compact_after_write=True)
         stats = result.to_pydict()
         assert "num_fragments" in stats
         assert "version" in stats
@@ -216,9 +204,7 @@ class TestMemWalEnsureDataset:
     def test_ensure_creates_dataset_if_missing(self, lance_dataset_path):
         target = os.path.join(lance_dataset_path, "new_ds")
         schema = pa.schema([("a", pa.int64())])
-        sink = LanceDataSink(
-            uri=target, schema=schema, mode="create", use_mem_wal=True
-        )
+        sink = LanceDataSink(uri=target, schema=schema, mode="create", use_mem_wal=True)
         ds = sink._ensure_mem_wal_dataset()
         assert ds is not None
         assert ds.mem_wal_index_details() is not None
@@ -227,9 +213,7 @@ class TestMemWalEnsureDataset:
         schema = pa.schema([("a", pa.int64())])
         lance.write_dataset(pa.table({"a": [1]}, schema=schema), lance_dataset_path)
 
-        sink = LanceDataSink(
-            uri=lance_dataset_path, schema=schema, mode="append", use_mem_wal=True
-        )
+        sink = LanceDataSink(uri=lance_dataset_path, schema=schema, mode="append", use_mem_wal=True)
         ds = sink._ensure_mem_wal_dataset()
         assert ds is not None
         assert ds.mem_wal_index_details() is not None
@@ -241,9 +225,7 @@ class TestMemWalEnsureDataset:
         ds = lance.dataset(lance_dataset_path)
         ds.initialize_mem_wal(unsharded=True)
 
-        sink = LanceDataSink(
-            uri=lance_dataset_path, schema=schema, mode="append", use_mem_wal=True
-        )
+        sink = LanceDataSink(uri=lance_dataset_path, schema=schema, mode="append", use_mem_wal=True)
         ds2 = sink._ensure_mem_wal_dataset()
         assert ds2.mem_wal_index_details() is not None
 
@@ -253,9 +235,7 @@ class TestMemWalWriteResult:
         from daft.recordbatch import MicroPartition
 
         schema = pa.schema([("a", pa.int64())])
-        sink = LanceDataSink(
-            uri=lance_dataset_path, schema=schema, mode="create", use_mem_wal=True
-        )
+        sink = LanceDataSink(uri=lance_dataset_path, schema=schema, mode="create", use_mem_wal=True)
         mp = MicroPartition.from_pydict({"a": [1, 2, 3]})
         results = list(sink.write(iter([mp])))
         assert len(results) == 1
@@ -264,7 +244,6 @@ class TestMemWalWriteResult:
         assert results[0].bytes_written >= 0
 
     def test_finalize_mem_wal_returns_stats(self, lance_dataset_path):
-        from daft.io.sink import WriteResult
         from daft.recordbatch import MicroPartition
 
         schema = pa.schema([("a", pa.int64())])
@@ -294,9 +273,7 @@ class TestMemWalSchemaPreservation:
                 pa.field("str_col", pa.large_string()),
             ]
         )
-        df = daft.from_pydict(
-            {"int_col": [1, 2], "float_col": [1.5, 2.5], "str_col": ["a", "b"]}
-        )
+        df = daft.from_pydict({"int_col": [1, 2], "float_col": [1.5, 2.5], "str_col": ["a", "b"]})
         df.write_lance(
             lance_dataset_path,
             schema=schema,

@@ -246,8 +246,10 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         if ds is None:
             ds = lance.write_dataset(
-                pa.table({f.name: pa.array([], type=f.type) for f in self._effective_pyarrow_schema},
-                         schema=self._effective_pyarrow_schema),
+                pa.table(
+                    {f.name: pa.array([], type=f.type) for f in self._effective_pyarrow_schema},
+                    schema=self._effective_pyarrow_schema,
+                ),
                 self._table_uri,
                 mode="create",
                 storage_options=self._storage_options,
@@ -261,7 +263,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         return ds
 
-    def _write_arrow_table_mem_wal(self, table: pa.Table, ds: lance.LanceDataset) -> WriteResult[list[FragmentMetadata]]:
+    def _write_arrow_table_mem_wal(
+        self, table: pa.Table, ds: lance.LanceDataset
+    ) -> WriteResult[list[FragmentMetadata]]:
         shard_id = str(uuid.uuid4())
         with ds.mem_wal_writer(shard_id) as writer:
             writer.put(table)
@@ -299,7 +303,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if buffer.has_rows():
             yield self._write_arrow_table(buffer.drain())
 
-    def _write_mem_wal(self, micropartitions: Iterator[MicroPartition]) -> Iterator[WriteResult[list[FragmentMetadata]]]:
+    def _write_mem_wal(
+        self, micropartitions: Iterator[MicroPartition]
+    ) -> Iterator[WriteResult[list[FragmentMetadata]]]:
         ds = self._ensure_mem_wal_dataset()
         for micropartition in micropartitions:
             arrow_table = self._prepare_arrow_table(micropartition.to_arrow())
