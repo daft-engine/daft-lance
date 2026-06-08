@@ -23,7 +23,6 @@ from .utils import construct_lance_dataset
 
 if TYPE_CHECKING:
     import pyarrow.compute
-
     from lance.dataset import LanceDataset
     from lance.udf import BatchUDF
 
