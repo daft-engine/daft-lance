@@ -91,7 +91,7 @@ def construct_lance_dataset(
     original_default_scan_options = kwargs.pop("default_scan_options", None)
     safe_default_scan_options = None
     if isinstance(original_default_scan_options, dict):
-        safe_default_scan_options = {k: v for k, v in original_default_scan_options.items() if k != "nearest"}
+        safe_default_scan_options = {k: v for k, v in original_default_scan_options.items() if k not in ("nearest", "full_text_query")}
         if safe_default_scan_options:
             kwargs["default_scan_options"] = safe_default_scan_options
     elif original_default_scan_options is not None:
@@ -110,7 +110,7 @@ def construct_lance_dataset(
     except Exception:
         pass
 
-    # Preserve the full user-provided defaults (including nearest) for Daft's planning
+    # Preserve the full user-provided defaults (including nearest and full_text_query) for Daft's planning
     # even if we stripped keys out before calling `lance.dataset`.
     try:
         ds._daft_default_scan_options = original_default_scan_options

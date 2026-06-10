@@ -22,7 +22,7 @@ from .utils import combine_filters_to_arrow
 logger = logging.getLogger(__name__)
 
 
-# TODO support fts and fast_search
+# TODO support fast_search (ANN vector search speed optimization)
 def _lancedb_table_factory_function(
     ds_uri: str,
     open_kwargs: dict[Any, Any] | None = None,
@@ -32,6 +32,7 @@ def _lancedb_table_factory_function(
     limit: int | None = None,
     include_fragment_id: bool | None = False,
     nearest: dict[str, Any] | None = None,
+    full_text_query: str | dict[str, Any] | None = None,
 ) -> Iterator[PyRecordBatch]:
     if fragment_ids is not None and nearest is not None:
         raise ValueError(
@@ -64,6 +65,7 @@ def _lancedb_table_factory_function(
                 columns=cols or None,
                 filter=filter,
                 limit=fragment_limit,
+                full_text_query=full_text_query,
                 blob_handling="blobs_descriptions",
             )
 
@@ -94,6 +96,7 @@ def _lancedb_table_factory_function(
             filter=filter,
             limit=limit,
             nearest=nearest,
+            full_text_query=full_text_query,
             blob_handling="blobs_descriptions",
         )
 
@@ -141,6 +144,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         self._fragment_group_size = fragment_group_size
         self._include_fragment_id = include_fragment_id
         self._enable_strict_filter_pushdown = get_context().daft_planning_config.enable_strict_filter_pushdown
+        self._full_text_query = self._resolve_full_text_query()
         base = self._ds.schema
         if self._include_fragment_id:
             base = pa.schema([*base, pa.field("fragment_id", pa.int64())], metadata=base.metadata)
@@ -221,6 +225,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                 required_columns.append("fragment_id")
 
         nearest_option = self._nearest_default_option()
+        fts_option = self._full_text_query
 
         # Check if there is a count aggregation pushdown
         if (
@@ -234,19 +239,20 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                     "Count mode %s is not supported for pushdown, falling back to original logic",
                     pushdowns.aggregation_count_mode(),
                 )
-                yield from self._create_regular_scan_tasks(pushdowns, required_columns, nearest_option)
+                yield from self._create_regular_scan_tasks(pushdowns, required_columns, nearest_option, fts_option)
             else:
                 yield from self._create_count_rows_scan_task(pushdowns)
-        # Check if there is a limit pushdown and no filters and no nearest search
+        # Check if there is a limit pushdown and no filters and no nearest search and no fts
         elif (
             pushdowns.limit is not None
             and self._pushed_filters is None
             and pushdowns.filters is None
             and nearest_option is None
+            and fts_option is None
         ):
             yield from self._create_scan_tasks_with_limit_and_no_filters(pushdowns, required_columns)
         else:
-            yield from self._create_regular_scan_tasks(pushdowns, required_columns, nearest_option)
+            yield from self._create_regular_scan_tasks(pushdowns, required_columns, nearest_option, fts_option)
 
     def _create_count_rows_scan_task(self, pushdowns: PyPushdowns) -> Iterator[ScanTask]:
         """Create scan task for counting rows."""
@@ -304,6 +310,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                         rows_to_scan,
                         self._include_fragment_id,
                         None,
+                        None,
                     ),
                     schema=task_schema._schema,
                     num_rows=rows_to_scan,
@@ -314,7 +321,11 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                 )
 
     def _create_regular_scan_tasks(
-        self, pushdowns: PyPushdowns, required_columns: list[str] | None, nearest_option: dict[str, Any] | None = None
+        self,
+        pushdowns: PyPushdowns,
+        required_columns: list[str] | None,
+        nearest_option: dict[str, Any] | None = None,
+        full_text_query_option: str | dict[str, Any] | None = None,
     ) -> Iterator[ScanTask]:
         """Create regular scan tasks without count pushdown."""
         open_kwargs = getattr(self._ds, "_lance_open_kwargs", None)
@@ -339,6 +350,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                     self._compute_limit_pushdown_with_filter(pushdowns),
                     self._include_fragment_id,
                     nearest_option,
+                    full_text_query_option,
                 ),
                 schema=self.schema()._schema,
                 num_rows=num_rows,
@@ -348,8 +360,8 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                 source_name=self.display_name(),
             )
 
-        # Use index-driven scan for point lookups with BTREE indices or nearest search.
-        if self._should_use_index_for_point_lookup() or nearest_option is not None:
+        # Use index-driven scan for point lookups with BTREE indices, nearest search, or FTS.
+        if self._should_use_index_for_point_lookup() or nearest_option is not None or fts_option is not None:
             yield _python_factory_func_scan_task(fragment_ids=None, num_rows=None, size_bytes=None)
             return
 
@@ -479,6 +491,36 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
             )
             return None
         return nearest
+
+    def _resolve_full_text_query(self) -> str | dict[str, Any] | None:
+        """Return the full_text_query option configured on the Lance dataset, if any.
+
+        Extracts ``full_text_query`` from ``default_scan_options``, supporting both
+        ``_daft_default_scan_options`` and ``_default_scan_options`` dataset attributes.
+        ``full_text_query`` accepts a plain string (simple search term) or a dict with
+        ``columns`` and ``q`` (column-qualified search).
+        """
+        default_opts = getattr(self._ds, "_daft_default_scan_options", None)
+        if not isinstance(default_opts, dict):
+            default_opts = getattr(self._ds, "_default_scan_options", None)
+        if not isinstance(default_opts, dict):
+            open_kwargs = getattr(self._ds, "_lance_open_kwargs", None)
+            if isinstance(open_kwargs, dict):
+                default_opts = open_kwargs.get("default_scan_options")
+        if not isinstance(default_opts, dict):
+            return None
+
+        fts = default_opts.get("full_text_query")
+        if fts is None:
+            return None
+        if not isinstance(fts, (str, dict)):
+            logger.warning(
+                "Ignoring default_scan_options['full_text_query'] for dataset %s: expected str or dict, got %s",
+                getattr(self._ds, "uri", "<unknown>"),
+                type(fts).__name__,
+            )
+            return None
+        return fts
 
     @staticmethod
     def _estimate_size_bytes(fragment: lance.LanceFragment) -> int:
