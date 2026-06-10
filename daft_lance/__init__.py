@@ -7,16 +7,20 @@ from ._blob import take_blobs
 from ._lance import (
     compact_files,
     create_scalar_index,
+    delete_from_lance,
     merge_columns,
     merge_columns_df,
     read_lance,
+    update_lance,
 )
 
 __all__ = [
     "compact_files",
     "create_scalar_index",
+    "delete_from_lance",
     "merge_columns",
     "merge_columns_df",
     "read_lance",
     "take_blobs",
+    "update_lance",
 ]
