@@ -362,7 +362,7 @@ def create_scalar_index(
     column: str,
     index_type: str = "INVERTED",
     name: str | None = None,
-    replace: bool = True,
+    replace: bool = False,
     storage_options: dict[str, Any] | None = None,
     version: int | str | None = None,
     asof: str | None = None,
@@ -390,9 +390,14 @@ def create_scalar_index(
         index_type: Type of index to build.
             For distributed execution this supports "INVERTED", "FTS", and "BTREE".
             Other scalar index types supported by Lance (for example "BITMAP", "NGRAM", "ZONEMAP",
-            "LABEL_LIST", "BLOOMFILTER") are passed through to Lance's scalar index implementation.
+            "LABEL_LIST", "BLOOMFILTER") are passed directly to
+            ``LanceDataset.create_scalar_index(...)``.
         name: Name of the index (generated if None).
-        replace: Whether to replace an existing index with the same name. Defaults to True.
+        replace: Whether to replace an existing index with the same name. Defaults to False.
+            This is only supported by scalar index types that are passed directly to
+            ``LanceDataset.create_scalar_index(...)``. Distributed BTREE/INVERTED/FTS
+            indexes use Lance's public segmented-index commit API, which does not
+            currently expose atomic replacement, so existing index names are rejected.
         storage_options: Storage options for the dataset.
         version: Version of the dataset to use.
         asof: Timestamp to use for time travel queries.
@@ -407,11 +412,12 @@ def create_scalar_index(
             greater than 1 enable additional parallelism on distributed runners; values <= 1 or None will use the default partitioning.
         max_concurrency: Maximum number of concurrent tasks to use for processing fragment batches.
             If None, Daft will use its default concurrency setting. Must be a positive integer.
-        segmented: If True and ``index_type`` is ``"BTREE"``, use the segmented index
-            workflow where each worker builds a fully independent index segment and the
-            coordinator commits them atomically via ``commit_existing_index_segments``.
-            This produces proper ``index_details`` metadata so ``describe_indices()``
-            works correctly.  Defaults to False (legacy partitioned-and-merged flow).
+        segmented: If True, force the segmented index workflow where each worker builds
+            a fully independent index segment and the coordinator commits them via
+            ``commit_existing_index_segments``. Distributed ``"BTREE"``, ``"INVERTED"``,
+            and ``"FTS"`` indexes use this workflow by default; ``"FTS"`` is normalized
+            to Lance's inverted full-text index. Other scalar index types are passed
+            directly to ``LanceDataset.create_scalar_index(...)``.
         **kwargs: Additional keyword arguments forwarded to ``lance.LanceDataset.create_scalar_index``.
 
     Returns:
