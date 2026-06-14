@@ -106,6 +106,7 @@ class GroupFragmentMergeUDF:
         read_columns: list[str] | None = None,
         reader_schema: pa.Schema | None = None,
         batch_size: int | None = 9223372036854775807,
+        blob_columns: list[str] | None = None,
     ):
         """Per-group merge handler that directly invokes Lance fragment.merge with keyed join.
 
@@ -123,6 +124,7 @@ class GroupFragmentMergeUDF:
         self.read_columns = read_columns or []
         self.reader_schema = reader_schema
         self.batch_size = batch_size
+        self.blob_columns = set(blob_columns or [])
 
     @method.batch(return_dtype=_FRAGMENT_HANDLER_RETURN_DTYPE)
     def __call__(self, *cols: Any) -> list[dict[str, bytes]]:
@@ -158,7 +160,7 @@ class GroupFragmentMergeUDF:
                 # Convert all arrays to a consistent type to avoid mypy errors
                 arrays.append(key_arr.cast(_pa.int64()))
             else:
-                arr = _pa.array(pylist)
+                arr = lance.blob_array(pylist) if col_name in self.blob_columns else _pa.array(pylist)
                 if _pa.types.is_floating(arr.type):
                     arrays.append(arr)
                 elif _pa.types.is_integer(arr.type):
@@ -243,11 +245,13 @@ class FastPathFragmentWriter:
         uri: str,
         new_column_names: list[str],
         storage_options: dict[str, str] | None = None,
+        blob_columns: list[str] | None = None,
     ):
         self.lance_ds = lance_ds
         self.uri = str(uri)
         self.new_column_names = new_column_names
         self.storage_options = storage_options
+        self.blob_columns = set(blob_columns or [])
 
     @method.batch(return_dtype=_FRAGMENT_HANDLER_RETURN_DTYPE)
     def __call__(self, *cols: Any) -> list[dict[str, bytes]]:
@@ -269,8 +273,9 @@ class FastPathFragmentWriter:
 
         # Build table of new columns
         arrays = []
-        for s in data_cols:
-            arr = _pa.array(s.to_pylist() if hasattr(s, "to_pylist") else list(s))
+        for col_name, s in zip(self.new_column_names, data_cols):
+            pylist = s.to_pylist() if hasattr(s, "to_pylist") else list(s)
+            arr = lance.blob_array(pylist) if col_name in self.blob_columns else _pa.array(pylist)
             arrays.append(arr)
         tbl = _pa.table({name: arr for name, arr in zip(self.new_column_names, arrays)})
 
@@ -360,6 +365,7 @@ def merge_columns_from_df(
     left_on: str | None = "_rowaddr",
     right_on: str | None = None,
     batch_size: int | None = 9223372036854775807,
+    blob_columns: list[str] | None = None,
 ) -> lance.LanceDataset:
     # Validate required keys
     if "fragment_id" not in df.column_names:
@@ -396,10 +402,10 @@ def merge_columns_from_df(
         read_columns = [join_key] + new_cols
 
     # Decide: fast path (raw file write) or slow path (keyed join)
-    use_fast_path = _can_use_fast_path(df, lance_ds, join_key)
+    use_fast_path = _can_use_fast_path(df, lance_ds, join_key) and not blob_columns
 
     if use_fast_path:
-        return _merge_fast_path(df, lance_ds, uri, new_cols, storage_options=storage_options)
+        return _merge_fast_path(df, lance_ds, uri, new_cols, storage_options=storage_options, blob_columns=blob_columns)
     else:
         return _merge_slow_path(
             df,
@@ -411,6 +417,7 @@ def merge_columns_from_df(
             reader_schema,
             batch_size,
             storage_options=storage_options,
+            blob_columns=blob_columns,
         )
 
 
@@ -420,9 +427,16 @@ def _merge_fast_path(
     uri: str | pathlib.Path,
     new_column_names: list[str],
     storage_options: dict[str, Any] | None = None,
+    blob_columns: list[str] | None = None,
 ) -> lance.LanceDataset:
     """Metadata-only add_columns: write raw .lance files and stitch into fragment metadata."""
-    handler = FastPathFragmentWriter(lance_ds, str(uri), new_column_names, storage_options=storage_options)
+    handler = FastPathFragmentWriter(
+        lance_ds,
+        str(uri),
+        new_column_names,
+        storage_options=storage_options,
+        blob_columns=blob_columns,
+    )
 
     grouped = df.groupby("fragment_id").map_groups(
         handler(*(df[c] for c in new_column_names), df["_rowaddr"], df["fragment_id"]).alias("commit_message")  # type: ignore[attr-defined]
@@ -472,6 +486,7 @@ def _merge_slow_path(
     reader_schema: pa.Schema | None,
     batch_size: int | None,
     storage_options: dict[str, Any] | None = None,
+    blob_columns: list[str] | None = None,
 ) -> lance.LanceDataset:
     """Original keyed-join merge path: rewrites fragment data."""
     handler_udf = GroupFragmentMergeUDF(
@@ -481,6 +496,7 @@ def _merge_slow_path(
         read_columns,
         reader_schema,
         batch_size,
+        blob_columns,
     )
 
     grouped = df.groupby("fragment_id").map_groups(

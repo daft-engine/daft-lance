@@ -270,6 +270,7 @@ def merge_columns_df(
     batch_size: int | None = None,
     left_on: str | None = "_rowaddr",
     right_on: str | None = "_rowaddr",
+    blob_columns: list[str] | None = None,
 ) -> Any:
     """Row-level merge columns entrypoint using a DataFrame.
 
@@ -351,6 +352,7 @@ def merge_columns_df(
         left_on=left_on,
         right_on=effective_right_on,
         batch_size=effective_batch_size,
+        blob_columns=blob_columns,
     )
 
 
