@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import tempfile
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 import daft
 from daft.dependencies import pd
 from daft_lance import create_scalar_index
+from daft_lance.lance_scalar_index import SegmentedFragmentIndexHandler, _prepare_index_segments_for_commit
 
 
 @pytest.fixture
@@ -88,19 +90,12 @@ class TestDistributedIndexing:
         )
         updated_dataset = lance.dataset(dataset_uri)
 
-        # Verify the index was created
-        indices = updated_dataset.list_indices()
-        assert len(indices) > 0, "No indices found after building"
-
-        # Find our index
-        text_index = None
-        for idx in indices:
-            if "text" in idx["name"]:
-                text_index = idx
-                break
+        # Verify the index was created with usable details.
+        described = updated_dataset.describe_indices()
+        text_index = next((idx for idx in described if "text" in idx.name), None)
 
         assert text_index is not None, "Text index not found"
-        assert text_index["type"] == "Inverted", f"Expected Inverted index, got {text_index['type']}"
+        assert "Inverted" in text_index.type_url, f"Expected Inverted index, got {text_index.type_url}"
 
         # Test full-text search functionality
         search_term = "Python"
@@ -297,15 +292,11 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        initial_indices = updated_dataset.list_indices()
+        initial_indices = updated_dataset.describe_indices()
         assert len(initial_indices) > 0, "Initial index creation failed"
 
         # Find our initial index
-        initial_index = None
-        for idx in initial_indices:
-            if idx["name"] == index_name:
-                initial_index = idx
-                break
+        initial_index = next((idx for idx in initial_indices if idx.name == index_name), None)
         assert initial_index is not None, "Initial index not found"
 
         # Now create another index with the same name but replace=True
@@ -318,15 +309,11 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        final_indices = updated_dataset.list_indices()
-        final_index = None
-        for idx in final_indices:
-            if idx["name"] == index_name:
-                final_index = idx
-                break
+        final_indices = updated_dataset.describe_indices()
+        final_index = next((idx for idx in final_indices if idx.name == index_name), None)
 
         assert final_index is not None, "Index should still exist after replacement"
-        assert final_index["type"] == "Inverted", "Index type should remain Inverted"
+        assert "Inverted" in final_index.type_url, "Index type should remain Inverted"
 
         # Test that the replaced index still works for searching
         search_term = "Python"
@@ -601,6 +588,121 @@ class TestDistributedIndexing:
 class TestSegmentedBTreeIndex:
     """Test cases for segmented BTree index functionality."""
 
+    def test_segmented_handler_uses_public_uncommitted_index_api(self):
+        """Test that segmented workers use Lance's public uncommitted index API."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def _ds(self):
+                raise AssertionError("segmented index creation must not use private _ds.create_index")
+
+            def create_index_uncommitted(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"segment": "metadata"}
+
+        fake_ds = FakeLanceDataset()
+        handler = SegmentedFragmentIndexHandler(
+            lance_ds=fake_ds,
+            column="price",
+            index_type="BTREE",
+            name="price_idx",
+            replace=True,
+            custom="value",
+        )
+
+        raw_segment = handler([1, 2])
+
+        assert pickle.loads(raw_segment) == {"segment": "metadata"}
+        assert fake_ds.calls == [
+            {
+                "column": "price",
+                "index_type": "BTREE",
+                "name": "price_idx",
+                "replace": True,
+                "train": True,
+                "fragment_ids": [1, 2],
+                "custom": "value",
+            }
+        ]
+
+    def test_segmented_handler_falls_back_when_public_scalar_api_is_unavailable(self):
+        """Test compatibility with Lance versions whose public API is vector-only."""
+
+        class FakeInnerDataset:
+            def __init__(self):
+                self.calls = []
+
+            def create_index(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return {"segment": "fallback-metadata"}
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self._ds = FakeInnerDataset()
+
+            def create_index_uncommitted(self, **kwargs):
+                raise TypeError("Vector column price must be FixedSizeListArray, got double")
+
+        fake_ds = FakeLanceDataset()
+        handler = SegmentedFragmentIndexHandler(
+            lance_ds=fake_ds,
+            column="price",
+            index_type="BTREE",
+            name="price_idx",
+            replace=True,
+        )
+
+        raw_segment = handler([1, 2])
+
+        assert pickle.loads(raw_segment) == {"segment": "fallback-metadata"}
+        assert fake_ds._ds.calls == [
+            (
+                (["price"], "BTREE"),
+                {
+                    "name": "price_idx",
+                    "replace": True,
+                    "train": True,
+                    "storage_options": None,
+                    "kwargs": {"fragment_ids": [1, 2]},
+                },
+            )
+        ]
+
+    def test_segmented_inverted_segments_are_merged_before_commit(self):
+        """Test that INVERTED segments are merged into one physical segment before commit."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            def merge_existing_index_segments(self, segments):
+                self.calls.append(segments)
+                return {"segment": "merged"}
+
+        fake_ds = FakeLanceDataset()
+        segments = [{"segment": "a"}, {"segment": "b"}]
+
+        prepared = _prepare_index_segments_for_commit(fake_ds, "INVERTED", segments)
+
+        assert prepared == [{"segment": "merged"}]
+        assert fake_ds.calls == [segments]
+
+    def test_segmented_btree_segments_are_committed_without_merge(self):
+        """Test that non-merged segmented index types keep their physical segments."""
+
+        class FakeLanceDataset:
+            def merge_existing_index_segments(self, segments):
+                raise AssertionError("BTREE segments must not be merged")
+
+        segments = [{"segment": "a"}, {"segment": "b"}]
+
+        prepared = _prepare_index_segments_for_commit(FakeLanceDataset(), "BTREE", segments)
+
+        assert prepared is segments
+
     def test_segmented_btree_basic(self, temp_dir):
         """Test basic segmented BTree index creation and query."""
         data = {
@@ -798,8 +900,8 @@ class TestSegmentedBTreeIndex:
         results = updated_dataset.scanner(filter="count > 500", columns=["id", "count"]).to_table()
         assert results.num_rows == 3  # 600, 700, 800
 
-    def test_segmented_false_uses_legacy_flow(self, temp_dir):
-        """Test that segmented=False still uses the legacy partitioned-and-merged flow."""
+    def test_segmented_false_uses_segmented_flow_for_btree(self, temp_dir):
+        """Test that BTREE uses the segmented flow even when segmented=False."""
         data = {
             "id": [1, 2, 3, 4, 5, 6, 7, 8],
             "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
@@ -808,28 +910,26 @@ class TestSegmentedBTreeIndex:
         path = Path(temp_dir) / "segmented_false.lance"
         dataset.write_lance(uri=path, max_rows_per_file=2)
 
-        # segmented=False (default) should use the legacy flow
+        # segmented=False is retained for API compatibility; BTREE still uses
+        # Lance's public segmented-index workflow by default.
         create_scalar_index(
             uri=path,
             column="price",
             index_type="BTREE",
-            name="price_legacy_idx",
+            name="price_btree_idx",
             segmented=False,
         )
 
         updated_dataset = lance.dataset(path)
-        indices = updated_dataset.list_indices()
-        index_names = [idx["name"] for idx in indices]
-        assert "price_legacy_idx" in index_names
+        described = updated_dataset.describe_indices()
+        assert len(described) == 1
+        assert described[0].name == "price_btree_idx"
+        assert "BTree" in described[0].type_url
 
-    def test_segmented_inverted_falls_back_to_legacy(self, multi_fragment_lance_dataset):
-        """Test that segmented=True with INVERTED still uses the legacy flow.
-
-        The segmented workflow currently only supports BTREE.
-        """
+    def test_segmented_inverted_creates_index(self, multi_fragment_lance_dataset):
+        """Test that segmented=True with INVERTED creates an index."""
         dataset_uri = multi_fragment_lance_dataset
 
-        # segmented=True but INVERTED => legacy flow is used
         create_scalar_index(
             uri=dataset_uri,
             column="text",
@@ -839,6 +939,7 @@ class TestSegmentedBTreeIndex:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        indices = updated_dataset.list_indices()
-        index_names = [idx["name"] for idx in indices]
-        assert "text_inv_idx" in index_names
+        described = updated_dataset.describe_indices()
+        text_index = next((idx for idx in described if idx.name == "text_inv_idx"), None)
+        assert text_index is not None
+        assert "Inverted" in text_index.type_url
