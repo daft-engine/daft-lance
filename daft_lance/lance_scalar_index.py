@@ -18,7 +18,7 @@ from daft_lance.utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
 
-SEGMENTED_INDEX_TYPES = {"BTREE", "INVERTED"}
+SEGMENTED_INDEX_TYPES = {"BTREE", "INVERTED", "ZONEMAP"}
 MERGED_SEGMENTED_INDEX_TYPES = {"INVERTED"}
 
 
@@ -222,9 +222,11 @@ def create_scalar_index_internal(
                 and not pa.types.is_string(value_type)
             ):
                 raise TypeError(f"Column {column} must be numeric or string type for BTREE index, got {value_type}")
+        case "ZONEMAP":
+            pass
         case _:
             logger.warning(
-                "Distributed indexing currently only supports 'INVERTED' and 'BTREE' index types, not '%s'. So we are falling back to single-threaded index creation.",
+                "Distributed indexing currently only supports 'INVERTED', 'BTREE', and 'ZONEMAP' index types, not '%s'. So we are falling back to single-threaded index creation.",
                 index_type,
             )
             lance_ds.create_scalar_index(

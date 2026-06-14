@@ -703,6 +703,44 @@ class TestSegmentedBTreeIndex:
 
         assert prepared is segments
 
+    def test_segmented_zonemap_handler_uses_uncommitted_index_api(self):
+        """Test that ZONEMAP segment creation uses the uncommitted index API."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def _ds(self):
+                raise AssertionError("public ZONEMAP segment creation should not use fallback")
+
+            def create_index_uncommitted(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"segment": "zonemap-metadata"}
+
+        fake_ds = FakeLanceDataset()
+        handler = SegmentedFragmentIndexHandler(
+            lance_ds=fake_ds,
+            column="price",
+            index_type="ZONEMAP",
+            name="price_zm_idx",
+            replace=True,
+        )
+
+        raw_segment = handler([1, 2])
+
+        assert pickle.loads(raw_segment) == {"segment": "zonemap-metadata"}
+        assert fake_ds.calls == [
+            {
+                "column": "price",
+                "index_type": "ZONEMAP",
+                "name": "price_zm_idx",
+                "replace": True,
+                "train": True,
+                "fragment_ids": [1, 2],
+            }
+        ]
+
     def test_segmented_btree_basic(self, temp_dir):
         """Test basic segmented BTree index creation and query."""
         data = {
