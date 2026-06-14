@@ -5,6 +5,7 @@ except ImportError:
 
 from ._blob import take_blobs
 from ._lance import (
+    cleanup_old_versions,
     compact_files,
     create_scalar_index,
     merge_columns,
@@ -13,6 +14,7 @@ from ._lance import (
 )
 
 __all__ = [
+    "cleanup_old_versions",
     "compact_files",
     "create_scalar_index",
     "merge_columns",
