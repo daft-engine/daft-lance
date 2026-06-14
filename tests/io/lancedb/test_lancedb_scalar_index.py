@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import tempfile
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 import daft
 from daft.dependencies import pd
 from daft_lance import create_scalar_index
+from daft_lance.lance_scalar_index import SegmentedFragmentIndexHandler
 
 
 @pytest.fixture
@@ -600,6 +602,89 @@ class TestDistributedIndexing:
 
 class TestSegmentedBTreeIndex:
     """Test cases for segmented BTree index functionality."""
+
+    def test_segmented_handler_uses_public_uncommitted_index_api(self):
+        """Test that segmented workers use Lance's public uncommitted index API."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def _ds(self):
+                raise AssertionError("segmented index creation must not use private _ds.create_index")
+
+            def create_index_uncommitted(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"segment": "metadata"}
+
+        fake_ds = FakeLanceDataset()
+        handler = SegmentedFragmentIndexHandler(
+            lance_ds=fake_ds,
+            column="price",
+            index_type="BTREE",
+            name="price_idx",
+            replace=True,
+            custom="value",
+        )
+
+        raw_segment = handler([1, 2])
+
+        assert pickle.loads(raw_segment) == {"segment": "metadata"}
+        assert fake_ds.calls == [
+            {
+                "column": "price",
+                "index_type": "BTREE",
+                "name": "price_idx",
+                "replace": True,
+                "train": True,
+                "fragment_ids": [1, 2],
+                "custom": "value",
+            }
+        ]
+
+    def test_segmented_handler_falls_back_when_public_scalar_api_is_unavailable(self):
+        """Test compatibility with Lance versions whose public API is vector-only."""
+
+        class FakeInnerDataset:
+            def __init__(self):
+                self.calls = []
+
+            def create_index(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return {"segment": "fallback-metadata"}
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self._ds = FakeInnerDataset()
+
+            def create_index_uncommitted(self, **kwargs):
+                raise TypeError("Vector column price must be FixedSizeListArray, got double")
+
+        fake_ds = FakeLanceDataset()
+        handler = SegmentedFragmentIndexHandler(
+            lance_ds=fake_ds,
+            column="price",
+            index_type="BTREE",
+            name="price_idx",
+            replace=True,
+        )
+
+        raw_segment = handler([1, 2])
+
+        assert pickle.loads(raw_segment) == {"segment": "fallback-metadata"}
+        assert fake_ds._ds.calls == [
+            (
+                (["price"], "BTREE"),
+                {
+                    "name": "price_idx",
+                    "replace": True,
+                    "train": True,
+                    "storage_options": None,
+                    "kwargs": {"fragment_ids": [1, 2]},
+                },
+            )
+        ]
 
     def test_segmented_btree_basic(self, temp_dir):
         """Test basic segmented BTree index creation and query."""

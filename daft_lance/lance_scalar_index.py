@@ -64,10 +64,11 @@ class SegmentedFragmentIndexHandler:
 
     Unlike ``FragmentIndexHandler``, which writes partial index files sharing
     a single UUID, this handler builds a fully independent index segment per
-    worker via the low-level ``_ds.create_index`` binding.  The returned
-    ``lance.Index`` metadata (including ``index_details``) is serialised
-    (pickled) so it can cross Daft process/serialisation boundaries.  The
-    coordinator then commits all segments atomically with
+    worker via Lance's public ``create_index_uncommitted`` API when available,
+    with a compatibility fallback for older Lance releases that expose the
+    method but only support vector columns.  The returned ``lance.Index``
+    metadata is serialised (pickled) so it can cross Daft process/serialisation
+    boundaries.  The coordinator then commits all segments atomically with
     ``commit_existing_index_segments``.
     """
 
@@ -96,19 +97,66 @@ class SegmentedFragmentIndexHandler:
             self.index_type,
         )
 
-        # _ds.create_index returns a lance.Index dataclass when fragment_ids
-        # is provided (uncommitted segment mode).
-        index_meta: lance.Index = self.lance_ds._ds.create_index(  # type: ignore[call-arg]
-            [self.column],
-            self.index_type,
+        index_meta = _create_index_segment(
+            lance_ds=self.lance_ds,
+            column=self.column,
+            index_type=self.index_type,
             name=self.name,
             replace=self.replace,
-            train=True,
-            storage_options=None,
-            kwargs={"fragment_ids": fragment_ids, **self.kwargs},
+            fragment_ids=fragment_ids,
+            **self.kwargs,
         )
 
         return pickle.dumps(index_meta)
+
+
+def _create_index_segment(
+    lance_ds: lance.LanceDataset,
+    *,
+    column: str,
+    index_type: str,
+    name: str,
+    replace: bool,
+    fragment_ids: list[int],
+    **kwargs: Any,
+) -> lance.Index:
+    """Create one uncommitted index segment.
+
+    Prefer Lance's public ``create_index_uncommitted`` API.  ``pylance 7.0.0``
+    exposes that method but only accepts vector columns, so scalar indexes need
+    the existing low-level fallback until the scalar public API is available in
+    released wheels.
+    """
+    try:
+        return lance_ds.create_index_uncommitted(
+            column=column,
+            index_type=index_type,
+            name=name,
+            replace=replace,
+            train=True,
+            fragment_ids=fragment_ids,
+            **kwargs,
+        )
+    except TypeError as exc:
+        message = str(exc)
+        if "Vector column" not in message or "FixedSizeListArray" not in message:
+            raise
+
+        logger.info(
+            "Falling back to Lance's low-level uncommitted index segment API for %s; public scalar segment API is unavailable in this pylance version.",
+            index_type,
+        )
+
+    raw_dataset = cast(Any, lance_ds._ds)
+    return cast(lance.Index, raw_dataset.create_index(
+        [column],
+        index_type,
+        name=name,
+        replace=replace,
+        train=True,
+        storage_options=None,
+        kwargs={"fragment_ids": fragment_ids, **kwargs},
+    ))
 
 
 def create_scalar_index_internal(
@@ -134,11 +182,10 @@ def create_scalar_index_internal(
     inverted full-text index type.
 
     When ``segmented=True`` and ``index_type`` is ``BTREE``, a cleaner segmented workflow
-    is used instead: each worker builds a fully independent index segment via the low-level
-    ``_ds.create_index`` binding (which returns ``lance.Index`` metadata including
-    ``index_details``), and the coordinator commits them atomically with
-    ``commit_existing_index_segments``.  This resolves a known issue where ``index_details``
-    was left empty in the legacy path, preventing ``describe_indices()`` from working.
+    is used instead: each worker builds a fully independent index segment, and the
+    coordinator commits them atomically with ``commit_existing_index_segments``.  This
+    resolves a known issue where ``index_details`` was left empty in the legacy path,
+    preventing ``describe_indices()`` from working.
     """
     if not column:
         raise ValueError("Column name cannot be empty")
@@ -289,11 +336,10 @@ def _create_segmented_index(
 ) -> None:
     """Segmented index workflow: each worker builds an independent segment.
 
-    Workers call the low-level ``_ds.create_index`` binding (which returns
-    ``lance.Index`` metadata with ``index_details`` populated), pickle the
-    result so it can traverse Daft serialisation boundaries, and return it.
-    The coordinator unpickles all segments and commits them atomically via
-    ``commit_existing_index_segments``.
+    Workers call Lance's uncommitted index segment API, pickle the returned
+    ``lance.Index`` metadata so it can traverse Daft serialisation boundaries,
+    and return it.  The coordinator unpickles all segments and commits them
+    atomically via ``commit_existing_index_segments``.
     """
     handler_cls = daft.cls(
         SegmentedFragmentIndexHandler,
