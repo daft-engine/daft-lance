@@ -18,6 +18,8 @@ from daft_lance.utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
 
+MERGED_SEGMENTED_INDEX_TYPES = {"INVERTED"}
+
 
 class FragmentIndexHandler:
     """Handler for distributed scalar index creation on fragment batches."""
@@ -287,7 +289,7 @@ def create_scalar_index_internal(
     # Choose between the segmented workflow and the legacy partitioned-and-merged
     # workflow.  Segmented mode produces proper ``index_details`` so
     # ``describe_indices()`` works correctly.
-    if segmented and index_type == "BTREE":
+    if segmented and index_type in ("BTREE", "INVERTED"):
         _create_segmented_index(
             lance_ds=lance_ds,
             uri=uri,
@@ -368,18 +370,32 @@ def _create_segmented_index(
         pickle.loads(raw) for raw in collected.to_pydict()["index_meta"]
     ]
 
+    # Reload dataset to pick up the latest version (segment files were written
+    # by workers against the version that was current at their invocation time).
+    lance_ds = lance.LanceDataset(uri, storage_options=storage_options)
+    index_metas = _prepare_index_segments_for_commit(lance_ds, index_type, index_metas)
+
     logger.info(
         "Collected %d index segments; committing as segmented index %s",
         len(index_metas),
         name,
     )
-
-    # Reload dataset to pick up the latest version (segment files were written
-    # by workers against the version that was current at their invocation time).
-    lance_ds = lance.LanceDataset(uri, storage_options=storage_options)
     lance_ds.commit_existing_index_segments(name, column, index_metas)
 
     logger.info("Segmented index %s committed successfully", name)
+
+
+def _prepare_index_segments_for_commit(
+    lance_ds: lance.LanceDataset,
+    index_type: str,
+    index_metas: list[lance.Index | lance.indices.IndexSegment],
+) -> list[lance.Index | lance.indices.IndexSegment]:
+    """Prepare worker-built segments for the final manifest commit."""
+    if index_type not in MERGED_SEGMENTED_INDEX_TYPES or len(index_metas) <= 1:
+        return index_metas
+
+    merged = lance_ds.merge_existing_index_segments([cast(lance.Index, segment) for segment in index_metas])
+    return [merged]
 
 
 def _create_partitioned_index(

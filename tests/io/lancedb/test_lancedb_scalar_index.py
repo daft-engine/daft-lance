@@ -10,7 +10,7 @@ import pytest
 import daft
 from daft.dependencies import pd
 from daft_lance import create_scalar_index
-from daft_lance.lance_scalar_index import SegmentedFragmentIndexHandler
+from daft_lance.lance_scalar_index import SegmentedFragmentIndexHandler, _prepare_index_segments_for_commit
 
 
 @pytest.fixture
@@ -686,6 +686,38 @@ class TestSegmentedBTreeIndex:
             )
         ]
 
+    def test_segmented_inverted_segments_are_merged_before_commit(self):
+        """Test that INVERTED segments are merged into one physical segment before commit."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            def merge_existing_index_segments(self, segments):
+                self.calls.append(segments)
+                return {"segment": "merged"}
+
+        fake_ds = FakeLanceDataset()
+        segments = [{"segment": "a"}, {"segment": "b"}]
+
+        prepared = _prepare_index_segments_for_commit(fake_ds, "INVERTED", segments)
+
+        assert prepared == [{"segment": "merged"}]
+        assert fake_ds.calls == [segments]
+
+    def test_segmented_btree_segments_are_committed_without_merge(self):
+        """Test that non-merged segmented index types keep their physical segments."""
+
+        class FakeLanceDataset:
+            def merge_existing_index_segments(self, segments):
+                raise AssertionError("BTREE segments must not be merged")
+
+        segments = [{"segment": "a"}, {"segment": "b"}]
+
+        prepared = _prepare_index_segments_for_commit(FakeLanceDataset(), "BTREE", segments)
+
+        assert prepared is segments
+
     def test_segmented_btree_basic(self, temp_dir):
         """Test basic segmented BTree index creation and query."""
         data = {
@@ -907,14 +939,10 @@ class TestSegmentedBTreeIndex:
         index_names = [idx["name"] for idx in indices]
         assert "price_legacy_idx" in index_names
 
-    def test_segmented_inverted_falls_back_to_legacy(self, multi_fragment_lance_dataset):
-        """Test that segmented=True with INVERTED still uses the legacy flow.
-
-        The segmented workflow currently only supports BTREE.
-        """
+    def test_segmented_inverted_creates_index(self, multi_fragment_lance_dataset):
+        """Test that segmented=True with INVERTED creates an index."""
         dataset_uri = multi_fragment_lance_dataset
 
-        # segmented=True but INVERTED => legacy flow is used
         create_scalar_index(
             uri=dataset_uri,
             column="text",
