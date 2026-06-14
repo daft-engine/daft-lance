@@ -389,8 +389,10 @@ def create_scalar_index(
         column: Column name to index
         index_type: Type of index to build.
             For distributed execution this supports "INVERTED", "FTS", and "BTREE".
-            Other scalar index types supported by Lance (for example "BITMAP", "NGRAM", "ZONEMAP",
-            "LABEL_LIST", "BLOOMFILTER") are passed through to Lance's scalar index implementation.
+            With segmented=True, this draft path also supports segment-index creation for
+            "ZONEMAP". Other scalar index types supported by Lance (for example "BITMAP",
+            "NGRAM", "LABEL_LIST", "BLOOMFILTER") are passed through to Lance's scalar
+            index implementation.
         name: Name of the index (generated if None).
         replace: Whether to replace an existing index with the same name. Defaults to True.
         storage_options: Storage options for the dataset.
@@ -407,11 +409,10 @@ def create_scalar_index(
             greater than 1 enable additional parallelism on distributed runners; values <= 1 or None will use the default partitioning.
         max_concurrency: Maximum number of concurrent tasks to use for processing fragment batches.
             If None, Daft will use its default concurrency setting. Must be a positive integer.
-        segmented: If True and ``index_type`` is ``"BTREE"``, use the segmented index
+        segmented: If True and supported by ``index_type``, use the segmented index
             workflow where each worker builds a fully independent index segment and the
             coordinator commits them atomically via ``commit_existing_index_segments``.
-            This produces proper ``index_details`` metadata so ``describe_indices()``
-            works correctly.  Defaults to False (legacy partitioned-and-merged flow).
+            Defaults to False.
         **kwargs: Additional keyword arguments forwarded to ``lance.LanceDataset.create_scalar_index``.
 
     Returns:
