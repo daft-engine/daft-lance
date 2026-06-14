@@ -42,6 +42,7 @@ def read_lance(
     fragment_group_size: int | None = None,
     include_fragment_id: bool | None = None,
     checkpoint: CheckpointConfig | None = None,
+    base_store_params: dict[str, dict[str, str]] | None = None,
 ) -> DataFrame:
     """Create a DataFrame from a LanceDB table.
 
@@ -145,6 +146,7 @@ def read_lance(
         index_cache_size=index_cache_size,
         default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
+        base_store_params=base_store_params,
     )
 
     lance_operator = LanceDBScanOperator(

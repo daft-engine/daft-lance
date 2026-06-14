@@ -6,7 +6,7 @@ import lance
 import lance.blob
 import pyarrow as pa
 import pytest
-from lance import Blob
+from lance import Blob, DatasetBasePath
 from lance.blob import BlobType
 from pytest import TempPathFactory
 
@@ -62,6 +62,69 @@ def test_blob_columns_dedicated(lance_path: str) -> None:
 
     _assert_logical_blob_field(lance_path, "data")
     assert _kinds(lance_path) == [KIND_DEDICATED, KIND_DEDICATED]
+
+
+def test_blob_columns_dedicated_multi_base(tmp_path) -> None:
+    dataset_path = tmp_path / "dataset"
+    blob_base = tmp_path / "blob-base"
+    blob_base.mkdir()
+    payload = b"multi-base-payload" * 300_000
+
+    daft.from_pydict({"id": [1], "data": [payload]}).write_lance(
+        str(dataset_path),
+        blob_columns=["data"],
+        initial_bases=[
+            DatasetBasePath(
+                str(blob_base),
+                name="blob_base",
+                is_dataset_root=False,
+            )
+        ],
+        target_bases=["blob_base"],
+    ).collect()
+
+    ds = lance.dataset(str(dataset_path))
+    fragment_files = ds.get_fragments()[0].metadata.to_json()["files"]
+    assert fragment_files[0]["base_id"] == 1
+    assert list(blob_base.rglob("*.blob"))
+    row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
+    assert ds.take_blobs("data", row_ids)[0].read() == payload
+
+
+def test_blob_columns_append_multi_base(tmp_path) -> None:
+    dataset_path = tmp_path / "dataset"
+    blob_base = tmp_path / "blob-base"
+    blob_base.mkdir()
+    first = b"first-multi-base" * 300_000
+    second = b"second-multi-base" * 300_000
+
+    daft.from_pydict({"id": [1], "data": [first]}).write_lance(
+        str(dataset_path),
+        blob_columns=["data"],
+        initial_bases=[
+            DatasetBasePath(
+                str(blob_base),
+                name="blob_base",
+                is_dataset_root=False,
+            )
+        ],
+        target_bases=["blob_base"],
+    ).collect()
+    daft.from_pydict({"id": [2], "data": [second]}).write_lance(
+        str(dataset_path),
+        mode="append",
+        target_bases=["blob_base"],
+    ).collect()
+
+    ds = lance.dataset(str(dataset_path))
+    assert [file["base_id"] for fragment in ds.get_fragments() for file in fragment.metadata.to_json()["files"]] == [
+        1,
+        1,
+    ]
+    assert len(list(blob_base.rglob("*.blob"))) == 2
+    rows = ds.to_table(columns=["id"], with_row_id=True).to_pylist()
+    blobs = ds.take_blobs("data", [row["_rowid"] for row in rows])
+    assert {row["id"]: blob.read() for row, blob in zip(rows, blobs, strict=True)} == {1: first, 2: second}
 
 
 def test_blob_columns_default_storage_version(lance_path: str) -> None:

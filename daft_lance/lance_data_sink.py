@@ -5,7 +5,7 @@ import pathlib
 import uuid
 import warnings
 from itertools import chain
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import lance
 from lance.fragment import FragmentMetadata
@@ -53,6 +53,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         use_legacy_format: bool | None = None,
         enable_stable_row_ids: bool = False,
         storage_options: dict[str, str] | None = None,
+        initial_bases: list[Any] | None = None,
+        target_bases: list[str] | None = None,
+        base_store_params: dict[str, dict[str, str]] | None = None,
         use_mem_wal: bool = False,
         compact_after_write: bool = True,
     ) -> None:
@@ -68,6 +71,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             if storage_options is not None
             else io_config_to_storage_options(self._io_config, self._table_uri)
         )
+        self._initial_bases = self._normalize_initial_bases(initial_bases)
+        self._target_bases = target_bases
+        self._base_store_params = base_store_params
         self._init_lance_knobs(
             max_rows_per_file=max_rows_per_file,
             max_rows_per_group=max_rows_per_group,
@@ -157,6 +163,30 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         self._blob = BlobV2WritePolicy(blob_columns)
         self._blob.validate_columns_present(self._pyarrow_schema)
 
+    @staticmethod
+    def _normalize_initial_bases(initial_bases: list[Any] | None) -> list[Any] | None:
+        """Assign non-root base IDs to match lance.write_dataset semantics."""
+        if initial_bases is None:
+            return None
+        normalized: list[Any] = []
+        next_base_id = 1
+        for base in initial_bases:
+            base_id = getattr(base, "id", None)
+            if base_id:
+                normalized.append(base)
+                next_base_id = max(next_base_id, int(base_id) + 1)
+                continue
+            normalized.append(
+                lance.DatasetBasePath(
+                    base.path,
+                    name=base.name,
+                    is_dataset_root=base.is_dataset_root,
+                    id=next_base_id,
+                )
+            )
+            next_base_id += 1
+        return normalized
+
     def _absorb_existing_dataset(self) -> lance.LanceDataset | None:
         """Open the existing dataset (if any), set table-state, and validate the requested mode.
 
@@ -167,7 +197,11 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         """
         dataset: lance.LanceDataset | None
         try:
-            dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            dataset = lance.dataset(
+                self._table_uri,
+                storage_options=self._storage_options,
+                base_store_params=self._base_store_params,
+            )
         except (ValueError, FileNotFoundError, OSError) as e:
             # Pinned to the Rust message format; lance has no typed exception. See test_lance_message_format_unchanged.
             if "was not found" in str(e):
@@ -190,6 +224,10 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         if self._mode == "create":
             raise ValueError("Cannot create a Lance dataset at a location where one already exists.")
+
+        if self._mode == "append" and self._initial_bases:
+            dataset = dataset.add_bases(self._initial_bases)
+            self._version = dataset.latest_version
 
         if self._mode == "append" and not _pyarrow_schema_castable(
             blob_aware_schema_for_validation(self._pyarrow_schema, self._table_schema),
@@ -230,6 +268,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             data_storage_version=self._data_storage_version,
             use_legacy_format=self._use_legacy_format,
             enable_stable_row_ids=self._enable_stable_row_ids,
+            initial_bases=self._initial_bases,
+            target_bases=self._target_bases,
+            base_store_params=self._base_store_params,
         )
         # Sum on-disk sizes from fragment metadata. Lance Blob V2 sidecar .blob
         # files are not tracked in FragmentMetadata.files (out of scope here).
@@ -240,7 +281,11 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
     def _ensure_mem_wal_dataset(self) -> lance.LanceDataset:
         try:
-            ds = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            ds = lance.dataset(
+                self._table_uri,
+                storage_options=self._storage_options,
+                base_store_params=self._base_store_params,
+            )
         except (ValueError, FileNotFoundError, OSError):
             ds = None
 
@@ -255,6 +300,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 storage_options=self._storage_options,
                 data_storage_version=self._data_storage_version,
                 use_legacy_format=self._use_legacy_format,
+                initial_bases=self._initial_bases,
+                target_bases=self._target_bases,
+                base_store_params=self._base_store_params,
             )
 
         details = ds.mem_wal_index_details()
@@ -326,7 +374,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         operation: lance.LanceOperation.BaseOperation
         if self._mode == "create" or self._mode == "overwrite":
-            operation = lance.LanceOperation.Overwrite(self._effective_pyarrow_schema, fragments)
+            operation = lance.LanceOperation.Overwrite(self._effective_pyarrow_schema, fragments, self._initial_bases)
         elif self._mode == "append":
             operation = lance.LanceOperation.Append(fragments)
 
@@ -335,6 +383,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             operation,
             read_version=self._version,
             storage_options=self._storage_options,
+            base_store_params=self._base_store_params,
         )
         stats = dataset.stats.dataset_stats()
         stats_dict = MicroPartition.from_pydict(
@@ -348,7 +397,11 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         return stats_dict
 
     def _finalize_mem_wal(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
-        dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+        dataset = lance.dataset(
+            self._table_uri,
+            storage_options=self._storage_options,
+            base_store_params=self._base_store_params,
+        )
 
         if self._compact_after_write:
             logger.info(
@@ -359,7 +412,11 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             from daft_lance.lance_compaction import compact_files_internal
 
             compact_files_internal(dataset)
-            dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            dataset = lance.dataset(
+                self._table_uri,
+                storage_options=self._storage_options,
+                base_store_params=self._base_store_params,
+            )
 
         stats = dataset.stats.dataset_stats()
         return MicroPartition.from_pydict(
