@@ -687,6 +687,164 @@ class TestSegmentedBTreeIndex:
 
         assert _existing_index_names(FakeLanceDataset()) == {"legacy_idx"}
 
+    def test_segmented_bitmap_handler_forwards_shard_id(self):
+        """Test that BITMAP segment creation forwards the required shard id."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def _ds(self):
+                raise AssertionError("public BITMAP segment creation should not use fallback")
+
+            def create_index_uncommitted(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"segment": "bitmap-metadata"}
+
+        fake_ds = FakeLanceDataset()
+        handler = SegmentedFragmentIndexHandler(
+            lance_ds=fake_ds,
+            column="flag",
+            index_type="BITMAP",
+            name="flag_idx",
+        )
+
+        raw_segment = handler([1, 2], shard_id=7)
+
+        assert pickle.loads(raw_segment) == {"segment": "bitmap-metadata"}
+        assert fake_ds.calls == [
+            {
+                "column": "flag",
+                "index_type": "BITMAP",
+                "name": "flag_idx",
+                "replace": False,
+                "train": True,
+                "fragment_ids": [1, 2],
+                "shard_id": 7,
+            }
+        ]
+
+    def test_segmented_bitmap_segments_are_merged_before_commit(self):
+        """Test that BITMAP segments are merged to avoid one physical segment per fragment."""
+
+        class FakeLanceDataset:
+            def __init__(self):
+                self.calls = []
+
+            def merge_existing_index_segments(self, segments):
+                self.calls.append(segments)
+                return {"segment": "merged-bitmap"}
+
+        fake_ds = FakeLanceDataset()
+        segments = [{"segment": "a"}, {"segment": "b"}]
+
+        prepared = _prepare_index_segments_for_commit(fake_ds, "BITMAP", segments)
+
+        assert prepared == [{"segment": "merged-bitmap"}]
+        assert fake_ds.calls == [segments]
+
+    def test_segmented_bitmap_respects_fragment_group_size(self, monkeypatch):
+        """Test that segmented BITMAP can group multiple fragments per segment."""
+
+        class FakeFragment:
+            def __init__(self, fragment_id):
+                self.fragment_id = fragment_id
+
+            def count_rows(self):
+                return 1
+
+        class FakeLanceDataset:
+            schema = pa.schema([("flag", pa.int64())])
+
+            def describe_indices(self):
+                return []
+
+            def get_fragments(self):
+                return [FakeFragment(i) for i in range(4)]
+
+        calls = []
+
+        def fake_create_segmented_index(**kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr(lance_scalar_index, "_create_segmented_index", fake_create_segmented_index)
+
+        create_scalar_index_internal(
+            lance_ds=FakeLanceDataset(),
+            uri="memory://bitmap",
+            column="flag",
+            index_type="BITMAP",
+            name="flag_bitmap_idx",
+            segmented=True,
+            fragment_group_size=2,
+        )
+
+        assert [len(group["fragment_ids"]) for group in calls[0]["fragment_data"]] == [2, 2]
+
+    def test_bitmap_replace_true_existing_index_preserves_lance_replacement(self):
+        """Test that default BITMAP indexing keeps replace=True behavior for existing indexes."""
+
+        class ExistingIndex:
+            name = "flag_bitmap_idx"
+
+        class FakeLanceDataset:
+            schema = pa.schema([("flag", pa.int64())])
+
+            def __init__(self):
+                self.calls = []
+
+            def describe_indices(self):
+                return [ExistingIndex()]
+
+            def create_scalar_index(self, **kwargs):
+                self.calls.append(kwargs)
+
+        fake_ds = FakeLanceDataset()
+
+        create_scalar_index_internal(
+            lance_ds=fake_ds,
+            uri="memory://bitmap",
+            column="flag",
+            index_type="BITMAP",
+            name="flag_bitmap_idx",
+            replace=True,
+        )
+
+        assert fake_ds.calls == [
+            {
+                "column": "flag",
+                "index_type": "BITMAP",
+                "name": "flag_bitmap_idx",
+                "replace": True,
+            }
+        ]
+
+    def test_bitmap_replace_true_default_name_preserves_lance_replacement(self, temp_dir):
+        """Test that default BITMAP replacement preserves Lance's default index name."""
+        path = Path(temp_dir) / "bitmap_default_replace.lance"
+        table = pa.table(
+            {
+                "flag": pa.array([1, 2, 1, 3], type=pa.int64()),
+            }
+        )
+        lance.write_dataset(table, str(path), max_rows_per_file=2)
+
+        initial_dataset = lance.dataset(str(path))
+        initial_dataset.create_scalar_index(column="flag", index_type="BITMAP")
+        initial_names = [idx["name"] for idx in lance.dataset(str(path)).list_indices()]
+        assert len(initial_names) == 1
+
+        create_scalar_index(
+            uri=path,
+            column="flag",
+            index_type="BITMAP",
+            replace=True,
+        )
+
+        final_names = [idx["name"] for idx in lance.dataset(str(path)).list_indices()]
+        assert final_names == initial_names
+
     def test_segmented_btree_basic(self, temp_dir):
         """Test basic segmented BTree index creation and query."""
         data = {
