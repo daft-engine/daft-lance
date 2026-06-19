@@ -17,7 +17,7 @@ from .lance_compaction import compact_files_internal
 from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
-from .lance_scan import LanceDBScanOperator
+from .lance_scan import LanceScanOperator
 from .namespace import validate_uri_or_namespace
 from .utils import construct_lance_dataset_handle
 
@@ -47,12 +47,12 @@ def read_lance(
     namespace_impl: str | None = None,
     namespace_properties: dict[str, str] | None = None,
 ) -> DataFrame:
-    """Create a DataFrame from a LanceDB table.
+    """Create a DataFrame from a Lance dataset.
 
     Args:
         uri: The URI of the Lance table to read from. Accepts a local path or an
             object-store URI like "s3://bucket/path".
-        io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        io_config: A custom IOConfig to use when accessing Lance data. Defaults to None.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
             Mutually exclusive with ``uri``.
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
@@ -108,25 +108,25 @@ def read_lance(
             already exists in the store are skipped on re-run. Requires the Ray runner.
 
     Returns:
-        DataFrame: a DataFrame with the schema converted from the specified LanceDB table
+        DataFrame: a DataFrame with the schema converted from the specified Lance dataset
 
-        This function requires the use of [LanceDB](https://lancedb.github.io/lancedb/), which is the Python library for the LanceDB project.
+        This function reads Lance datasets via the Lance Python package.
         To ensure that this is installed with Daft, you may install: `pip install daft[lance]`
 
     Examples:
-        Read a local LanceDB table:
+        Read a local Lance dataset:
         >>> df = daft.read_lance("/path/to/lance/data/")
         >>> df.show()
 
-        Read a LanceDB table and specify a version:
+        Read a Lance dataset and specify a version:
         >>> df = daft.read_lance("/path/to/lance/data/", version=1)
         >>> df.show()
 
-        Read a LanceDB table with fragment grouping:
+        Read a Lance dataset with fragment grouping:
         >>> df = daft.read_lance("/path/to/lance/data/", fragment_group_size=5)
         >>> df.show()
 
-        Read a LanceDB table from a public S3 bucket:
+        Read a Lance dataset from a public S3 bucket:
         >>> from daft.io import S3Config, IOConfig
         >>> io_config = IOConfig(s3=S3Config(region="us-west-2", anonymous=True))
         >>> df = daft.read_lance("s3://daft-oss-public-data/lance/words-test-dataset", io_config=io_config)
@@ -160,7 +160,7 @@ def read_lance(
         metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
 
-    lance_operator = LanceDBScanOperator(
+    lance_operator = LanceScanOperator(
         dataset_handle.dataset,
         fragment_group_size=fragment_group_size,
         include_fragment_id=include_fragment_id,
@@ -196,14 +196,14 @@ def merge_columns(
     default_scan_options: dict[str, Any] | None = None,
     metadata_cache_size_bytes: int | None = None,
 ) -> LanceDataset:
-    """Merge new columns into a LanceDB table using a transformation function.
+    """Merge new columns into a Lance dataset using a transformation function.
 
-    This function modifies the LanceDB table in-place by adding new columns computed
+    This function modifies the Lance dataset in-place by adding new columns computed
     from existing data using a transformation function. It does not return a DataFrame.
 
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
-        io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        io_config: A custom IOConfig to use when accessing Lance data. Defaults to None.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
             Mutually exclusive with ``uri``.
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
@@ -227,17 +227,17 @@ def merge_columns(
         None: This function modifies the table in-place and does not return a value.
 
     Note:
-        This function requires the use of [LanceDB](https://lancedb.github.io/lancedb/), which is the Python library for the LanceDB project.
+        This function writes Lance datasets via the Lance Python package.
         To ensure that this is installed with Daft, you may install: `pip install daft[lance]`
 
     Examples:
-        Merge new columns into a local LanceDB table:
+        Merge new columns into a local Lance dataset:
         >>> def double_score(batch):
         ...     # Example transformation function
         ...     import pyarrow.compute as pc
         ...
         ...     return batch.append_column("new_column", pc.multiply(batch["c"], 2))
-        >>> daft_lance.merge_columns("s3://my-lancedb-bucket/data/", transform=double_score)
+        >>> daft_lance.merge_columns("s3://my-lance-bucket/data/", transform=double_score)
     """
     if transform is None:
         raise ValueError(
@@ -301,13 +301,13 @@ def merge_columns_df(
 ) -> Any:
     """Row-level merge columns entrypoint using a DataFrame.
 
-    This function modifies the LanceDB table in-place by merging new columns from a DataFrame
+    This function modifies the Lance dataset in-place by merging new columns from a DataFrame
     into existing fragments using a row-level join. It does not return a DataFrame.
 
     Args:
         df: DataFrame containing the new columns to merge along with fragment_id and join key columns
-        uri: URL to the LanceDB table (supports remote URLs to object stores such as `s3://` or `gs://`)
-        io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        uri: URL to the Lance dataset (supports remote URLs to object stores such as `s3://` or `gs://`)
+        io_config: A custom IOConfig to use when accessing Lance data. Defaults to None.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
             Mutually exclusive with ``uri``.
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
@@ -333,22 +333,22 @@ def merge_columns_df(
         None: This function modifies the table in-place and does not return a value.
 
     Note:
-        This function requires the use of [LanceDB](https://lancedb.github.io/lancedb/), which is the Python library for the LanceDB project.
+        This function writes Lance datasets via the Lance Python package.
         To ensure that this is installed with Daft, you may install: `pip install daft[lance]`
 
     Examples:
-        Merge new columns into a local LanceDB table:
+        Merge new columns into a local Lance dataset:
         >>> import daft
         >>> # Read the existing table with row addresses
         >>> df = daft.read_lance(
-        ...     "s3://my-lancedb-bucket/data/",
+        ...     "s3://my-lance-bucket/data/",
         ...     default_scan_options={"with_row_address": True},
         ...     include_fragment_id=True,
         ... )
         >>> # Add new columns based on existing data
         >>> df = df.with_column("doubled_c", df["c"] * 2)
         >>> # Merge the new columns back to the table
-        >>> daft_lance.merge_columns_df(df, "s3://my-lancedb-bucket/data/")
+        >>> daft_lance.merge_columns_df(df, "s3://my-lance-bucket/data/")
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -423,7 +423,7 @@ def create_scalar_index(
 
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
-        io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        io_config: A custom IOConfig to use when accessing Lance data. Defaults to None.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
             Mutually exclusive with ``uri``.
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
@@ -475,7 +475,7 @@ def create_scalar_index(
         ImportError: If lance package is not available
 
     Note:
-        This function requires the use of [LanceDB](https://lancedb.github.io/lancedb/), which is the Python library for the LanceDB project.
+        This function writes Lance datasets via the Lance Python package.
         To ensure that this is installed with Daft, you may install: `pip install daft[lance]`
 
     Examples:
@@ -566,7 +566,7 @@ def compact_files(
 
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
-        io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        io_config: A custom IOConfig to use when accessing Lance data. Defaults to None.
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
             Mutually exclusive with ``uri``.
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
