@@ -16,6 +16,7 @@ from daft.logical.schema import Schema
 from daft.recordbatch import RecordBatch
 
 from ._metadata import convert_lance_schema
+from .namespace import get_namespace_kwargs
 from .point_lookup import detect_point_lookup_columns
 from .utils import combine_filters_to_arrow
 
@@ -40,7 +41,15 @@ def _lancedb_table_factory_function(
             "Use nearest with fragment_ids=None for index-driven global vector search."
         )
 
-    ds = lance.dataset(ds_uri, **(open_kwargs or {}))
+    open_kwargs = dict(open_kwargs or {})
+    namespace_impl = open_kwargs.pop("namespace_impl", None)
+    namespace_properties = open_kwargs.pop("namespace_properties", None)
+    table_id = open_kwargs.pop("table_id", None)
+    ds = lance.dataset(
+        None if namespace_impl is not None and table_id is not None else ds_uri,
+        **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
+        **open_kwargs,
+    )
 
     def _iter_batches() -> Iterator[PyRecordBatch]:
         # Iterate fragments individually; append a fragment_id column only when requested
@@ -117,7 +126,15 @@ def _lancedb_count_result_function(
     filter: pa.compute.Expression | None = None,
 ) -> Iterator[PyRecordBatch]:
     """Use LanceDB's API to count rows and return a record batch with the count result."""
-    ds = lance.dataset(ds_uri, **(open_kwargs or {}))
+    open_kwargs = dict(open_kwargs or {})
+    namespace_impl = open_kwargs.pop("namespace_impl", None)
+    namespace_properties = open_kwargs.pop("namespace_properties", None)
+    table_id = open_kwargs.pop("table_id", None)
+    ds = lance.dataset(
+        None if namespace_impl is not None and table_id is not None else ds_uri,
+        **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
+        **open_kwargs,
+    )
     logger.debug("Using metadata for counting all rows")
     count = ds.count_rows(filter=filter)
 

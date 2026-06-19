@@ -26,6 +26,13 @@ from daft_lance._blob import (
     detect_blob_v2_columns,
     resolve_storage_version,
 )
+from daft_lance.namespace import (
+    get_namespace_kwargs,
+    get_write_fragments_kwargs,
+    merge_storage_options,
+    resolve_namespace_table,
+    validate_uri_or_namespace,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -40,11 +47,14 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
     def __init__(
         self,
-        uri: str | pathlib.Path,
+        uri: str | pathlib.Path | None,
         schema: Schema | pa.Schema,
         mode: Literal["create", "append", "overwrite"] = "create",
         io_config: IOConfig | None = None,
         *,
+        table_id: list[str] | None = None,
+        namespace_impl: str | None = None,
+        namespace_properties: dict[str, str] | None = None,
         blob_columns: list[str] | None = None,
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
@@ -57,17 +67,26 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         compact_after_write: bool = True,
     ) -> None:
         self._reject_unsupported_modes(mode, use_legacy_format)
-        if not isinstance(uri, (str, pathlib.Path)):
+        validate_uri_or_namespace(uri, namespace_impl, table_id)
+        if uri is not None and not isinstance(uri, (str, pathlib.Path)):
             raise TypeError(f"Expected URI to be str or pathlib.Path, got {type(uri)}")
 
-        self._table_uri = str(uri)
         self._mode = mode
+        self._namespace_impl = namespace_impl
+        self._namespace_properties = namespace_properties
+        self._table_id = table_id
         self._io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
-        self._storage_options = (
-            storage_options
-            if storage_options is not None
-            else io_config_to_storage_options(self._io_config, self._table_uri)
+        base_storage_options = (
+            (
+                storage_options
+                if storage_options is not None
+                else io_config_to_storage_options(self._io_config, str(uri))
+            )
+            if uri is not None
+            else storage_options
         )
+        self._table_uri, namespace_storage_options = self._resolve_table_uri(uri)
+        self._storage_options = merge_storage_options(base_storage_options, namespace_storage_options)
         self._init_lance_knobs(
             max_rows_per_file=max_rows_per_file,
             max_rows_per_group=max_rows_per_group,
@@ -108,6 +127,28 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 ("version", DataType.int64()),
             ]
         )
+
+    @property
+    def _namespace_kwargs(self) -> dict[str, object]:
+        return get_namespace_kwargs(self._namespace_impl, self._namespace_properties, self._table_id)
+
+    @property
+    def _dataset_uri_arg(self) -> str | None:
+        return None if self._namespace_impl is not None and self._table_id is not None else self._table_uri
+
+    def _resolve_table_uri(self, uri: str | pathlib.Path | None) -> tuple[str, dict[str, str] | None]:
+        if uri is not None:
+            return str(uri), None
+        mode = "create" if self._mode == "create" else "overwrite" if self._mode == "overwrite" else "read"
+        resolved_uri, namespace_storage_options = resolve_namespace_table(
+            namespace_impl=self._namespace_impl,
+            namespace_properties=self._namespace_properties,
+            table_id=self._table_id,
+            mode=mode,
+        )
+        if resolved_uri is None:
+            raise ValueError("Unable to resolve Lance dataset URI from namespace.")
+        return resolved_uri, namespace_storage_options
 
     @staticmethod
     def _reject_unsupported_modes(
@@ -167,7 +208,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         """
         dataset: lance.LanceDataset | None
         try:
-            dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            dataset = lance.dataset(
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
+            )
         except (ValueError, FileNotFoundError, OSError) as e:
             # Pinned to the Rust message format; lance has no typed exception. See test_lance_message_format_unchanged.
             if "was not found" in str(e):
@@ -230,6 +273,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             data_storage_version=self._data_storage_version,
             use_legacy_format=self._use_legacy_format,
             enable_stable_row_ids=self._enable_stable_row_ids,
+            **get_write_fragments_kwargs(self._namespace_impl, self._namespace_properties, self._table_id),
         )
         # Sum on-disk sizes from fragment metadata. Lance Blob V2 sidecar .blob
         # files are not tracked in FragmentMetadata.files (out of scope here).
@@ -240,7 +284,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
     def _ensure_mem_wal_dataset(self) -> lance.LanceDataset:
         try:
-            ds = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            ds = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
         except (ValueError, FileNotFoundError, OSError):
             ds = None
 
@@ -250,11 +294,12 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                     {f.name: pa.array([], type=f.type) for f in self._effective_pyarrow_schema},
                     schema=self._effective_pyarrow_schema,
                 ),
-                self._table_uri,
+                self._dataset_uri_arg,
                 mode="create",
                 storage_options=self._storage_options,
                 data_storage_version=self._data_storage_version,
                 use_legacy_format=self._use_legacy_format,
+                **self._namespace_kwargs,
             )
 
         details = ds.mem_wal_index_details()
@@ -335,6 +380,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             operation,
             read_version=self._version,
             storage_options=self._storage_options,
+            **self._namespace_kwargs,
         )
         stats = dataset.stats.dataset_stats()
         stats_dict = MicroPartition.from_pydict(
@@ -348,7 +394,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         return stats_dict
 
     def _finalize_mem_wal(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
-        dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
 
         if self._compact_after_write:
             logger.info(
@@ -359,7 +405,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             from daft_lance.lance_compaction import compact_files_internal
 
             compact_files_internal(dataset)
-            dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            dataset = lance.dataset(
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
+            )
 
         stats = dataset.stats.dataset_stats()
         return MicroPartition.from_pydict(

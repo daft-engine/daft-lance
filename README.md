@@ -38,6 +38,29 @@ from daft_lance import merge_columns_df
 merge_columns_df(df, "s3://bucket/my_dataset")
 ```
 
+### Namespace Tables
+
+```python
+import daft
+import daft_lance  # installs daft.read_lance / DataFrame.write_lance namespace support
+
+table_id = ["my_table"]
+namespace_properties = {"root": "/tmp/lance_tables"}
+
+df.write_lance(
+    namespace_impl="dir",
+    namespace_properties=namespace_properties,
+    table_id=table_id,
+    mode="create",
+).collect()
+
+df = daft.read_lance(
+    namespace_impl="dir",
+    namespace_properties=namespace_properties,
+    table_id=table_id,
+)
+```
+
 ## Migration
 
 The migration only requires replacing `daft.io.lance` with `daft_lance`.

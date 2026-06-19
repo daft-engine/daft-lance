@@ -7,6 +7,13 @@ import lance
 
 from daft.dependencies import pa
 from daft.logical.schema import Schema as DaftSchema
+from daft_lance.namespace import (
+    get_namespace_kwargs,
+    has_namespace_params,
+    merge_storage_options,
+    resolve_namespace_table,
+    validate_uri_or_namespace,
+)
 
 if TYPE_CHECKING:
     import pathlib
@@ -82,12 +89,29 @@ def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int
 
 
 def construct_lance_dataset(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None,
     version: int | str | None = None,
     storage_options: dict[str, Any] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    table_id: list[str] | None = None,
     **kwargs: Any,
 ) -> lance.LanceDataset:
     """Construct a Lance dataset with common options."""
+    validate_uri_or_namespace(uri, namespace_impl, table_id)
+    resolved_uri = str(uri) if uri is not None else None
+    namespace_storage_options = None
+    if resolved_uri is None:
+        resolved_uri, namespace_storage_options = resolve_namespace_table(
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+            table_id=table_id,
+            mode="read",
+        )
+    if resolved_uri is None:
+        raise ValueError("Unable to resolve Lance dataset URI.")
+    merged_storage_options = merge_storage_options(storage_options, namespace_storage_options)
+
     original_default_scan_options = kwargs.pop("default_scan_options", None)
     safe_default_scan_options = None
     if isinstance(original_default_scan_options, dict):
@@ -98,11 +122,21 @@ def construct_lance_dataset(
         # Non-dict defaults are forwarded as-is.
         kwargs["default_scan_options"] = original_default_scan_options
 
-    ds = lance.dataset(uri, storage_options=storage_options, version=version, **kwargs)
+    dataset_uri = None if has_namespace_params(namespace_impl, table_id) else resolved_uri
+    ds = lance.dataset(
+        dataset_uri,
+        storage_options=merged_storage_options,
+        version=version,
+        **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
+        **kwargs,
+    )
 
     effective_kwargs = {
-        "storage_options": storage_options,
+        "storage_options": merged_storage_options,
         "version": version,
+        "namespace_impl": namespace_impl,
+        "namespace_properties": namespace_properties,
+        "table_id": table_id,
     }
     effective_kwargs.update(kwargs or {})
     try:

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 @PublicAPI
 def read_lance(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     version: str | int | None = None,
     asof: str | None = None,
@@ -42,6 +42,10 @@ def read_lance(
     fragment_group_size: int | None = None,
     include_fragment_id: bool | None = None,
     checkpoint: CheckpointConfig | None = None,
+    *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
 ) -> DataFrame:
     """Create a DataFrame from a LanceDB table.
 
@@ -123,8 +127,8 @@ def read_lance(
         >>> df = daft.read_lance("s3://daft-oss-public-data/lance/words-test-dataset", io_config=io_config)
         >>> df.show()
     """
-    uri_str = str(uri)
-    if uri_str.startswith("rest://"):
+    uri_str = str(uri) if uri is not None else None
+    if uri_str is not None and uri_str.startswith("rest://"):
         raise ValueError(
             "rest:// Lance URIs are no longer supported by daft.read_lance. "
             "The previous REST-namespace integration did not match the real "
@@ -133,11 +137,14 @@ def read_lance(
         )
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = io_config_to_storage_options(io_config, uri_str)
+    storage_options = io_config_to_storage_options(io_config, uri_str) if uri_str is not None else None
 
     ds = construct_lance_dataset(
         uri_str,
         storage_options=storage_options,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
