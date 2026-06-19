@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 # TODO support fts and fast_search
-def _lancedb_table_factory_function(
+def _lance_table_factory_function(
     ds_uri: str,
     open_kwargs: dict[Any, Any] | None = None,
     fragment_ids: list[int] | None = None,
@@ -110,13 +110,13 @@ def _lancedb_table_factory_function(
         return _iter_batches()
 
 
-def _lancedb_count_result_function(
+def _lance_count_result_function(
     ds_uri: str,
     open_kwargs: dict[Any, Any] | None,
     required_column: str,
     filter: pa.compute.Expression | None = None,
 ) -> Iterator[PyRecordBatch]:
-    """Use LanceDB's API to count rows and return a record batch with the count result."""
+    """Use Lance's API to count rows and return a record batch with the count result."""
     ds = lance.dataset(ds_uri, **(open_kwargs or {}))
     logger.debug("Using metadata for counting all rows")
     count = ds.count_rows(filter=filter)
@@ -128,7 +128,7 @@ def _lancedb_count_result_function(
     yield result_batch._recordbatch
 
 
-class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
+class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
     def __init__(
         self,
         ds: lance.LanceDataset,
@@ -150,10 +150,10 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         self._schema = convert_lance_schema(base)
 
     def name(self) -> str:
-        return "LanceDBScanOperator"
+        return "LanceScanOperator"
 
     def display_name(self) -> str:
-        return f"LanceDBScanOperator({self._ds.uri})"
+        return f"LanceScanOperator({self._ds.uri})"
 
     def schema(self) -> Schema:
         return self._schema
@@ -257,8 +257,8 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         new_schema = Schema.from_pyarrow_schema(pa.schema([pa.field(fields[0], pa.uint64())]))
         open_kwargs = getattr(self._ds, "_lance_open_kwargs", None)
         yield ScanTask.python_factory_func_scan_task(
-            module=_lancedb_count_result_function.__module__,
-            func_name=_lancedb_count_result_function.__name__,
+            module=_lance_count_result_function.__module__,
+            func_name=_lance_count_result_function.__name__,
             func_args=(self._ds.uri, open_kwargs, fields[0], self._combine_filters_to_arrow()),
             schema=new_schema._schema,
             num_rows=1,
@@ -296,8 +296,8 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
 
                 task_schema = self._schema
                 yield ScanTask.python_factory_func_scan_task(
-                    module=_lancedb_table_factory_function.__module__,
-                    func_name=_lancedb_table_factory_function.__name__,
+                    module=_lance_table_factory_function.__module__,
+                    func_name=_lance_table_factory_function.__name__,
                     func_args=(
                         self._ds.uri,
                         open_kwargs,
@@ -331,8 +331,8 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
             size_bytes: int | None = None,
         ) -> ScanTask:
             return ScanTask.python_factory_func_scan_task(
-                module=_lancedb_table_factory_function.__module__,
-                func_name=_lancedb_table_factory_function.__name__,
+                module=_lance_table_factory_function.__module__,
+                func_name=_lance_table_factory_function.__name__,
                 func_args=(
                     self._ds.uri,
                     open_kwargs,

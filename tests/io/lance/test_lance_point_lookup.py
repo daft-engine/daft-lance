@@ -20,7 +20,7 @@ def lance_dataset(tmp_path_factory):
 
 
 def _scan(ds):
-    return lance_scan.LanceDBScanOperator(ds)
+    return lance_scan.LanceScanOperator(ds)
 
 
 @pytest.mark.parametrize(
@@ -102,7 +102,7 @@ def test_scanner_without_fragments(lance_dataset, idx_type):
 
     arrow_filter = Expression._from_pyexpr((col("id") == 2)._expr).to_arrow_expr()
     # Invoke factory with fragment_ids=None to exercise index-driven fragment selection
-    gen = lance_scan._lancedb_table_factory_function(
+    gen = lance_scan._lance_table_factory_function(
         ds.uri,
         getattr(ds, "_lance_open_kwargs", None),
         None,

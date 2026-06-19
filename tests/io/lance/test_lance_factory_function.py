@@ -7,7 +7,7 @@ import pyarrow.compute as pc
 import pytest
 
 from daft.recordbatch import RecordBatch
-from daft_lance.lance_scan import _lancedb_table_factory_function
+from daft_lance.lance_scan import _lance_table_factory_function
 
 # Import-or-skip lance once at module level so individual tests don't need to do this
 lance = pytest.importorskip("lance")
@@ -57,7 +57,7 @@ def test_reconstructs_dataset_and_reads_fragments(
 
     # Collect records from factory
     out_batches = list(
-        _lancedb_table_factory_function(
+        _lance_table_factory_function(
             ds_uri=ds_direct.uri,
             open_kwargs=open_kwargs,
             fragment_ids=frag_ids,
@@ -89,7 +89,7 @@ def test_raises_when_no_fragments(tmp_path_factory):
 
     with pytest.raises(RuntimeError) as ei:
         list(
-            _lancedb_table_factory_function(
+            _lance_table_factory_function(
                 ds_uri=ds.uri,
                 open_kwargs=None,
                 fragment_ids=[],
@@ -110,7 +110,7 @@ def test_invalid_fragment_id_raises(tmp_path_factory):
 
     with pytest.raises(Exception) as ei:
         list(
-            _lancedb_table_factory_function(
+            _lance_table_factory_function(
                 ds_uri=ds.uri,
                 open_kwargs=None,
                 fragment_ids=[invalid_id],
@@ -141,7 +141,7 @@ def test_open_kwargs_version_selects_correct_version(tmp_path_factory):
     frag_ids_v1 = [f.fragment_id for f in ds_v1.get_fragments()]
 
     out_batches = list(
-        _lancedb_table_factory_function(
+        _lance_table_factory_function(
             ds_uri=ds_v2.uri,
             open_kwargs={"version": 1},
             fragment_ids=frag_ids_v1,
