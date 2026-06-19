@@ -11,7 +11,7 @@ import daft
 from daft import col
 from daft.daft import CountMode
 from daft.recordbatch import RecordBatch
-from daft_lance.lance_scan import LanceDBScanOperator, _lancedb_count_result_function
+from daft_lance.lance_scan import LanceScanOperator, _lance_count_result_function
 
 
 class TestLanceCountResultFunction:
@@ -30,20 +30,20 @@ class TestLanceCountResultFunction:
         lance.write_dataset(pa.Table.from_pydict(test_data), tmp_dir)
         yield str(tmp_dir)
 
-    def test_lancedb_count_no_filters_direct_call(self, test_dataset_path):
+    def test_lance_count_no_filters_direct_call(self, test_dataset_path):
         """Test that no filters list is handled correctly."""
         ds = lance.dataset(test_dataset_path)
-        result_generator = _lancedb_count_result_function(ds.uri, None, "count")
+        result_generator = _lance_count_result_function(ds.uri, None, "count")
         result_batch = next(result_generator)
         record_batch = RecordBatch._from_pyrecordbatch(result_batch)
         result_dict = record_batch.to_pydict()
         assert result_dict["count"][0] == 6
 
-    def test_lancedb_count_with_filters_path(self, test_dataset_path):
+    def test_lance_count_with_filters_path(self, test_dataset_path):
         """Test that filters list is handled correctly."""
         ds = lance.dataset(test_dataset_path)
         filter_expr = pc.greater(pc.field("age"), pc.scalar(30))
-        result_generator = _lancedb_count_result_function(ds.uri, None, "count", filter=filter_expr)
+        result_generator = _lance_count_result_function(ds.uri, None, "count", filter=filter_expr)
         result_batch = next(result_generator)
         record_batch = RecordBatch._from_pyrecordbatch(result_batch)
         result_dict = record_batch.to_pydict()
@@ -52,7 +52,7 @@ class TestLanceCountResultFunction:
     def test_unsupported_count_mode_fallback(self, test_dataset_path):
         """Test that unsupported count mode falls back to regular scan."""
         ds = lance.dataset(test_dataset_path)
-        scan_op = LanceDBScanOperator(ds)
+        scan_op = LanceScanOperator(ds)
 
         with patch.object(scan_op, "supported_count_modes", return_value=[CountMode.All]):
             with patch("daft_lance.lance_scan.logger") as mock_logger:
@@ -77,7 +77,7 @@ class TestLanceCountResultFunction:
     def test_empty_filters_list_handling(self, test_dataset_path):
         """Test that empty filters list is handled correctly."""
         ds = lance.dataset(test_dataset_path)
-        scan_op = LanceDBScanOperator(ds)
+        scan_op = LanceScanOperator(ds)
         pushed, remaining = scan_op.push_filters([])
 
         assert len(pushed) == 0

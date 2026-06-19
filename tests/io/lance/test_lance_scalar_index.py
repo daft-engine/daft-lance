@@ -399,9 +399,9 @@ class TestDistributedIndexing:
         """Test building distributed FTS (Full-Text Search) index."""
         dataset_uri = multi_fragment_lance_dataset
 
-        # Skip this test if FTS is not supported in the current LanceDB version
-        # This test will be enabled when LanceDB version supports FTS index type
-        pytest.skip("FTS index type may not be supported in the current LanceDB version")
+        # Skip this test if FTS is not supported in the current Lance version
+        # This test will be enabled when Lance version supports FTS index type
+        pytest.skip("FTS index type may not be supported in the current Lance version")
 
         # Build distributed FTS index
         create_scalar_index(

@@ -41,7 +41,7 @@ def minio_create_bucket(minio_io_config, bucket_name):
     yield
 
 
-def test_lancedb_roundtrip(lance_dataset_path):
+def test_lance_roundtrip(lance_dataset_path):
     df1 = daft.from_pydict(data1)
     df2 = daft.from_pydict(data2)
     df1.write_lance(lance_dataset_path, mode="create")
@@ -52,7 +52,7 @@ def test_lancedb_roundtrip(lance_dataset_path):
 
 
 @pytest.mark.integration()
-def test_lancedb_minio(minio_io_config):
+def test_lance_minio(minio_io_config):
     df1 = daft.from_pydict(data1)
     df2 = daft.from_pydict(data2)
     bucket_name = "lance"
@@ -64,7 +64,7 @@ def test_lancedb_minio(minio_io_config):
         assert df_loaded.to_pydict() == df1.concat(df2).to_pydict()
 
 
-def test_lancedb_write_with_schema(lance_dataset_path):
+def test_lance_write_with_schema(lance_dataset_path):
     """Writing a dataframe to lance with a user-provided schema with lance encodings."""
     data = {
         "vector": [1.1, 1.2],
@@ -99,7 +99,7 @@ def test_lancedb_write_with_schema(lance_dataset_path):
     assert compress_field_metadata[b"lance-encoding:compression"] == b"zstd"
 
 
-def test_lancedb_write_blob(lance_dataset_path):
+def test_lance_write_blob(lance_dataset_path):
     schema = pa.schema(
         [
             pa.field("blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}),
@@ -130,7 +130,7 @@ def test_lancedb_write_blob(lance_dataset_path):
             assert f.read() == expected
 
 
-def test_lancedb_write_string(lance_dataset_path):
+def test_lance_write_string(lance_dataset_path):
     import lance
 
     # Make lance dataset with a string column
@@ -149,7 +149,7 @@ def test_lancedb_write_string(lance_dataset_path):
     assert df_loaded.to_pydict() == data
 
 
-def test_lancedb_write_incompatible_schema(lance_dataset_path):
+def test_lance_write_incompatible_schema(lance_dataset_path):
     import lance
 
     # Make lance dataset with an int and a string column
@@ -166,7 +166,7 @@ def test_lancedb_write_incompatible_schema(lance_dataset_path):
         df.write_lance(lance_dataset_path, mode="append")
 
 
-def test_lancedb_write_with_create_append_mode(lance_dataset_path):
+def test_lance_write_with_create_append_mode(lance_dataset_path):
     import lance
 
     # Make lance dataset with a string column

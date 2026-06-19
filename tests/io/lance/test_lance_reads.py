@@ -18,18 +18,18 @@ def lance_dataset_path(tmp_path_factory):
     yield str(tmp_dir)
 
 
-def test_lancedb_read(lance_dataset_path):
+def test_lance_read(lance_dataset_path):
     df = daft.read_lance(lance_dataset_path)
     assert df.to_pydict() == data
 
 
-def test_lancedb_read_column_selection(lance_dataset_path):
+def test_lance_read_column_selection(lance_dataset_path):
     df = daft.read_lance(lance_dataset_path)
     df = df.select("vector")
     assert df.to_pydict() == {"vector": data["vector"]}
 
 
-def test_lancedb_read_filter(lance_dataset_path):
+def test_lance_read_filter(lance_dataset_path):
     df = daft.read_lance(lance_dataset_path)
     df = df.where((df["lat"] > 45) & (df["lat"] < 90))
     df = df.select("vector")
@@ -68,7 +68,7 @@ def large_lance_dataset_path(tmp_path_factory):
         (10000, 10),
     ],
 )
-def test_lancedb_read_limit_large_dataset(large_lance_dataset_path, limit_size, expected_scan_tasks):
+def test_lance_read_limit_large_dataset(large_lance_dataset_path, limit_size, expected_scan_tasks):
     """Test limit operation on a large Lance dataset with multiple fragments."""
     import io
 
@@ -97,12 +97,12 @@ def test_lancedb_read_limit_large_dataset(large_lance_dataset_path, limit_size, 
     assert result["big_int"] == expected_big_ints
 
 
-def test_lancedb_with_version(lance_dataset_path):
+def test_lance_with_version(lance_dataset_path):
     df = daft.read_lance(uri=lance_dataset_path, version=1)
     assert df.to_pydict() == data
 
     # test pushdown filters with limit and projection
-    def test_lancedb_read_pushdown(lance_dataset_path, capsys):
+    def test_lance_read_pushdown(lance_dataset_path, capsys):
         df = daft.read_lance(lance_dataset_path)
         df = daft.sql("SELECT vector, lat + 1 as lat_plus_1 FROM df where  long < 3 limit 1")
         df.explain(show_all=True)
@@ -139,7 +139,7 @@ def test_lancedb_with_version(lance_dataset_path):
             )
 
 
-def test_lancedb_read_parallelism_fragment_merging(large_lance_dataset_path):
+def test_lance_read_parallelism_fragment_merging(large_lance_dataset_path):
     """Test parallelism parameter reduces scan tasks by merging fragments."""
     df = daft.read_lance(uri=large_lance_dataset_path, fragment_group_size=3)
     result = df.to_pydict()
@@ -147,7 +147,7 @@ def test_lancedb_read_parallelism_fragment_merging(large_lance_dataset_path):
     assert len(result["big_int"]) == 10000
 
 
-def test_lancedb_read_filter_passthrough(tmp_path):
+def test_lance_read_filter_passthrough(tmp_path):
     """Test passing raw SQL filter string to Lance via default_scan_options."""
     import lance
 
@@ -164,8 +164,8 @@ def test_lancedb_read_filter_passthrough(tmp_path):
     assert sorted(res["id"]) == [1, 2]
 
 
-def test_lancedb_geo_projection_and_filter(tmp_path):
-    """Test LanceDB read with Geo projection and filter via default_scan_options."""
+def test_lance_geo_projection_and_filter(tmp_path):
+    """Test Lance read with Geo projection and filter via default_scan_options."""
     import lance
 
     try:
@@ -250,7 +250,7 @@ def test_lancedb_geo_projection_and_filter(tmp_path):
     assert abs(res["distance"][0]) < 1e-6
 
 
-class TestLanceDBCountPushdown:
+class TestLanceCountPushdown:
     tmp_data = {
         "a": ["a", "b", "c", "d", "e", None],
         "b": [1, None, 3, None, 5, 6],
@@ -271,7 +271,7 @@ class TestLanceDBCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [b], aggregation: count(col(b), All)}" in actual.out
-        assert "_lancedb_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
 
         result = df.to_pydict()
         assert result == {"count": [6]}
@@ -284,7 +284,7 @@ class TestLanceDBCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [a], aggregation: count(col(a), All)}" not in actual.out
-        assert "_lancedb_count_result_function" not in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" not in actual.out  # Accept daft or daft_lance module path
 
         result = df.to_pydict()
         assert result == {"a": [5]}
@@ -297,7 +297,7 @@ class TestLanceDBCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [b], aggregation: count(col(b), All)}" in actual.out
-        assert "_lancedb_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
 
         result = df.to_pydict()
         assert result == {"count": [6]}
@@ -310,7 +310,7 @@ class TestLanceDBCountPushdown:
         _ = capsys.readouterr()
         df.explain(True)
         actual = capsys.readouterr()
-        assert "_lancedb_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
         assert "Filter pushdown = is_null(col(b))" in actual.out
         assert "Aggregation pushdown = count(col(b), All)" in actual.out
 
@@ -325,7 +325,7 @@ class TestLanceDBCountPushdown:
         _ = capsys.readouterr()
         df.explain(True)
         actual = capsys.readouterr()
-        assert "_lancedb_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
         assert "Filter pushdown = is_null(col(b)) | is_null(col(c))" in actual.out
         assert "Aggregation pushdown = count(col(b), All)" in actual.out
 
@@ -341,7 +341,7 @@ class TestLanceDBCountPushdown:
         _ = capsys.readouterr()
         df.explain(True)
         actual = capsys.readouterr()
-        assert "_lancedb_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
         assert "Aggregation pushdown" in actual.out
         assert "Filter pushdown" in actual.out
 
@@ -356,7 +356,7 @@ class TestLanceDBCountPushdown:
         _ = capsys.readouterr()
         df.explain(True)
         actual = capsys.readouterr()
-        assert "_lancedb_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
 
         result = df.to_pydict()
         assert result == {"count": [4]}
@@ -373,7 +373,7 @@ class TestLanceDBCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [a], aggregation: count(col(a), All)}" in actual.out
-        assert "_lancedb_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
 
         result = df.to_pydict()
         assert result == {"count": [0]}
@@ -386,14 +386,14 @@ class TestLanceDBCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [b], aggregation: count(col(b), All)}" in actual.out
-        assert "_lancedb_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
 
         result = df.to_pydict()
         assert result == {"count": [6]}
 
 
 @pytest.mark.parametrize("enable_strict_filter_pushdown", [True, False])
-def test_lancedb_filter_then_limit_behavior(lance_dataset_path, enable_strict_filter_pushdown):
+def test_lance_filter_then_limit_behavior(lance_dataset_path, enable_strict_filter_pushdown):
     """Ensure filter is applied before limit for Lance reads."""
     daft.context.set_planning_config(enable_strict_filter_pushdown=enable_strict_filter_pushdown)
     df = daft.read_lance(lance_dataset_path)
@@ -408,7 +408,7 @@ def test_lancedb_filter_then_limit_behavior(lance_dataset_path, enable_strict_fi
     assert result3 == {"vector": [[0.2, 1.8]], "lat": [40.1], "long": [-74.1], "big_int": [2]}
 
 
-def test_lancedb_limit_with_filter_and_fragment_grouping_single_task(large_lance_dataset_path):
+def test_lance_limit_with_filter_and_fragment_grouping_single_task(large_lance_dataset_path):
     """Validate filter+limit correctness when fragment grouping is enabled."""
     df = daft.read_lance(uri=large_lance_dataset_path, fragment_group_size=4)
     df = df.filter("big_int = 999").limit(1).select("big_int")
