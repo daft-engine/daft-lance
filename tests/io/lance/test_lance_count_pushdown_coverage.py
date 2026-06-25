@@ -11,7 +11,12 @@ import daft
 from daft import col
 from daft.daft import CountMode
 from daft.recordbatch import RecordBatch
-from daft_lance.lance_scan import LanceScanOperator, _lance_count_result_function
+from daft_lance.lance_scan import (
+    LanceDBScanOperator,
+    LanceScanOperator,
+    _lance_count_result_function,
+    _lancedb_count_result_function,
+)
 
 
 class TestLanceCountResultFunction:
@@ -49,6 +54,18 @@ class TestLanceCountResultFunction:
         result_dict = record_batch.to_pydict()
         assert result_dict["count"][0] == 4
 
+    def test_deprecated_lancedb_count_result_function_alias(self, test_dataset_path):
+        """Test that the old count helper name remains available."""
+        ds = lance.dataset(test_dataset_path)
+
+        with pytest.deprecated_call(match="_lancedb_count_result_function is deprecated"):
+            result_generator = _lancedb_count_result_function(ds.uri, None, "count")
+
+        result_batch = next(result_generator)
+        record_batch = RecordBatch._from_pyrecordbatch(result_batch)
+        result_dict = record_batch.to_pydict()
+        assert result_dict["count"][0] == 6
+
     def test_unsupported_count_mode_fallback(self, test_dataset_path):
         """Test that unsupported count mode falls back to regular scan."""
         ds = lance.dataset(test_dataset_path)
@@ -83,6 +100,17 @@ class TestLanceCountResultFunction:
         assert len(pushed) == 0
         assert len(remaining) == 0
         assert scan_op._pushed_filters is None
+
+    def test_deprecated_lancedb_scan_operator_alias(self, test_dataset_path):
+        """Test that the old public scan operator name remains available."""
+        ds = lance.dataset(test_dataset_path)
+
+        with pytest.deprecated_call(match="LanceDBScanOperator is deprecated"):
+            scan_op = LanceDBScanOperator(ds)
+
+        assert isinstance(scan_op, LanceScanOperator)
+        assert scan_op.name() == "LanceDBScanOperator"
+        assert scan_op.display_name() == f"LanceDBScanOperator({ds.uri})"
 
     def test_very_large_filter_expression(self, test_dataset_path):
         """Test that very large filter expressions are handled correctly."""
