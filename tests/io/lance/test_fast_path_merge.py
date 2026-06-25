@@ -587,3 +587,124 @@ class TestReadBackIntegrity:
 
         combined = sorted(zip(all_ids, all_doubled))
         assert combined == [(1, 2), (2, 4), (3, 6), (4, 8)]
+
+
+# ---------------------------------------------------------------------------
+# 10. Regressions
+# ---------------------------------------------------------------------------
+
+
+class TestRegressions:
+    def test_fixed_size_list_float32_type_preserved(self, ds_path):
+        """Bug: pa.array(s.to_pylist()) erases fixed_size_list<float32>[N] → list<float64>.
+
+        Python floats are float64 and list structure is inferred from nested Python lists,
+        so the Arrow type is lost. The fix uses s.to_arrow().combine_chunks() which
+        preserves the declared daft return type exactly.
+        """
+        N = 8
+        ds = create_dataset(ds_path, [{"id": [1, 2, 3]}])
+        df = read_with_metadata(ds_path)
+
+        @daft.func.batch(return_dtype=daft.DataType.fixed_size_list(daft.DataType.float32(), N))
+        def _make_vec(ids):
+            import numpy as np
+
+            return [np.array([float(i)] * N, dtype=np.float32) for i in ids.to_pylist()]
+
+        df = df.with_column("embedding", _make_vec(daft.col("id")))
+        ds2 = merge_columns_from_df(df, ds, ds_path)
+
+        field = ds2.schema.field("embedding")
+        # Type must be preserved: fixed_size_list<float32>[N], NOT list<float64>
+        assert pa.types.is_fixed_size_list(field.type), f"Expected fixed_size_list, got {field.type}"
+        assert field.type.list_size == N
+        assert field.type.value_type == pa.float32(), f"Expected float32 values, got {field.type.value_type}"
+
+        result = ds2.to_table().sort_by("id").to_pydict()
+        for i, emb in zip(result["id"], result["embedding"]):
+            assert emb is not None, f"Embedding for id={i} is null"
+            assert len(emb) == N
+            for v in emb:
+                assert pytest.approx(float(i), rel=1e-5) == v
+
+    def test_next_fid_skips_nested_child_field_ids(self, ds_path):
+        """Bug: next_fid only scanned top-level lance_schema.fields(), missing child IDs.
+
+        A struct column with M children occupies M+1 field IDs (1 for parent + M for children).
+        With top-level-only scan: max_id = num_top_level_fields - 1, next_fid collides with a
+        child field ID, and the new file's fragment metadata maps to the wrong schema field →
+        the new column reads back as null.
+
+        The fix uses recursive _max_field_id() that includes all descendants.
+        """
+        # Schema: id(fid=0), meta struct(fid=1) with children meta.a(fid=2), meta.b(fid=3).
+        # Top-level scan → max=1, next_fid=2 (WRONG: collides with meta.a).
+        # Recursive scan → max=3, next_fid=4 (CORRECT).
+        struct_type = pa.struct([("a", pa.int64()), ("b", pa.utf8())])
+        rows = [{"a": i, "b": f"s{i}"} for i in [1, 2, 3]]
+        tbl = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "meta": pa.array(rows, type=struct_type),
+            }
+        )
+        lance.write_dataset(tbl, ds_path)
+        ds = lance.dataset(ds_path)
+
+        df = read_with_metadata(ds_path)
+        df = df.with_column("score", daft.col("id").cast(daft.DataType.int64()) * 10)
+        ds2 = merge_columns_from_df(df, ds, ds_path)
+
+        result = ds2.to_table().sort_by("id").to_pydict()
+        assert result["score"] == [10, 20, 30], f"score is null or wrong (field ID collision): {result['score']}"
+        assert result["id"] == [1, 2, 3]
+
+    def test_blob_pipeline_merge_produces_nonnull_results(self, tmp_path_factory):
+        """Bug: _can_use_fast_path called df.collect(), caching one-shot BlobFile objects.
+
+        Daft caches collect() results in df._result_cache. The subsequent
+        groupby().map_groups() received the same exhausted BlobFile instances,
+        whose .read() returned b'', causing downstream UDFs to produce null/wrong output.
+
+        The fix uses df.count_rows() which does NOT set _result_cache, so the pipeline
+        re-executes fresh and BlobFile objects are materialized again from scratch.
+        """
+        from daft_lance._blob import take_blobs as _take_blobs
+
+        blob_path = str(tmp_path_factory.mktemp("blob_ds"))
+        payloads = [b"hello", b"world", b"foo"]
+        tbl = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "blob": lance.blob_array(payloads),
+            }
+        )
+        lance.write_dataset(tbl, blob_path, data_storage_version="2.2")
+        ds = lance.dataset(blob_path)
+
+        df = daft.read_lance(
+            blob_path,
+            include_fragment_id=True,
+            default_scan_options={"with_row_id": True, "with_row_address": True},
+        )
+        df = _take_blobs(df, ds, "blob")
+
+        @daft.func.batch(return_dtype=daft.DataType.int64())
+        def _blob_len(blobs):
+            return [len(b.read()) if b is not None else -1 for b in blobs.to_pylist()]
+
+        df = df.with_column("blob_len", _blob_len(daft.col("blob")))
+        ds2 = merge_columns_from_df(
+            df.select("fragment_id", "_rowaddr", "blob_len"),
+            ds,
+            blob_path,
+        )
+
+        result = ds2.to_table().sort_by("id").to_pydict()
+        expected_lens = [len(p) for p in payloads]
+        # If the old bug (collect() caching) were present, blob_len would be 0 for all rows
+        # because exhausted BlobFile.read() returns b''.
+        assert result["blob_len"] == expected_lens, (
+            f"blob_len wrong (BlobFile exhaustion bug?): got {result['blob_len']}, expected {expected_lens}"
+        )
