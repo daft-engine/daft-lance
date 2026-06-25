@@ -267,10 +267,18 @@ class FastPathFragmentWriter:
 
         rowaddrs = rowaddr_col.to_pylist() if hasattr(rowaddr_col, "to_pylist") else list(rowaddr_col)
 
-        # Build table of new columns
+        # Build table of new columns, preserving the Arrow type from the daft Series.
+        # pa.array(s.to_pylist()) loses type information: fixed_size_list<float32>[N]
+        # becomes list<double> because Python floats are float64 and list structure is
+        # inferred from Python lists. Using s.to_arrow() avoids this type erasure.
         arrays = []
         for s in data_cols:
-            arr = _pa.array(s.to_pylist() if hasattr(s, "to_pylist") else list(s))
+            if hasattr(s, "to_arrow"):
+                arr = s.to_arrow()
+                if isinstance(arr, _pa.ChunkedArray):
+                    arr = arr.combine_chunks()
+            else:
+                arr = _pa.array(list(s))
             arrays.append(arr)
         tbl = _pa.table({name: arr for name, arr in zip(self.new_column_names, arrays)})
 
@@ -306,8 +314,22 @@ class FastPathFragmentWriter:
                 writer.write_batch(b)
         file_size = os.path.getsize(filepath)
 
-        # Determine field IDs for the new columns
-        next_fid = max(f.id() for f in self.lance_ds.lance_schema.fields()) + 1
+        # Determine field IDs for the new columns.
+        # lance_schema.fields() returns only top-level fields; child fields of
+        # nested types (struct, fixed_size_list, …) have their own IDs and must
+        # be included in the max-scan, otherwise next_fid collides with an
+        # existing child field ID and the committed fragment metadata will map
+        # the new file to the wrong schema field.
+        def _max_field_id(fields: Any) -> int:
+            best = -1
+            for f in fields:
+                best = max(best, f.id())
+                children = f.children() if callable(getattr(f, "children", None)) else []
+                if children:
+                    best = max(best, _max_field_id(children))
+            return best
+
+        next_fid = _max_field_id(self.lance_ds.lance_schema.fields()) + 1
 
         # Stitch new data file into fragment metadata
         new_file_entry = {
@@ -342,7 +364,11 @@ def _can_use_fast_path(
         return False
     if "fragment_id" not in df.column_names:
         return False
-    df_row_count = len(df.collect())
+    # Use count_rows() rather than collect() to avoid caching one-shot Python
+    # objects (e.g. BlobFile) into df._result_cache. collect() caches its result
+    # so a subsequent groupby().map_groups() would receive the same exhausted
+    # Python objects instead of fresh ones.
+    df_row_count = df.count_rows()
     ds_row_count = lance_ds.count_rows()
     return df_row_count == ds_row_count
 
