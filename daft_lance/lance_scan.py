@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Iterator
 from typing import Any
 
@@ -126,6 +127,26 @@ def _lance_count_result_function(
     arrow_batch = pa.RecordBatch.from_arrays([arrow_array], [required_column])
     result_batch = RecordBatch.from_arrow_record_batches([arrow_batch], arrow_schema)
     yield result_batch._recordbatch
+
+
+def _lancedb_table_factory_function(*args: Any, **kwargs: Any) -> Iterator[PyRecordBatch]:
+    warnings.warn(
+        "_lancedb_table_factory_function is deprecated and will be removed in a future release. "
+        "Use _lance_table_factory_function instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _lance_table_factory_function(*args, **kwargs)
+
+
+def _lancedb_count_result_function(*args: Any, **kwargs: Any) -> Iterator[PyRecordBatch]:
+    warnings.warn(
+        "_lancedb_count_result_function is deprecated and will be removed in a future release. "
+        "Use _lance_count_result_function instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _lance_count_result_function(*args, **kwargs)
 
 
 class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
@@ -486,3 +507,29 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
             return 0
 
         return sum(file.file_size_bytes for file in fragment.metadata.files if file.file_size_bytes is not None)
+
+
+class LanceDBScanOperator(LanceScanOperator):
+    def __init__(
+        self,
+        ds: lance.LanceDataset,
+        fragment_group_size: int | None = None,
+        include_fragment_id: bool | None = False,
+    ):
+        warnings.warn(
+            "LanceDBScanOperator is deprecated and will be removed in a future release. "
+            "Use LanceScanOperator instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(
+            ds,
+            fragment_group_size=fragment_group_size,
+            include_fragment_id=include_fragment_id,
+        )
+
+    def name(self) -> str:
+        return "LanceDBScanOperator"
+
+    def display_name(self) -> str:
+        return f"LanceDBScanOperator({self._ds.uri})"
