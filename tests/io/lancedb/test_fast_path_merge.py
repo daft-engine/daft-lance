@@ -587,3 +587,31 @@ class TestReadBackIntegrity:
 
         combined = sorted(zip(all_ids, all_doubled))
         assert combined == [(1, 2), (2, 4), (3, 6), (4, 8)]
+
+
+# ---------------------------------------------------------------------------
+# 10. Regressions
+# ---------------------------------------------------------------------------
+
+
+class TestRegressions:
+    def test_fast_path_check_does_not_set_result_cache(self, ds_path):
+        """Bug: _can_use_fast_path called df.collect(), which sets df._result_cache.
+
+        Daft caches collect() results in _result_cache. One-shot Python objects
+        in that cache (e.g. BlobFile from take_blobs()) are exhausted; when the
+        fast-path merge re-executes the pipeline via groupby().map_groups(), the
+        same stale objects are returned and downstream UDFs produce null/wrong output.
+
+        The fix uses df.count_rows() which does NOT populate _result_cache.
+        """
+        ds = create_dataset(ds_path, [{"id": [1, 2, 3]}])
+        df = read_with_metadata(ds_path).with_column("x", daft.lit(1))
+
+        assert getattr(df, "_result_cache", None) is None, "cache should start empty"
+        result = _can_use_fast_path(df, ds, "_rowaddr")
+        assert result is True
+        # count_rows() must not populate _result_cache; collect() would have done so
+        assert getattr(df, "_result_cache", None) is None, (
+            "_result_cache was set — fast-path check used collect() instead of count_rows()"
+        )
