@@ -314,8 +314,10 @@ class FastPathFragmentWriter:
                 writer.write_batch(b)
         file_size = os.path.getsize(filepath)
 
-        # Determine field IDs for the new columns
-        next_fid = max(f.id() for f in self.lance_ds.lance_schema.fields()) + 1
+        # Determine field IDs for the new columns. Lance's manifest-level
+        # max_field_id includes nested child fields and field IDs from dropped
+        # columns, so it is the correct high-water mark for dataset evolution.
+        next_fid = self.lance_ds.max_field_id + 1
 
         # Stitch new data file into fragment metadata
         new_file_entry = {
