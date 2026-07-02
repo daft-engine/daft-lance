@@ -342,7 +342,11 @@ def _can_use_fast_path(
         return False
     if "fragment_id" not in df.column_names:
         return False
-    df_row_count = len(df.collect())
+    # Use count_rows() rather than collect() to avoid caching one-shot Python
+    # objects (e.g. BlobFile) into df._result_cache. collect() caches its result
+    # so a subsequent groupby().map_groups() would receive the same exhausted
+    # Python objects instead of fresh ones.
+    df_row_count = df.count_rows()
     ds_row_count = lance_ds.count_rows()
     return df_row_count == ds_row_count
 
