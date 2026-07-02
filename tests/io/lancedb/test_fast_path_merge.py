@@ -14,8 +14,10 @@ import os
 import lance
 import pyarrow as pa
 import pytest
+from lance.blob import BlobType
 
 import daft
+import daft_lance
 from daft_lance.lance_merge_column import _can_use_fast_path, merge_columns_from_df
 
 # ---------------------------------------------------------------------------
@@ -126,6 +128,31 @@ class TestBasicCorrectness:
         result = ds2.to_table().sort_by("x").to_pydict()
         for x, y, z in zip(result["x"], result["y"], result["z"]):
             assert x + y == z
+
+    def test_fast_path_adds_blob_v2_column(self, ds_path):
+        lance.write_dataset(
+            pa.table({"id": [1, 2, 3], "val": [10, 20, 30]}),
+            ds_path,
+            data_storage_version="2.2",
+        )
+        df = read_with_metadata(ds_path)
+
+        @daft.func.batch(return_dtype=daft.DataType.binary())
+        def make_payload(ids):  # type: ignore[no-untyped-def]
+            return pa.array([f"payload-{id_}".encode() for id_ in ids.to_pylist()], type=pa.large_binary())
+
+        df = df.with_column("payload", make_payload(df["id"]))
+        ds2 = daft_lance.merge_columns_df(df, ds_path, blob_columns=["payload"])
+
+        field = ds2.schema.field("payload")
+        assert isinstance(field.type, BlobType)
+        rows = ds2.to_table(columns=["id"], with_row_id=True).to_pylist()
+        blobs = ds2.take_blobs("payload", [row["_rowid"] for row in rows])
+        assert {row["id"]: blob.read() for row, blob in zip(rows, blobs, strict=True)} == {
+            1: b"payload-1",
+            2: b"payload-2",
+            3: b"payload-3",
+        }
 
 
 # ---------------------------------------------------------------------------
