@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import pathlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
-
-import lance
+from typing import TYPE_CHECKING, Any, Literal
 
 from daft import context
 from daft.api_annotations import PublicAPI
@@ -15,9 +13,11 @@ from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.builder import LogicalPlanBuilder
 
 from .lance_compaction import compact_files_internal
+from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
 from .lance_scan import LanceDBScanOperator
+from .namespace import is_table_not_found, validate_uri_or_namespace
 from .utils import construct_lance_dataset
 
 if TYPE_CHECKING:
@@ -26,6 +26,19 @@ if TYPE_CHECKING:
 
     from daft.checkpoint import CheckpointConfig
     from daft.dependencies import pa
+
+
+def _effective_uri(lance_ds: LanceDataset, uri: str | pathlib.Path | None) -> str:
+    """The dataset location: the user-supplied URI, or the namespace-resolved one."""
+    return str(uri) if uri is not None else str(lance_ds.uri)
+
+
+def _effective_storage_options(
+    lance_ds: LanceDataset, storage_options: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Storage options actually used to open the dataset (includes namespace-vended ones)."""
+    open_kwargs = getattr(lance_ds, "_lance_open_kwargs", None) or {}
+    return open_kwargs.get("storage_options") or storage_options
 
 
 @PublicAPI
@@ -168,9 +181,12 @@ def read_lance(
 
 @PublicAPI
 def merge_columns(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
     transform: dict[str, str] | BatchUDF | Callable[[pa.lib.RecordBatch], pa.lib.RecordBatch] | None = None,
     read_columns: list[str] | None = None,
     reader_schema: pa.Schema | None = None,
@@ -229,12 +245,16 @@ def merge_columns(
         )
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = storage_options or io_config_to_storage_options(io_config, uri)
+    if uri is not None:
+        storage_options = storage_options or io_config_to_storage_options(io_config, uri)
 
     # Build Lance dataset handle for committing
     lance_ds = construct_lance_dataset(
         uri,
         storage_options=storage_options,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -246,11 +266,11 @@ def merge_columns(
 
     return merge_columns_internal(
         lance_ds,
-        uri,
+        _effective_uri(lance_ds, uri),
         transform=transform,
         read_columns=read_columns,
         reader_schema=reader_schema,
-        storage_options=storage_options,
+        storage_options=_effective_storage_options(lance_ds, storage_options),
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
     )
@@ -259,9 +279,12 @@ def merge_columns(
 @PublicAPI
 def merge_columns_df(
     df: DataFrame,
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
     read_columns: list[str] | None = None,
     reader_schema: pa.Schema | None = None,
     storage_options: dict[str, Any] | None = None,
@@ -325,12 +348,16 @@ def merge_columns_df(
         >>> daft_lance.merge_columns_df(df, "s3://my-lancedb-bucket/data/")
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = storage_options or io_config_to_storage_options(io_config, uri)
+    if uri is not None:
+        storage_options = storage_options or io_config_to_storage_options(io_config, uri)
 
     # Build Lance dataset handle for committing
     lance_ds = construct_lance_dataset(
         uri,
         storage_options=storage_options,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -349,10 +376,10 @@ def merge_columns_df(
     return merge_columns_from_df(
         df,
         lance_ds=lance_ds,
-        uri=uri,
+        uri=_effective_uri(lance_ds, uri),
         read_columns=read_columns,
         reader_schema=reader_schema,
-        storage_options=storage_options,
+        storage_options=_effective_storage_options(lance_ds, storage_options),
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
         left_on=left_on,
@@ -363,9 +390,12 @@ def merge_columns_df(
 
 @PublicAPI
 def create_scalar_index(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
     column: str,
     index_type: str = "INVERTED",
     name: str | None = None,
@@ -471,11 +501,15 @@ def create_scalar_index(
         >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="title", replace=False)
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = storage_options or io_config_to_storage_options(io_config, str(uri))
+    if uri is not None:
+        storage_options = storage_options or io_config_to_storage_options(io_config, str(uri))
 
     lance_ds = construct_lance_dataset(
         uri,
         storage_options=storage_options,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -487,12 +521,12 @@ def create_scalar_index(
 
     create_scalar_index_internal(
         lance_ds=lance_ds,
-        uri=uri,
+        uri=_effective_uri(lance_ds, uri),
         column=column,
         index_type=index_type,
         name=name,
         replace=replace,
-        storage_options=storage_options,
+        storage_options=_effective_storage_options(lance_ds, storage_options),
         fragment_group_size=fragment_group_size,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
@@ -503,9 +537,12 @@ def create_scalar_index(
 
 @PublicAPI
 def compact_files(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
     storage_options: dict[str, Any] | None = None,
     version: int | str | None = None,
     asof: str | None = None,
@@ -556,13 +593,17 @@ def compact_files(
         RuntimeError: When compaction fails or no successful results
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = storage_options or io_config_to_storage_options(
-        io_config, str(uri) if isinstance(uri, pathlib.Path) else uri
-    )
+    if uri is not None:
+        storage_options = storage_options or io_config_to_storage_options(
+            io_config, str(uri) if isinstance(uri, pathlib.Path) else uri
+        )
 
-    lance_ds = lance.dataset(
+    lance_ds = construct_lance_dataset(
         uri,
         storage_options=storage_options,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -578,3 +619,159 @@ def compact_files(
         partition_num=partition_num,
         concurrency=concurrency,
     )
+
+
+def _is_missing_dataset_error(error: Exception) -> bool:
+    """Whether opening a dataset failed because it does not exist yet."""
+    if isinstance(error, (FileNotFoundError,)):
+        return True
+    if isinstance(error, (ValueError, OSError)) and "was not found" in str(error):
+        return True
+    return is_table_not_found(error)
+
+
+def _stats_dataframe(lance_ds: LanceDataset) -> DataFrame:
+    """Build the same stats DataFrame that LanceDataSink.finalize returns."""
+    import pyarrow as _pa
+
+    from daft.recordbatch import MicroPartition
+
+    stats = lance_ds.stats.dataset_stats()
+    return DataFrame._from_micropartitions(
+        MicroPartition.from_pydict(
+            {
+                "num_fragments": _pa.array([stats["num_fragments"]], type=_pa.int64()),
+                "num_deleted_rows": _pa.array([stats["num_deleted_rows"]], type=_pa.int64()),
+                "num_small_files": _pa.array([stats["num_small_files"]], type=_pa.int64()),
+                "version": _pa.array([lance_ds.version], type=_pa.int64()),
+            }
+        )
+    )
+
+
+@PublicAPI
+def write_lance(
+    df: DataFrame,
+    uri: str | pathlib.Path | None = None,
+    mode: Literal["create", "append", "overwrite", "merge"] = "create",
+    io_config: IOConfig | None = None,
+    schema: Any | None = None,
+    left_on: str | None = None,
+    right_on: str | None = None,
+    *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    **kwargs: Any,
+) -> DataFrame:
+    """Write a DataFrame to a Lance table, addressed by URI or by Lance Namespace.
+
+    Args:
+        df: The DataFrame to write.
+        uri: The URI of the Lance table. Mutually exclusive with the namespace parameters.
+        mode: One of "create", "append", "overwrite", or "merge" (add new columns to
+            existing rows; requires ``fragment_id`` and a join key column in ``df``).
+        io_config: A custom IOConfig to use when accessing Lance data.
+        schema: Desired schema to enforce during write; defaults to the DataFrame schema.
+        left_on/right_on: Join keys for ``mode="merge"``; default "_rowaddr".
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
+        **kwargs: Additional arguments forwarded to the Lance writer.
+
+    Returns:
+        DataFrame: write statistics (num_fragments, num_deleted_rows, num_small_files, version).
+
+    Examples:
+        >>> import daft, daft_lance
+        >>> df = daft.from_pydict({"id": [1, 2]})
+        >>> daft_lance.write_lance(
+        ...     df, namespace_impl="dir", namespace_properties={"root": "/tmp/tables"}, table_id=["t"]
+        ... ).collect()  # doctest: +SKIP
+    """
+    validate_uri_or_namespace(uri, namespace_impl, table_id)
+
+    if schema is None:
+        schema = df.schema()
+
+    if mode != "merge":
+        sanitized_kwargs = {k: v for k, v in kwargs.items() if k not in ("left_on", "right_on")}
+        sink = LanceDataSink(
+            uri,
+            schema,
+            mode,
+            io_config,
+            table_id=table_id,
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+            **sanitized_kwargs,
+        )
+        return df.write_sink(sink)
+
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    storage_options = kwargs.pop("storage_options", None)
+    if uri is not None:
+        storage_options = storage_options or io_config_to_storage_options(io_config, str(uri))
+
+    lance_ds: LanceDataset | None
+    try:
+        lance_ds = construct_lance_dataset(
+            uri,
+            storage_options=storage_options,
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+            table_id=table_id,
+        )
+    except Exception as error:
+        if not _is_missing_dataset_error(error):
+            raise
+        lance_ds = None
+
+    sanitized_kwargs = {k: v for k, v in kwargs.items() if k not in ("left_on", "right_on")}
+
+    if lance_ds is None:
+        # Merge against a missing table degenerates to create.
+        sink = LanceDataSink(
+            uri,
+            schema,
+            "create",
+            io_config,
+            table_id=table_id,
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+            storage_options=storage_options,
+            **sanitized_kwargs,
+        )
+        return df.write_sink(sink)
+
+    existing_fields = {getattr(f, "name", str(f)) for f in lance_ds.schema}
+    meta_exclusions = {"fragment_id", "_rowaddr", "_rowid"}
+    new_cols = [c for c in df.column_names if c not in existing_fields and c not in meta_exclusions]
+
+    if len(new_cols) == 0:
+        # No schema evolution: merge degenerates to append.
+        sink = LanceDataSink(
+            uri,
+            schema,
+            "append",
+            io_config,
+            table_id=table_id,
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+            storage_options=storage_options,
+            **sanitized_kwargs,
+        )
+        return df.write_sink(sink)
+
+    join_left = left_on or "_rowaddr"
+    join_right = right_on or join_left
+    merged = merge_columns_from_df(
+        df,
+        lance_ds=lance_ds,
+        uri=_effective_uri(lance_ds, uri),
+        left_on=join_left,
+        right_on=join_right,
+        storage_options=_effective_storage_options(lance_ds, storage_options),
+    )
+    return _stats_dataframe(merged)

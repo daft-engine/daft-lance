@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 import lance
 
 from daft.dependencies import pa
+from daft_lance.namespace import namespace_kwargs_for_dataset
 from daft_lance.utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
@@ -386,7 +387,10 @@ def _create_segmented_index(
 
     # Reload dataset to pick up the latest version (segment files were written
     # by workers against the version that was current at their invocation time).
-    lance_ds = lance.LanceDataset(uri, storage_options=storage_options)
+    namespace_kwargs = namespace_kwargs_for_dataset(lance_ds)
+    lance_ds = lance.dataset(
+        None if namespace_kwargs else uri, storage_options=storage_options, **namespace_kwargs
+    )
     index_metas = _prepare_index_segments_for_commit(lance_ds, index_type, index_metas)
 
     logger.info(
@@ -460,7 +464,10 @@ def _create_partitioned_index(
         df.collect()
 
     logger.info("Starting index metadata merging by reloading dataset to get latest state")
-    lance_ds = lance.LanceDataset(uri, storage_options=storage_options)
+    namespace_kwargs = namespace_kwargs_for_dataset(lance_ds)
+    lance_ds = lance.dataset(
+        None if namespace_kwargs else uri, storage_options=storage_options, **namespace_kwargs
+    )
     lance_ds.merge_index_metadata(index_id, index_type)
 
     logger.info("Starting atomic index creation and commit")
@@ -506,6 +513,7 @@ def _create_partitioned_index(
         create_index_op,
         read_version=lance_ds.version,
         storage_options=storage_options,
+        **namespace_kwargs,
     )
 
     logger.info("Index %s created successfully with ID %s", name, index_id)

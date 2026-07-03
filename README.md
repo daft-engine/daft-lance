@@ -40,25 +40,60 @@ merge_columns_df(df, "s3://bucket/my_dataset")
 
 ### Namespace Tables
 
+Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance-namespace/)
+(catalog) instead of a raw URI. Pass `namespace_impl` + `namespace_properties` + `table_id`
+in place of `uri` — the namespace resolves the table's storage location and vends any storage
+credentials. This works across `read_lance`, `write_lance`, `merge_columns_df`,
+`create_scalar_index`, and `compact_files`.
+
 ```python
 import daft
-import daft_lance  # installs daft.read_lance / DataFrame.write_lance namespace support
+import daft_lance
 
 table_id = ["my_table"]
-namespace_properties = {"root": "/tmp/lance_tables"}
+namespace = {"namespace_impl": "dir", "namespace_properties": {"root": "/tmp/lance_tables"}}
 
-df.write_lance(
-    namespace_impl="dir",
-    namespace_properties=namespace_properties,
+daft_lance.write_lance(
+    daft.from_pydict({"id": [1, 2, 3]}),
     table_id=table_id,
     mode="create",
+    **namespace,
 ).collect()
 
-df = daft.read_lance(
-    namespace_impl="dir",
-    namespace_properties=namespace_properties,
-    table_id=table_id,
-)
+df = daft_lance.read_lance(table_id=table_id, **namespace)
+```
+
+`uri` and the namespace parameters are mutually exclusive: provide exactly one of `uri` or
+(`namespace_impl` + `table_id`).
+
+#### Using a REST namespace (e.g. Gravitino Lance REST server)
+
+```python
+namespace = {
+    "namespace_impl": "rest",
+    "namespace_properties": {"uri": "http://127.0.0.1:9101/lance"},
+}
+table_id = ["lance_catalog", "sales", "orders"]
+
+daft_lance.write_lance(df, table_id=table_id, mode="create", **namespace).collect()
+daft_lance.read_lance(table_id=table_id, **namespace).show()
+```
+
+When the catalog holds the storage configuration (bucket, endpoint, credentials), the
+`describe_table` response vends `storage_options` to the client, so you do not need to pass
+object-store credentials yourself.
+
+#### Drop-in Daft APIs
+
+If you prefer Daft's own entry points, call `daft_lance.patch_daft()` once to route
+`daft.read_lance` and `DataFrame.write_lance` through daft-lance (namespace parameters included):
+
+```python
+import daft, daft_lance
+
+daft_lance.patch_daft()
+df.write_lance(table_id=["my_table"], mode="create", **namespace).collect()
+daft.read_lance(table_id=["my_table"], **namespace).show()
 ```
 
 ## Migration

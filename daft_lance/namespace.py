@@ -8,19 +8,6 @@ from urllib.parse import urlparse
 import lance
 
 _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "16"))
-_PYLANCE_5 = (5, 0, 0)
-
-
-@lru_cache(maxsize=1)
-def _pylance_version() -> tuple[int, ...]:
-    version = getattr(lance, "__version__", "0.0.0")
-    parts = []
-    for part in version.split(".")[:3]:
-        digits = "".join(ch for ch in part if ch.isdigit())
-        parts.append(int(digits or "0"))
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts)
 
 
 def has_namespace_params(namespace_impl: str | None, table_id: list[str] | None) -> bool:
@@ -69,56 +56,26 @@ def get_or_create_namespace(namespace_impl: str | None, namespace_properties: di
     return _get_cached_namespace(namespace_impl, namespace_properties_tuple)
 
 
-def _create_storage_options_provider(
-    namespace_impl: str | None,
-    namespace_properties: dict[str, str] | None,
-    table_id: list[str] | None,
-) -> Any | None:
-    if not has_namespace_params(namespace_impl, table_id):
-        return None
-    namespace = get_or_create_namespace(namespace_impl, namespace_properties)
-    if namespace is None or not hasattr(lance, "LanceNamespaceStorageOptionsProvider"):
-        return None
-    return lance.LanceNamespaceStorageOptionsProvider(namespace=namespace, table_id=table_id)
-
-
 def get_namespace_kwargs(
     namespace_impl: str | None,
     namespace_properties: dict[str, str] | None,
     table_id: list[str] | None,
 ) -> dict[str, Any]:
+    """Kwargs wiring a namespace client into pylance APIs (``lance.dataset``, ``commit``, ...).
+
+    Requires pylance >= 7 which accepts ``namespace_client`` + ``table_id`` natively.
+    """
     if not has_namespace_params(namespace_impl, table_id):
         return {}
 
     namespace = get_or_create_namespace(namespace_impl, namespace_properties)
     if namespace is None:
         return {}
-
-    kwargs: dict[str, Any] = {"table_id": table_id}
-    if _pylance_version() >= _PYLANCE_5:
-        kwargs["namespace_client"] = namespace
-    else:
-        kwargs["namespace"] = namespace
-        provider = _create_storage_options_provider(namespace_impl, namespace_properties, table_id)
-        if provider is not None:
-            kwargs["storage_options_provider"] = provider
-    return kwargs
+    return {"namespace_client": namespace, "table_id": table_id}
 
 
-def get_write_fragments_kwargs(
-    namespace_impl: str | None,
-    namespace_properties: dict[str, str] | None,
-    table_id: list[str] | None,
-) -> dict[str, Any]:
-    if not has_namespace_params(namespace_impl, table_id):
-        return {}
-    if _pylance_version() >= _PYLANCE_5:
-        namespace = get_or_create_namespace(namespace_impl, namespace_properties)
-        if namespace is None:
-            return {}
-        return {"namespace_client": namespace, "table_id": table_id}
-    provider = _create_storage_options_provider(namespace_impl, namespace_properties, table_id)
-    return {"storage_options_provider": provider} if provider is not None else {}
+# `lance.fragment.write_fragments` accepts the same namespace kwargs as `lance.dataset`.
+get_write_fragments_kwargs = get_namespace_kwargs
 
 
 def _storage_options(response: Any) -> dict[str, str] | None:
@@ -136,16 +93,27 @@ def _response_location(response: Any) -> str:
 
 
 def _declare_table(namespace: Any, table_id: list[str]) -> tuple[str, dict[str, str] | None]:
+    from lance_namespace import DeclareTableRequest
+
+    response = namespace.declare_table(DeclareTableRequest(id=table_id, location=None))
+    return _response_location(response), _storage_options(response)
+
+
+def is_table_not_found(error: Exception) -> bool:
+    """Whether an exception from ``describe_table`` means the table does not exist.
+
+    Native implementations raise the typed ``TableNotFoundError``; the Rust-backed
+    REST client surfaces untyped errors, so fall back to message matching.
+    """
     try:
-        from lance_namespace import DeclareTableRequest
+        from lance_namespace.errors import TableNotFoundError
 
-        response = namespace.declare_table(DeclareTableRequest(id=table_id, location=None))
-        return _response_location(response), _storage_options(response)
-    except (AttributeError, NotImplementedError):
-        from lance_namespace import CreateEmptyTableRequest
-
-        response = namespace.create_empty_table(CreateEmptyTableRequest(id=table_id))
-        return _response_location(response), _storage_options(response)
+        if isinstance(error, TableNotFoundError):
+            return True
+    except ImportError:
+        pass
+    message = str(error).lower()
+    return "not found" in message or "does not exist" in message or "no such table" in message
 
 
 def resolve_namespace_table(
@@ -155,6 +123,11 @@ def resolve_namespace_table(
     table_id: list[str] | None,
     mode: str = "read",
 ) -> tuple[str | None, dict[str, str] | None]:
+    """Resolve a namespace table to ``(location, storage_options)``.
+
+    ``mode="create"`` declares the table; ``mode="overwrite"`` declares it only when
+    it does not exist yet; other modes require the table to exist.
+    """
     namespace = get_or_create_namespace(namespace_impl, namespace_properties)
     if namespace is None or table_id is None:
         return None, None
@@ -167,8 +140,8 @@ def resolve_namespace_table(
     try:
         response = namespace.describe_table(DescribeTableRequest(id=table_id))
         return _response_location(response), _storage_options(response)
-    except Exception:
-        if mode == "overwrite":
+    except Exception as error:
+        if mode == "overwrite" and is_table_not_found(error):
             return _declare_table(namespace, table_id)
         raise
 
@@ -185,33 +158,40 @@ def merge_storage_options(
     return merged or None
 
 
-def open_lance_dataset(
-    uri: str | os.PathLike[str] | None,
-    *,
-    storage_options: dict[str, Any] | None = None,
-    namespace_impl: str | None = None,
-    namespace_properties: dict[str, str] | None = None,
-    table_id: list[str] | None = None,
-    mode: str = "read",
-    **kwargs: Any,
-) -> lance.LanceDataset:
-    validate_uri_or_namespace(uri, namespace_impl, table_id)
-    resolved_uri = str(uri) if uri is not None else None
-    namespace_storage_options = None
-    if resolved_uri is None:
-        resolved_uri, namespace_storage_options = resolve_namespace_table(
-            namespace_impl=namespace_impl,
-            namespace_properties=namespace_properties,
-            table_id=table_id,
-            mode=mode,
-        )
-    if resolved_uri is None:
-        raise ValueError("Unable to resolve Lance dataset URI.")
+def pop_namespace_params(open_kwargs: dict[str, Any]) -> tuple[str | None, dict[str, str] | None, list[str] | None]:
+    """Remove and return the namespace triple from a ``_lance_open_kwargs`` dict."""
+    return (
+        open_kwargs.pop("namespace_impl", None),
+        open_kwargs.pop("namespace_properties", None),
+        open_kwargs.pop("table_id", None),
+    )
 
-    merged_storage_options = merge_storage_options(storage_options, namespace_storage_options)
+
+def namespace_kwargs_for_dataset(ds: Any) -> dict[str, Any]:
+    """Namespace kwargs for commit-style calls, recovered from ``ds._lance_open_kwargs``.
+
+    ``lance.LanceDataset.commit`` is a static method, so a dataset opened through a
+    namespace does not carry its client into commits; re-derive it from the open
+    kwargs stashed by ``construct_lance_dataset``.
+    """
+    open_kwargs = getattr(ds, "_lance_open_kwargs", None) or {}
+    return get_namespace_kwargs(
+        open_kwargs.get("namespace_impl"),
+        open_kwargs.get("namespace_properties"),
+        open_kwargs.get("table_id"),
+    )
+
+
+def open_dataset_from_open_kwargs(ds_uri: str | None, open_kwargs: dict[str, Any] | None) -> lance.LanceDataset:
+    """Re-open a dataset on a worker from serialized ``_lance_open_kwargs``.
+
+    The namespace client is not picklable, so only the (impl, properties, table_id)
+    triple travels with the task; the client is re-created here via the lru cache.
+    """
+    open_kwargs = dict(open_kwargs or {})
+    namespace_impl, namespace_properties, table_id = pop_namespace_params(open_kwargs)
     return lance.dataset(
-        None if has_namespace_params(namespace_impl, table_id) else resolved_uri,
-        storage_options=merged_storage_options,
+        None if has_namespace_params(namespace_impl, table_id) else ds_uri,
         **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
-        **kwargs,
+        **open_kwargs,
     )

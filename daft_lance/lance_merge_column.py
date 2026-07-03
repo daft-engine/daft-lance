@@ -14,6 +14,8 @@ from daft.datatype import DataType
 from daft.udf import cls as daft_cls
 from daft.udf import method
 
+from .namespace import namespace_kwargs_for_dataset
+
 if TYPE_CHECKING:
     import pathlib
     from collections.abc import Callable
@@ -93,6 +95,7 @@ def merge_columns_internal(
         op,
         read_version=lance_ds.version,
         storage_options=storage_options,
+        **namespace_kwargs_for_dataset(lance_ds),
     )
 
 
@@ -473,6 +476,7 @@ def _merge_fast_path(
         op,
         read_version=lance_ds.version,
         storage_options=storage_options,
+        **namespace_kwargs_for_dataset(lance_ds),
     )
 
 
@@ -521,4 +525,5 @@ def _merge_slow_path(
         op,
         read_version=lance_ds.version,
         storage_options=storage_options,
+        **namespace_kwargs_for_dataset(lance_ds),
     )
