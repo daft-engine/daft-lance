@@ -10,6 +10,7 @@ repos:
     additional_dependencies:
       - 'daft>=0.7.0'
       - 'pylance>=6.0.0'
+      - 'pyarrow-stubs>=20.0.0'
 
 - repo: https://github.com/pre-commit/pre-commit-hooks
   rev: v6.0.0
@@ -26,6 +27,7 @@ repos:
   hooks:
   - id: pretty-format-toml
     args: [--autofix, --no-sort]
+    exclude: uv.lock
 
 - repo: https://github.com/astral-sh/ruff-pre-commit
   # ruff version.

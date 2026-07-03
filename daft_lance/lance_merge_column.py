@@ -142,13 +142,13 @@ class GroupFragmentMergeUDF:
                 f"GroupFragmentMergeUDF expected {len(self.read_columns)} data columns, received {len(data_cols)}."
             )
 
-        arrays: list[_pa.Array] = []
+        arrays: list[_pa.Array[Any]] = []
 
         for col_name, s in zip(self.read_columns, data_cols):
             pylist = s.to_pylist() if hasattr(s, "to_pylist") else list(s)
 
             if col_name == self.right_on:
-                key_arr: _pa.Array
+                key_arr: _pa.Array[Any]
                 if self.right_on == "_rowaddr":
                     key_arr = _pa.array(pylist, type=_pa.uint64())
                 else:
