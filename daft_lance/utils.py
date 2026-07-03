@@ -106,14 +106,14 @@ def construct_lance_dataset(
     }
     effective_kwargs.update(kwargs or {})
     try:
-        ds._lance_open_kwargs = effective_kwargs
+        ds._lance_open_kwargs = effective_kwargs  # type: ignore[attr-defined]
     except Exception:
         pass
 
     # Preserve the full user-provided defaults (including nearest) for Daft's planning
     # even if we stripped keys out before calling `lance.dataset`.
     try:
-        ds._daft_default_scan_options = original_default_scan_options
+        ds._daft_default_scan_options = original_default_scan_options  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -174,4 +174,7 @@ def select_required_columns(schema: pa.Schema, required_columns: list[str] | Non
     if missing:
         raise KeyError(f"Required columns missing in schema: {missing}")
     fields = [schema.field(schema.get_field_index(c)) for c in required_columns]
-    return pa.schema(fields, metadata=schema.metadata)
+    metadata: dict[bytes | str, bytes | str] | None = (
+        {k: v for k, v in schema.metadata.items()} if schema.metadata else None
+    )
+    return pa.schema(fields, metadata=metadata)

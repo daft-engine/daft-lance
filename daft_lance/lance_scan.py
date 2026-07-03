@@ -143,7 +143,10 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         self._enable_strict_filter_pushdown = get_context().daft_planning_config.enable_strict_filter_pushdown
         base = self._ds.schema
         if self._include_fragment_id:
-            base = pa.schema([*base, pa.field("fragment_id", pa.int64())], metadata=base.metadata)
+            metadata: dict[bytes | str, bytes | str] | None = (
+                {k: v for k, v in base.metadata.items()} if base.metadata else None
+            )
+            base = pa.schema([*base, pa.field("fragment_id", pa.int64())], metadata=metadata)
         self._schema = convert_lance_schema(base)
 
     def name(self) -> str:
