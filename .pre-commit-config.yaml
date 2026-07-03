@@ -26,6 +26,7 @@ repos:
   hooks:
   - id: pretty-format-toml
     args: [--autofix, --no-sort]
+    exclude: uv.lock
 
 - repo: https://github.com/astral-sh/ruff-pre-commit
   # ruff version.
