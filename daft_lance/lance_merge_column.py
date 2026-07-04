@@ -267,10 +267,18 @@ class FastPathFragmentWriter:
 
         rowaddrs = rowaddr_col.to_pylist() if hasattr(rowaddr_col, "to_pylist") else list(rowaddr_col)
 
-        # Build table of new columns
+        # Build table of new columns, preserving the Arrow type from the daft Series.
+        # pa.array(s.to_pylist()) loses type information: fixed_size_list<float32>[N]
+        # becomes list<double> because Python floats are float64 and list structure is
+        # inferred from Python lists. Using s.to_arrow() avoids this type erasure.
         arrays = []
         for s in data_cols:
-            arr = _pa.array(s.to_pylist() if hasattr(s, "to_pylist") else list(s))
+            if hasattr(s, "to_arrow"):
+                arr = s.to_arrow()
+                if isinstance(arr, _pa.ChunkedArray):
+                    arr = arr.combine_chunks()
+            else:
+                arr = _pa.array(list(s))
             arrays.append(arr)
         tbl = _pa.table({name: arr for name, arr in zip(self.new_column_names, arrays)})
 

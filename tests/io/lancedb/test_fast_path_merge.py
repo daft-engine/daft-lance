@@ -615,3 +615,36 @@ class TestRegressions:
         assert getattr(df, "_result_cache", None) is None, (
             "_result_cache was set — fast-path check used collect() instead of count_rows()"
         )
+
+    def test_fixed_size_list_float32_type_preserved(self, ds_path):
+        """Bug: pa.array(s.to_pylist()) erases fixed_size_list<float32>[N] → list<float64>.
+
+        Python floats are float64 and list structure is inferred from nested Python lists,
+        so the Arrow type is lost. The fix uses s.to_arrow().combine_chunks() which
+        preserves the declared daft return type exactly.
+        """
+        N = 8
+        ds = create_dataset(ds_path, [{"id": [1, 2, 3]}])
+        df = read_with_metadata(ds_path)
+
+        @daft.func.batch(return_dtype=daft.DataType.fixed_size_list(daft.DataType.float32(), N))
+        def _make_vec(ids):
+            import numpy as np
+
+            return [np.array([float(i)] * N, dtype=np.float32) for i in ids.to_pylist()]
+
+        df = df.with_column("embedding", _make_vec(daft.col("id")))
+        ds2 = merge_columns_from_df(df, ds, ds_path)
+
+        field = ds2.schema.field("embedding")
+        # Type must be preserved: fixed_size_list<float32>[N], NOT list<float64>
+        assert pa.types.is_fixed_size_list(field.type), f"Expected fixed_size_list, got {field.type}"
+        assert field.type.list_size == N
+        assert field.type.value_type == pa.float32(), f"Expected float32 values, got {field.type.value_type}"
+
+        result = ds2.to_table().sort_by("id").to_pydict()
+        for i, emb in zip(result["id"], result["embedding"]):
+            assert emb is not None, f"Embedding for id={i} is null"
+            assert len(emb) == N
+            for v in emb:
+                assert pytest.approx(float(i), rel=1e-5) == v
