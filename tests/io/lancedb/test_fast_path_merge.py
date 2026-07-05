@@ -648,3 +648,36 @@ class TestRegressions:
             assert len(emb) == N
             for v in emb:
                 assert pytest.approx(float(i), rel=1e-5) == v
+
+    def test_next_fid_uses_manifest_max_field_id(self, ds_path):
+        """Bug: next_fid only scanned top-level lance_schema.fields(), missing child IDs.
+
+        A struct column with M children occupies M+1 Lance field IDs (1 for parent +
+        M for children). With top-level-only scan: max_id = num_top_level_fields - 1,
+        next_fid can collide with a child field ID, and the new file's fragment metadata
+        maps to the wrong schema field → the new column reads back as null.
+
+        Example layout for table with id(0) + meta struct(1, children a=2, b=3):
+          top-level scan       → max=1, next_fid=2 (WRONG: collides with meta.a)
+          ds.max_field_id scan → max=3, next_fid=4 (CORRECT)
+
+        The fix uses Lance's manifest-level max_field_id, which includes child IDs.
+        """
+        struct_type = pa.struct([("a", pa.int64()), ("b", pa.utf8())])
+        rows = [{"a": i, "b": f"s{i}"} for i in [1, 2, 3]]
+        tbl = pa.table(
+            {
+                "id": pa.array([1, 2, 3], type=pa.int64()),
+                "meta": pa.array(rows, type=struct_type),
+            }
+        )
+        lance.write_dataset(tbl, ds_path)
+        ds = lance.dataset(ds_path)
+
+        df = read_with_metadata(ds_path)
+        df = df.with_column("score", daft.col("id").cast(daft.DataType.int64()) * 10)
+        ds2 = merge_columns_from_df(df, ds, ds_path)
+
+        result = ds2.to_table().sort_by("id").to_pydict()
+        assert result["score"] == [10, 20, 30], f"score is null or wrong (field ID collision): {result['score']}"
+        assert result["id"] == [1, 2, 3]
