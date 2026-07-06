@@ -2,13 +2,13 @@
 name = "daft-lance"
 version = "0.4.0"
 description = "Lance integration for Daft - compaction, indexing, merge columns, and REST operations"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 readme = "README.md"
 dependencies = [
   "lance-namespace>=0.6.0",
   "lance-namespace-urllib3-client>=0.6.0",
-  "pylance>=7.0.0"
+  "pylance>=8.0.0"
 ]
 
 [dependency-groups]
