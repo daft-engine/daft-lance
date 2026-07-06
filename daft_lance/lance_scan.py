@@ -32,6 +32,7 @@ def _lancedb_table_factory_function(
     limit: int | None = None,
     include_fragment_id: bool | None = False,
     nearest: dict[str, Any] | None = None,
+    scan_options: dict[str, Any] | None = None,
 ) -> Iterator[PyRecordBatch]:
     if fragment_ids is not None and nearest is not None:
         raise ValueError(
@@ -59,13 +60,15 @@ def _lancedb_table_factory_function(
             if limit is not None:
                 fragment_limit = limit - rows_yielded
 
-            scanner = ds.scanner(
+            scanner_kwargs = dict(scan_options or {})
+            scanner_kwargs.setdefault("blob_handling", "blobs_descriptions")
+            scanner_kwargs.update(
                 fragments=[fragment],
                 columns=cols or None,
                 filter=filter,
                 limit=fragment_limit,
-                blob_handling="blobs_descriptions",
             )
+            scanner = ds.scanner(**scanner_kwargs)
 
             for rb in scanner.to_batches():
                 # If we have a limit, we may need to truncate this batch
@@ -89,13 +92,15 @@ def _lancedb_table_factory_function(
 
     # If fragment_ids is None, let Lance choose fragments via index; omit the fragments parameter.
     if fragment_ids is None:
-        scanner = ds.scanner(
+        scanner_kwargs = dict(scan_options or {})
+        scanner_kwargs.setdefault("blob_handling", "blobs_descriptions")
+        scanner_kwargs.update(
             columns=required_columns,
             filter=filter,
             limit=limit,
             nearest=nearest,
-            blob_handling="blobs_descriptions",
         )
+        scanner = ds.scanner(**scanner_kwargs)
 
         def _batches() -> Iterator[PyRecordBatch]:
             for rb in scanner.to_batches():
@@ -134,12 +139,14 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         ds: lance.LanceDataset,
         fragment_group_size: int | None = None,
         include_fragment_id: bool | None = False,
+        scan_options: dict[str, Any] | None = None,
     ):
         self._ds = ds
         self._pushed_filters: list[PyExpr] | None = None
         self._remaining_filters: list[PyExpr] | None = None
         self._fragment_group_size = fragment_group_size
         self._include_fragment_id = include_fragment_id
+        self._scan_options = scan_options
         self._enable_strict_filter_pushdown = get_context().daft_planning_config.enable_strict_filter_pushdown
         base = self._ds.schema
         if self._include_fragment_id:
@@ -307,6 +314,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                         rows_to_scan,
                         self._include_fragment_id,
                         None,
+                        self._scan_options,
                     ),
                     schema=task_schema._schema,
                     num_rows=rows_to_scan,
@@ -342,6 +350,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                     self._compute_limit_pushdown_with_filter(pushdowns),
                     self._include_fragment_id,
                     nearest_option,
+                    self._scan_options,
                 ),
                 schema=self.schema()._schema,
                 num_rows=num_rows,

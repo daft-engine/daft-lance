@@ -41,6 +41,7 @@ def read_lance(
     metadata_cache_size_bytes: int | None = None,
     fragment_group_size: int | None = None,
     include_fragment_id: bool | None = None,
+    scan_options: dict[str, Any] | None = None,
     checkpoint: CheckpointConfig | None = None,
 ) -> DataFrame:
     """Create a DataFrame from a LanceDB table.
@@ -94,6 +95,22 @@ def read_lance(
         include_fragment_id : Optional, bool
             Whether to display fragment_id.
             if you have the behavior of 'merge_columns_df' or 'write_lance(mode = 'merge')', the `include_fragment_id` must be set to True
+        scan_options : optional, dict
+            Additional keyword arguments forwarded to ``lance.LanceDataset.scanner()``
+            at scan time.  Use this to tune scan performance, e.g.::
+
+                scan_options = {
+                    "batch_size": 8192,
+                    "batch_readahead": 16,
+                    "fragment_readahead": 4,
+                    "scan_in_order": False,
+                }
+
+            Supported keys include ``batch_size``, ``batch_readahead``,
+            ``fragment_readahead``, ``scan_in_order``, ``late_materialization``,
+            ``prefilter``, ``offset``, ``use_scalar_index``, and ``io_buffer_size``.
+            Unknown keys are forwarded as-is so that future Lance scanner parameters
+            work without a daft-lance upgrade.
         checkpoint: Optional :class:`daft.CheckpointConfig` for progress tracking across runs. Bundles the
             checkpoint store, the source key column (``on=``), and optional anti-join tuning. Rows whose key
             already exists in the store are skipped on re-run. Requires the Ray runner.
@@ -121,6 +138,10 @@ def read_lance(
         >>> from daft.io import S3Config, IOConfig
         >>> io_config = IOConfig(s3=S3Config(region="us-west-2", anonymous=True))
         >>> df = daft.read_lance("s3://daft-oss-public-data/lance/words-test-dataset", io_config=io_config)
+        >>> df.show()
+
+        Read a LanceDB table with scan performance tuning:
+        >>> df = daft.read_lance("/path/to/lance/data/", scan_options={"batch_size": 8192, "scan_in_order": False})
         >>> df.show()
     """
     uri_str = str(uri)
@@ -151,6 +172,7 @@ def read_lance(
         ds,
         fragment_group_size=fragment_group_size,
         include_fragment_id=include_fragment_id,
+        scan_options=scan_options,
     )
 
     handle = ScanOperatorHandle.from_python_scan_operator(lance_operator)

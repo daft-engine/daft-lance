@@ -415,3 +415,53 @@ def test_lancedb_limit_with_filter_and_fragment_grouping_single_task(large_lance
 
     result = df.to_pydict()
     assert result == {"big_int": [999]}
+
+
+def test_lancedb_read_with_scan_options(lance_dataset_path):
+    """Test that scan_options are accepted and forwarded to the Lance scanner."""
+    import daft_lance
+
+    df = daft_lance.read_lance(
+        lance_dataset_path,
+        scan_options={
+            "batch_size": 512,
+            "scan_in_order": True,
+        },
+    )
+    assert df.to_pydict() == data
+
+
+def test_lancedb_read_scan_options_with_filter_and_limit(large_lance_dataset_path):
+    """Test scan_options work together with filters and limits."""
+    import daft_lance
+
+    df = daft_lance.read_lance(
+        large_lance_dataset_path,
+        scan_options={"batch_size": 256, "scan_in_order": False},
+    )
+    df = df.filter("big_int < 100").limit(50).select("big_int")
+
+    result = df.to_pydict()
+    assert len(result["big_int"]) == 50
+
+
+def test_lancedb_read_scan_options_with_fragment_grouping(large_lance_dataset_path):
+    """Test scan_options combined with fragment grouping."""
+    import daft_lance
+
+    df = daft_lance.read_lance(
+        large_lance_dataset_path,
+        fragment_group_size=5,
+        scan_options={"batch_size": 1024},
+    )
+    result = df.to_pydict()
+    assert len(result["vector"]) == 10000
+    assert len(result["big_int"]) == 10000
+
+
+def test_lancedb_read_scan_options_none(lance_dataset_path):
+    """Test that scan_options=None (default) behaves identically to no scan_options."""
+    import daft_lance
+
+    df = daft_lance.read_lance(lance_dataset_path, scan_options=None)
+    assert df.to_pydict() == data
