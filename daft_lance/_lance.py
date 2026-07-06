@@ -486,6 +486,149 @@ def create_scalar_index(
     )
 
 
+_VECTOR_INDEX_TYPES = frozenset({"IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_FLAT", "IVF_SQ"})
+
+
+@PublicAPI
+def create_vector_index(
+    uri: str | pathlib.Path,
+    io_config: IOConfig | None = None,
+    *,
+    column: str,
+    index_type: str = "IVF_PQ",
+    name: str | None = None,
+    metric: str = "L2",
+    replace: bool = True,
+    num_partitions: int | None = None,
+    num_sub_vectors: int | None = None,
+    accelerator: str | None = None,
+    storage_options: dict[str, Any] | None = None,
+    version: int | str | None = None,
+    asof: str | None = None,
+    block_size: int | None = None,
+    commit_lock: Any | None = None,
+    index_cache_size: int | None = None,
+    default_scan_options: dict[str, Any] | None = None,
+    metadata_cache_size_bytes: int | None = None,
+    **kwargs: Any,
+) -> None:
+    """Create a vector index on a Lance dataset column.
+
+    This is a passthrough to ``lance.LanceDataset.create_index()`` with the same
+    dataset construction pattern used by other daft-lance functions (URI,
+    io_config, storage_options, version, etc.).
+
+    Vector indices (IVF_PQ, IVF_HNSW_PQ, etc.) require a global training phase
+    across all data, so this function runs the index build in-process rather than
+    distributing it across workers.
+
+    Args:
+        uri: The URI of the Lance table (supports remote URLs to object stores such as ``s3://`` or ``gs://``).
+        io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        column: Column name to index. Must be a fixed-size list (vector) column.
+        index_type: Type of vector index to build. Supported values:
+            ``"IVF_PQ"``, ``"IVF_HNSW_PQ"``, ``"IVF_HNSW_SQ"``, ``"IVF_FLAT"``, ``"IVF_SQ"``.
+            Defaults to ``"IVF_PQ"``.
+        name: Name of the index. If not provided, Lance generates one from the column name.
+        metric: Distance metric type. One of ``"L2"`` (euclidean), ``"cosine"``, or ``"dot"``.
+            Defaults to ``"L2"``.
+        replace: Whether to replace an existing index with the same name. Defaults to True.
+        num_partitions: Number of IVF partitions. If None, Lance picks a default based on dataset size.
+        num_sub_vectors: Number of sub-vectors for Product Quantization (PQ). Only used with PQ-based
+            index types (``IVF_PQ``, ``IVF_HNSW_PQ``).
+        accelerator: Hardware accelerator for training. ``"cuda"`` (Nvidia GPU) or ``"mps"``
+            (Apple Silicon GPU). If None, uses CPU.
+        storage_options: Extra options for storage connection.
+        version: If specified, load a specific version of the Lance dataset.
+        asof: If specified, find the latest version created on or earlier than the given argument value.
+        block_size: Block size in bytes for I/O.
+        commit_lock: A custom commit lock.
+        index_cache_size: Index cache size (number of entries).
+        default_scan_options: Default scan options for the dataset.
+        metadata_cache_size_bytes: Size of the metadata cache in bytes.
+        **kwargs: Additional keyword arguments forwarded to ``lance.LanceDataset.create_index()``
+            (e.g., ``ivf_centroids``, ``pq_codebook``, ``target_partition_size``,
+            ``filter_nan``, ``shuffle_partition_batches``).
+
+    Returns:
+        None
+
+    Raises:
+        ValueError: If the column does not exist, is not a vector (fixed-size list) type,
+            or if ``index_type`` is not a supported vector index type.
+
+    Note:
+        This function requires the use of `LanceDB <https://lancedb.github.io/lancedb/>`_.
+        Install with: ``pip install daft[lance]``
+
+    Examples:
+        Create an IVF_PQ index on a vector column:
+        >>> import daft_lance
+        >>> daft_lance.create_vector_index("s3://my-bucket/dataset/", column="embedding")
+
+        Create an IVF_HNSW_SQ index with cosine distance:
+        >>> daft_lance.create_vector_index(
+        ...     "s3://my-bucket/dataset/",
+        ...     column="embedding",
+        ...     index_type="IVF_HNSW_SQ",
+        ...     metric="cosine",
+        ... )
+
+        Create an index with GPU acceleration:
+        >>> daft_lance.create_vector_index(
+        ...     "/path/to/dataset/",
+        ...     column="vector",
+        ...     accelerator="cuda",
+        ...     num_partitions=256,
+        ...     num_sub_vectors=16,
+        ... )
+    """
+    index_type_upper = index_type.upper()
+    if index_type_upper not in _VECTOR_INDEX_TYPES:
+        raise ValueError(
+            f"Unsupported vector index type: {index_type!r}. Supported types: {sorted(_VECTOR_INDEX_TYPES)}"
+        )
+
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    storage_options = storage_options or io_config_to_storage_options(io_config, str(uri))
+
+    lance_ds = construct_lance_dataset(
+        uri,
+        storage_options=storage_options,
+        version=version,
+        asof=asof,
+        block_size=block_size,
+        commit_lock=commit_lock,
+        index_cache_size=index_cache_size,
+        default_scan_options=default_scan_options,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
+    )
+
+    # Validate column exists and is a vector type
+    schema = lance_ds.schema
+    if column not in schema.names:
+        raise ValueError(f"Column {column!r} not found in dataset. Available columns: {schema.names}")
+
+    col_type = schema.field(column).type
+    if not hasattr(col_type, "list_size"):
+        raise ValueError(
+            f"Column {column!r} has type {col_type}, which is not a vector type. "
+            f"Vector index requires a fixed-size list column (e.g., FixedSizeList(float32, N))."
+        )
+
+    lance_ds.create_index(
+        column,
+        index_type_upper,
+        name=name,
+        metric=metric,
+        replace=replace,
+        num_partitions=num_partitions,
+        num_sub_vectors=num_sub_vectors,
+        accelerator=accelerator,
+        **kwargs,
+    )
+
+
 @PublicAPI
 def compact_files(
     uri: str | pathlib.Path,
