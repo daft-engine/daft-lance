@@ -18,9 +18,6 @@ from daft_lance.utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
 
-# Scalar index types that use Lance's public segmented-index workflow by default.
-SEGMENTED_INDEX_TYPES = {"BTREE", "INVERTED"}
-
 # Segmented index types whose worker-built segments must be merged before commit.
 MERGED_SEGMENTED_INDEX_TYPES = {"INVERTED"}
 
@@ -145,12 +142,12 @@ def create_scalar_index_internal(
 ) -> None:
     """Internal implementation of distributed scalar index creation.
 
-    ``BTREE`` and ``INVERTED`` use Lance's public segment-index workflow: each
-    worker builds a fully independent index segment, and the coordinator commits
-    them atomically with ``commit_existing_index_segments``. ``FTS`` is
-    normalized to ``INVERTED`` (same Lance index); see Lance Rust/Python
-    bindings: ``INVERTED`` and ``FTS`` map to the same inverted full-text index
-    type.
+    When ``segmented=True``, ``BTREE`` and ``INVERTED`` use Lance's public
+    segment-index workflow: each worker builds a fully independent index segment,
+    and the coordinator commits them atomically with
+    ``commit_existing_index_segments``. ``FTS`` is normalized to ``INVERTED``
+    (same Lance index); see Lance Rust/Python bindings: ``INVERTED`` and ``FTS``
+    map to the same inverted full-text index type.
     """
     if not column:
         raise ValueError("Column name cannot be empty")
@@ -203,7 +200,7 @@ def create_scalar_index_internal(
     if name is None:
         name = f"{column}_{index_type.lower()}_idx"
 
-    use_segmented_workflow = segmented or index_type in SEGMENTED_INDEX_TYPES
+    use_segmented_workflow = segmented
 
     # Handle replace parameter - check for existing index with same name
     if not replace or use_segmented_workflow:
@@ -215,6 +212,20 @@ def create_scalar_index_internal(
             )
         if name in existing_names:
             raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
+
+    if index_type == "BTREE" and not use_segmented_workflow:
+        logger.info(
+            "Falling back to Lance scalar index creation for non-segmented BTREE index %s.",
+            name,
+        )
+        lance_ds.create_scalar_index(
+            column=column,
+            index_type=index_type,
+            name=name,
+            replace=replace,
+            **kwargs,
+        )
+        return
 
     # Get available fragment IDs to use
     fragments = lance_ds.get_fragments()

@@ -9,8 +9,8 @@ import lance
 import pytest
 
 import daft
-from daft.dependencies import pd
-from daft_lance import create_scalar_index
+from daft.dependencies import pa, pd
+from daft_lance import create_scalar_index, lance_scalar_index
 from daft_lance.lance_scalar_index import (
     SegmentedFragmentIndexHandler,
     _existing_index_names,
@@ -101,12 +101,11 @@ class TestDistributedIndexing:
         )
         updated_dataset = lance.dataset(dataset_uri)
 
-        # Verify the index was created with usable details.
-        described = updated_dataset.describe_indices()
-        text_index = next((idx for idx in described if "text" in idx.name), None)
-
-        assert text_index is not None, "Text index not found"
-        assert "Inverted" in text_index.type_url, f"Expected Inverted index, got {text_index.type_url}"
+        # Verify the index was created. The default non-segmented path does not
+        # populate Lance index details, so use list_indices() here.
+        indices = updated_dataset.list_indices()
+        index_names = [idx["name"] for idx in indices]
+        assert "text_inverted_idx" in index_names, f"Text index not found in {index_names}"
 
         # Test full-text search functionality
         search_term = "Python"
@@ -289,8 +288,8 @@ class TestDistributedIndexing:
         error_msg = str(exc_info.value)
         assert "already exists" in error_msg and index_name in error_msg
 
-    def test_build_distributed_index_replace_true_existing_index_is_rejected(self, multi_fragment_lance_dataset):
-        """Test that segmented replace=True rejects existing indexes without corrupting them."""
+    def test_build_distributed_index_replace_true_overwrites_existing(self, multi_fragment_lance_dataset):
+        """Test that default non-segmented replace=True overwrites existing indexes."""
         dataset_uri = multi_fragment_lance_dataset
         index_name = "test_replace_true_index"
 
@@ -303,37 +302,35 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        initial_indices = updated_dataset.describe_indices()
+        initial_indices = updated_dataset.list_indices()
         assert len(initial_indices) > 0, "Initial index creation failed"
 
         # Find our initial index
-        initial_index = next((idx for idx in initial_indices if idx.name == index_name), None)
+        initial_index = next((idx for idx in initial_indices if idx["name"] == index_name), None)
         assert initial_index is not None, "Initial index not found"
 
-        with pytest.raises(ValueError, match="cannot atomically replace existing index"):
-            create_scalar_index(
-                uri=dataset_uri,
-                column="text",
-                index_type="INVERTED",
-                name=index_name,
-                replace=True,
-            )
+        create_scalar_index(
+            uri=dataset_uri,
+            column="text",
+            index_type="INVERTED",
+            name=index_name,
+            replace=True,
+        )
 
         updated_dataset = lance.dataset(dataset_uri)
-        final_indices = updated_dataset.describe_indices()
-        final_index = next((idx for idx in final_indices if idx.name == index_name), None)
+        final_indices = updated_dataset.list_indices()
+        final_index = next((idx for idx in final_indices if idx["name"] == index_name), None)
 
-        assert final_index is not None, "Existing index should still exist after rejected replacement"
-        assert "Inverted" in final_index.type_url, "Index type should remain Inverted"
+        assert final_index is not None, "Index should still exist after replacement"
 
-        # Test that the original index still works for searching
+        # Test that the replaced index still works for searching
         search_term = "Python"
         results = updated_dataset.scanner(
             full_text_query=search_term,
             columns=["id", "text"],
         ).to_table()
 
-        assert results.num_rows > 0, f"No results found for search term '{search_term}' after rejected replacement"
+        assert results.num_rows > 0, f"No results found for search term '{search_term}' after index replacement"
 
     def test_build_distributed_index_auto_adjust_workers(self, temp_dir):
         """Test that concurrency is automatically adjusted if it exceeds fragment count."""
@@ -375,11 +372,9 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        described = updated_dataset.describe_indices()
-        assert len(described) == 1
-        assert described[0].name == index_name
-        assert described[0].type_url == "/lance.table.InvertedIndexDetails"
-        assert described[0].num_rows_indexed == 8
+        indices = updated_dataset.list_indices()
+        index_names = [idx["name"] for idx in indices]
+        assert index_name in index_names, f"Index {index_name!r} not found in {index_names}"
 
         results = updated_dataset.scanner(
             full_text_query="Python",
@@ -419,10 +414,9 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        described = updated_dataset.describe_indices()
-        assert len(described) == 1
-        assert described[0].name == index_name
-        assert described[0].type_url == "/lance.table.InvertedIndexDetails"
+        indices = updated_dataset.list_indices()
+        index_names = [idx["name"] for idx in indices]
+        assert index_name in index_names, f"FTS index not found in {index_names}"
 
         # Test search functionality
         search_term = "Python"
@@ -890,31 +884,39 @@ class TestSegmentedBTreeIndex:
         results = updated_dataset.scanner(filter="count > 500", columns=["id", "count"]).to_table()
         assert results.num_rows == 3  # 600, 700, 800
 
-    def test_segmented_false_uses_segmented_flow_for_btree(self, temp_dir):
-        """Test that BTREE uses the segmented flow even when segmented=False."""
-        data = {
-            "id": [1, 2, 3, 4, 5, 6, 7, 8],
-            "price": [10.5, 20.75, 30.0, 40.25, 50.5, 60.75, 70.0, 80.25],
-        }
-        dataset = daft.from_pydict(data)
-        path = Path(temp_dir) / "segmented_false.lance"
-        dataset.write_lance(uri=path, max_rows_per_file=2)
+    def test_segmented_false_uses_lance_scalar_flow_for_btree(self, monkeypatch):
+        """Test that segmented=False opts out of distributed BTREE workflows."""
 
-        # segmented=False is retained for API compatibility; BTREE still uses
-        # Lance's public segmented-index workflow by default.
-        create_scalar_index(
-            uri=path,
+        class FakeLanceDataset:
+            schema = pa.schema([("price", pa.float64())])
+
+            def describe_indices(self):
+                return []
+
+            def create_scalar_index(self, **kwargs):
+                calls.append(("lance_scalar", kwargs))
+
+        calls = []
+
+        def fake_create_segmented_index(**kwargs):
+            calls.append(("segmented", kwargs))
+
+        def fake_create_partitioned_index(**kwargs):
+            calls.append(("partitioned", kwargs))
+
+        monkeypatch.setattr(lance_scalar_index, "_create_segmented_index", fake_create_segmented_index)
+        monkeypatch.setattr(lance_scalar_index, "_create_partitioned_index", fake_create_partitioned_index)
+
+        create_scalar_index_internal(
+            lance_ds=FakeLanceDataset(),
+            uri="memory://btree",
             column="price",
             index_type="BTREE",
             name="price_btree_idx",
             segmented=False,
         )
 
-        updated_dataset = lance.dataset(path)
-        described = updated_dataset.describe_indices()
-        assert len(described) == 1
-        assert described[0].name == "price_btree_idx"
-        assert "BTree" in described[0].type_url
+        assert [call[0] for call in calls] == ["lance_scalar"]
 
     def test_segmented_inverted_creates_index(self, multi_fragment_lance_dataset):
         """Test that segmented=True with INVERTED creates an index."""

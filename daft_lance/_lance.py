@@ -388,14 +388,14 @@ def create_scalar_index(
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
         column: Column name to index
         index_type: Type of index to build.
-            For distributed execution this supports "INVERTED", "FTS", and "BTREE".
+            For distributed segmented execution this supports "INVERTED", "FTS", and "BTREE".
             Other scalar index types supported by Lance (for example "BITMAP", "NGRAM", "ZONEMAP",
             "LABEL_LIST", "BLOOMFILTER") are passed directly to
             ``LanceDataset.create_scalar_index(...)``.
         name: Name of the index (generated if None).
         replace: Whether to replace an existing index with the same name. Defaults to False.
             This is only supported by scalar index types that are passed directly to
-            ``LanceDataset.create_scalar_index(...)``. Distributed BTREE/INVERTED/FTS
+            ``LanceDataset.create_scalar_index(...)``. Segmented BTREE/INVERTED/FTS
             indexes use Lance's public segmented-index commit API, which does not
             currently expose atomic replacement, so existing index names are rejected.
         storage_options: Storage options for the dataset.
@@ -414,11 +414,10 @@ def create_scalar_index(
             If None, Daft will use its default concurrency setting. Must be a positive integer.
         segmented: If True, force the segmented index workflow where each worker builds
             a fully independent index segment and the coordinator commits them via
-            ``commit_existing_index_segments``. Distributed ``"BTREE"``, ``"INVERTED"``,
-            and ``"FTS"`` indexes use this workflow by default; ``"FTS"`` is normalized
-            to Lance's inverted full-text index. Other scalar index types are passed
-            directly to ``LanceDataset.create_scalar_index(...)``.
-        **kwargs: Additional keyword arguments forwarded to ``lance.LanceDataset.create_scalar_index``.
+            ``commit_existing_index_segments``. ``"FTS"`` is normalized to Lance's
+            inverted full-text index. If False, scalar index creation uses the legacy
+            partitioned workflow or Lance's direct ``create_scalar_index`` path.
+        **kwargs: Additional keyword arguments forwarded to the selected Lance index creation API.
 
     Returns:
         None
