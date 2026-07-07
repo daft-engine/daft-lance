@@ -103,7 +103,8 @@ def is_table_not_found(error: Exception) -> bool:
     """Whether an exception from ``describe_table`` means the table does not exist.
 
     Native implementations raise the typed ``TableNotFoundError``; the Rust-backed
-    REST client surfaces untyped errors, so fall back to message matching.
+    REST client may surface untyped errors, so only fall back when the error is
+    clearly a 404 for a table resource.
     """
     try:
         from lance_namespace.errors import TableNotFoundError
@@ -112,8 +113,42 @@ def is_table_not_found(error: Exception) -> bool:
             return True
     except ImportError:
         pass
+
+    status_code = _error_status_code(error)
+    if status_code != 404:
+        return False
+
     message = str(error).lower()
-    return "not found" in message or "does not exist" in message or "no such table" in message
+    return "no such table" in message or (
+        "table" in message and ("not found" in message or "does not exist" in message)
+    )
+
+
+def _error_status_code(error: Exception) -> int | None:
+    """Best-effort HTTP status extraction for untyped namespace REST errors."""
+    for attr in ("status", "status_code", "code"):
+        value = getattr(error, attr, None)
+        status_code = _coerce_status_code(value)
+        if status_code is not None:
+            return status_code
+
+    response = getattr(error, "response", None)
+    if response is not None:
+        for attr in ("status", "status_code"):
+            value = getattr(response, attr, None)
+            status_code = _coerce_status_code(value)
+            if status_code is not None:
+                return status_code
+
+    return None
+
+
+def _coerce_status_code(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
 
 
 def resolve_namespace_table(

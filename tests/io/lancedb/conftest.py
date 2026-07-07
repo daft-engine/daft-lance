@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import sys
 
@@ -8,8 +6,21 @@ import pytest
 # Try to import lance; if it fails, all tests in this directory will be skipped.
 lance = pytest.importorskip("lance")
 
+_NATIVE_TEARDOWN_CRASH_MARKER = "lance_native_teardown_crash_workaround"
+_exitstatus: int | None = None
+_hard_exit_after_session = False
 
-_exitstatus = 0
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        f"{_NATIVE_TEARDOWN_CRASH_MARKER}: hard-exit after reported results to avoid a known Lance native teardown crash",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    global _hard_exit_after_session
+    _hard_exit_after_session = any(item.get_closest_marker(_NATIVE_TEARDOWN_CRASH_MARKER) for item in items)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -19,15 +30,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 @pytest.hookimpl(trylast=True)
 def pytest_unconfigure(config: pytest.Config) -> None:
-    """Hard-exit after reporting to dodge an upstream teardown crash.
-
-    Running enough ``daft`` + ``lance`` write/read cycles in one process makes the
-    interpreter SIGSEGV during native finalization (in lance's runtime, inside
-    OpenSSL cert teardown) *after* every test has already run and been reported.
-    This reproduces with plain ``daft.DataFrame.write_lance`` and is unrelated to
-    test outcomes. Runs last, once tracebacks and the summary are already flushed,
-    so it never hides a failure — it only skips the crashing native finalization.
-    """
+    if not _hard_exit_after_session or _exitstatus is None:
+        return
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(_exitstatus)

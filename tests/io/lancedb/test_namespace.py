@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 import daft
 import daft_lance
+import daft_lance.namespace as namespace_mod
+
+pytestmark = pytest.mark.lance_native_teardown_crash_workaround
 
 
 def _dir_ns(tmp_path):
@@ -44,6 +49,38 @@ def test_namespace_overwrite_missing_table_declares(tmp_path):
 
     result = daft_lance.read_lance(table_id=table_id, **ns).to_pydict()
     assert result == {"id": [1]}
+
+
+def test_namespace_overwrite_does_not_declare_on_ambiguous_error(monkeypatch, tmp_path):
+    class FakeNamespace:
+        declared = False
+
+        def describe_table(self, request):
+            raise RuntimeError("permission denied: parent catalog does not exist")
+
+        def declare_table(self, request):
+            self.declared = True
+            return SimpleNamespace(location=str(tmp_path / "should_not_exist.lance"))
+
+    namespace = FakeNamespace()
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: namespace)
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        namespace_mod.resolve_namespace_table(
+            namespace_impl="rest",
+            namespace_properties={"uri": "http://namespace.example"},
+            table_id=["catalog", "schema", "table"],
+            mode="overwrite",
+        )
+
+    assert not namespace.declared
+
+
+def test_namespace_untyped_404_table_not_found_is_missing():
+    class RestTableNotFound(RuntimeError):
+        status = 404
+
+    assert namespace_mod.is_table_not_found(RestTableNotFound("table catalog.schema.table not found"))
 
 
 def test_namespace_read_supports_pushdowns(tmp_path):
