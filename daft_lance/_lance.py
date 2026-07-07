@@ -388,16 +388,19 @@ def create_scalar_index(
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
         column: Column name to index
         index_type: Type of index to build.
-            For distributed segmented execution this supports "INVERTED", "FTS", and "BTREE".
-            Other scalar index types supported by Lance (for example "BITMAP", "NGRAM", "ZONEMAP",
+            For distributed segmented execution this supports "BITMAP", "BTREE", "INVERTED", and "FTS".
+            Other scalar index types supported by Lance (for example "NGRAM", "ZONEMAP",
             "LABEL_LIST", "BLOOMFILTER") are passed directly to
             ``LanceDataset.create_scalar_index(...)``.
         name: Name of the index (generated if None).
         replace: Whether to replace an existing index with the same name. Defaults to False.
             This is only supported by scalar index types that are passed directly to
-            ``LanceDataset.create_scalar_index(...)``. Segmented BTREE/INVERTED/FTS
+            ``LanceDataset.create_scalar_index(...)``. Segmented BITMAP/BTREE/INVERTED/FTS
             indexes use Lance's public segmented-index commit API, which does not
             currently expose atomic replacement, so existing index names are rejected.
+            For BITMAP indexing with the default ``segmented=False`` behavior,
+            ``replace=True`` on an existing index falls back to Lance's scalar
+            replacement path to preserve existing API behavior.
         storage_options: Storage options for the dataset.
         version: Version of the dataset to use.
         asof: Timestamp to use for time travel queries.

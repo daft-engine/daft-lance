@@ -19,7 +19,7 @@ from daft_lance.utils import distribute_fragments_balanced
 logger = logging.getLogger(__name__)
 
 # Segmented index types whose worker-built segments must be merged before commit.
-MERGED_SEGMENTED_INDEX_TYPES = {"INVERTED"}
+MERGED_SEGMENTED_INDEX_TYPES = {"BITMAP", "INVERTED"}
 
 
 class FragmentIndexHandler:
@@ -86,7 +86,7 @@ class SegmentedFragmentIndexHandler:
         self.name = name
         self.kwargs = kwargs
 
-    def __call__(self, fragment_ids: list[int]) -> bytes:
+    def __call__(self, fragment_ids: list[int], shard_id: int | None = None) -> bytes:
         """Build an independent index segment and return its pickled metadata."""
         logger.info(
             "Building segmented index segment for fragments %s (column=%s, type=%s)",
@@ -94,6 +94,11 @@ class SegmentedFragmentIndexHandler:
             self.column,
             self.index_type,
         )
+        segment_kwargs = self.kwargs.copy()
+        if self.index_type == "BITMAP" and shard_id is not None:
+            # Lance's BITMAP segment builder needs a stable shard number to
+            # distinguish independently-built bitmap segments before merge/commit.
+            segment_kwargs["shard_id"] = shard_id
 
         # Create one uncommitted index segment. ``pylance 8.0.0`` supports
         # scalar index segments through this public API. Segment creation always
@@ -106,7 +111,7 @@ class SegmentedFragmentIndexHandler:
             replace=False,
             train=True,
             fragment_ids=fragment_ids,
-            **self.kwargs,
+            **segment_kwargs,
         )
 
         return pickle.dumps(index_meta)
@@ -142,12 +147,12 @@ def create_scalar_index_internal(
 ) -> None:
     """Internal implementation of distributed scalar index creation.
 
-    When ``segmented=True``, ``BTREE`` and ``INVERTED`` use Lance's public
-    segment-index workflow: each worker builds a fully independent index segment,
-    and the coordinator commits them atomically with
+    When ``segmented=True``, ``BITMAP``, ``BTREE``, and ``INVERTED`` use
+    Lance's public segment-index workflow: each worker builds a fully
+    independent index segment, and the coordinator commits them atomically with
     ``commit_existing_index_segments``. ``FTS`` is normalized to ``INVERTED``
-    (same Lance index); see Lance Rust/Python bindings: ``INVERTED`` and ``FTS``
-    map to the same inverted full-text index type.
+    (same Lance index); see Lance Rust/Python bindings: ``INVERTED`` and
+    ``FTS`` map to the same inverted full-text index type.
     """
     if not column:
         raise ValueError("Column name cannot be empty")
@@ -182,9 +187,14 @@ def create_scalar_index_internal(
                 and not pa.types.is_string(value_type)
             ):
                 raise TypeError(f"Column {column} must be numeric or string type for BTREE index, got {value_type}")
+        case "BITMAP":
+            # BITMAP supports multiple physical Arrow types depending on the
+            # Lance release. Leave final type validation to Lance rather than
+            # duplicating a narrower Python-side allowlist here.
+            pass
         case _:
             logger.warning(
-                "Distributed indexing currently only supports 'INVERTED' and 'BTREE' index types, not '%s'. So we are falling back to single-threaded index creation.",
+                "Distributed indexing currently only supports 'BITMAP', 'INVERTED', and 'BTREE' index types, not '%s'. So we are falling back to single-threaded index creation.",
                 index_type,
             )
             lance_ds.create_scalar_index(
@@ -196,16 +206,28 @@ def create_scalar_index_internal(
             )
             return
 
+    if index_type == "BITMAP" and not segmented:
+        logger.info(
+            "Falling back to Lance scalar index creation for non-segmented BITMAP index %s.",
+            name,
+        )
+        lance_ds.create_scalar_index(
+            column=column,
+            index_type=index_type,
+            name=name,
+            replace=replace,
+            **kwargs,
+        )
+        return
+
     # Generate index name if not provided
     if name is None:
         name = f"{column}_{index_type.lower()}_idx"
 
-    use_segmented_workflow = segmented
-
     # Handle replace parameter - check for existing index with same name
-    if not replace or use_segmented_workflow:
+    if not replace or segmented:
         existing_names = _existing_index_names(lance_ds)
-        if name in existing_names and use_segmented_workflow:
+        if name in existing_names and segmented:
             raise ValueError(
                 f"Index with name '{name}' already exists and cannot atomically replace existing index "
                 "with Lance's public segmented index API. Drop the existing index first or use a different name."
@@ -213,9 +235,10 @@ def create_scalar_index_internal(
         if name in existing_names:
             raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
 
-    if index_type == "BTREE" and not use_segmented_workflow:
+    if index_type == "BTREE" and not segmented:
         logger.info(
-            "Falling back to Lance scalar index creation for non-segmented BTREE index %s.",
+            "Falling back to Lance scalar index creation for non-segmented %s index %s.",
+            index_type,
             name,
         )
         lance_ds.create_scalar_index(
@@ -265,7 +288,7 @@ def create_scalar_index_internal(
     # Use segment-index creation for Lance scalar index types that expose the
     # public uncommitted segment API.  The legacy path is kept as a fallback for
     # older/unsupported distributed scalar index types.
-    if use_segmented_workflow:
+    if segmented:
         _create_segmented_index(
             lance_ds=lance_ds,
             uri=uri,
@@ -329,13 +352,31 @@ def _create_segmented_index(
         **kwargs,
     )
 
+    segment_data: list[dict[str, Any]]
+    if index_type == "BITMAP":
+        # Give each worker-built BITMAP segment a stable Lance shard id.  This
+        # is separate from Lance fragment ids: shard_id identifies the bitmap
+        # segment, while fragment_ids identify the rows covered by that segment.
+        segment_data = [
+            {
+                **group,
+                "shard_id": shard_id,
+            }
+            for shard_id, group in enumerate(fragment_data)
+        ]
+    else:
+        segment_data = fragment_data
+
     with execution_config_ctx(maintain_order=False):
         if num_partitions is not None and num_partitions > 1:
-            df = from_pylist(fragment_data).repartition(num_partitions)
+            df = from_pylist(segment_data).repartition(num_partitions)
         else:
-            df = from_pylist(fragment_data)
+            df = from_pylist(segment_data)
 
-        df = df.select(handler(df["fragment_ids"]).alias("index_meta"))
+        if index_type == "BITMAP":
+            df = df.select(handler(df["fragment_ids"], df["shard_id"]).alias("index_meta"))
+        else:
+            df = df.select(handler(df["fragment_ids"]).alias("index_meta"))
         collected = df.collect()
 
     # Deserialise the Index metadata returned by each worker.
