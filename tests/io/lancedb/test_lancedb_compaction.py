@@ -140,3 +140,69 @@ def test_compaction_with_partition_num(tmp_path: Path):
     post_rows = dataset.count_rows()
     assert post_fragments == 2, "Fragment count should be reduced after compaction"
     assert post_rows == pre_rows, "Row count should remain unchanged after compaction"
+
+
+def _blob_v2_table(ids: list[int], blobs: list[bytes]) -> pa.Table:
+    return pa.table(
+        {
+            "id": pa.array(ids, type=pa.int64()),
+            "blob": lance.blob_array(blobs),
+        }
+    )
+
+
+def _read_blob_bytes_by_id(uri: str) -> dict[int, bytes]:
+    ds = lance.dataset(uri)
+    rows = ds.to_table(columns=["id"], with_row_id=True).to_pylist()
+    blobs = ds.take_blobs("blob", [row["_rowid"] for row in rows])
+    return {row["id"]: blob.read() for row, blob in zip(rows, blobs, strict=True)}
+
+
+def test_blob_v2_compaction_materializes_deletions_and_preserves_bytes(tmp_path: Path):
+    dataset_path = tmp_path / "test_blob_v2_deletion_compaction"
+    payloads = {
+        1: b"inline",
+        2: b"x" * 100_000,
+        3: b"y" * 5_000_000,
+        4: b"survivor",
+    }
+    lance.write_dataset(
+        _blob_v2_table([1, 2], [payloads[1], payloads[2]]),
+        dataset_path,
+        data_storage_version="2.2",
+        max_rows_per_file=2,
+    )
+    lance.write_dataset(
+        _blob_v2_table([3, 4], [payloads[3], payloads[4]]),
+        dataset_path,
+        mode="append",
+        data_storage_version="2.2",
+        max_rows_per_file=2,
+    )
+
+    ds = lance.dataset(str(dataset_path))
+    assert len(ds.get_fragments()) == 2
+    assert _read_blob_bytes_by_id(str(dataset_path)) == payloads
+    ds.delete("id = 2")
+
+    metrics = compact_files(
+        uri=str(dataset_path),
+        compaction_options={
+            "materialize_deletions": True,
+            "materialize_deletions_threshold": 0.0,
+            "target_rows_per_fragment": 100,
+            "num_threads": 1,
+        },
+    )
+
+    assert metrics is not None
+    assert getattr(metrics, "fragments_removed", None) == 2
+    assert getattr(metrics, "fragments_added", None) == 1
+    ds = lance.dataset(str(dataset_path))
+    assert len(ds.get_fragments()) == 1
+    assert ds.count_rows() == 3
+    assert _read_blob_bytes_by_id(str(dataset_path)) == {
+        1: payloads[1],
+        3: payloads[3],
+        4: payloads[4],
+    }
