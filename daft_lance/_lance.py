@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pathlib
 from collections.abc import Callable
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import lance
@@ -491,6 +492,59 @@ def create_scalar_index(
         max_concurrency=max_concurrency,
         segmented=segmented,
         **kwargs,
+    )
+
+
+@PublicAPI
+def cleanup_old_versions(
+    uri: str | pathlib.Path,
+    io_config: IOConfig | None = None,
+    *,
+    storage_options: dict[str, Any] | None = None,
+    older_than: timedelta | None = None,
+    retain_versions: int | None = None,
+    delete_unverified: bool = False,
+    error_if_tagged_old_versions: bool = True,
+    delete_rate_limit: int | None = None,
+    version: int | str | None = None,
+    asof: str | None = None,
+    block_size: int | None = None,
+    commit_lock: Any | None = None,
+    index_cache_size: int | None = None,
+    default_scan_options: dict[str, Any] | None = None,
+    metadata_cache_size_bytes: int | None = None,
+    base_store_params: dict[str, dict[str, str]] | None = None,
+) -> Any:
+    """Clean up old Lance dataset versions and unreferenced files.
+
+    This is a thin wrapper around :meth:`lance.LanceDataset.cleanup_old_versions`.
+    It removes versions selected by ``older_than`` / ``retain_versions`` and the
+    data files referenced only by those removed versions.
+    """
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    storage_options = storage_options or io_config_to_storage_options(
+        io_config, str(uri) if isinstance(uri, pathlib.Path) else uri
+    )
+
+    lance_ds = construct_lance_dataset(
+        uri,
+        storage_options=storage_options,
+        version=version,
+        asof=asof,
+        block_size=block_size,
+        commit_lock=commit_lock,
+        index_cache_size=index_cache_size,
+        default_scan_options=default_scan_options,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
+        base_store_params=base_store_params,
+    )
+
+    return lance_ds.cleanup_old_versions(
+        older_than=older_than,
+        retain_versions=retain_versions,
+        delete_unverified=delete_unverified,
+        error_if_tagged_old_versions=error_if_tagged_old_versions,
+        delete_rate_limit=delete_rate_limit,
     )
 
 
