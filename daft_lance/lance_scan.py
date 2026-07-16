@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Iterator
 from typing import Any
 
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 # TODO support fts and fast_search
-def _lancedb_table_factory_function(
+def _lance_table_factory_function(
     ds_uri: str,
     open_kwargs: dict[Any, Any] | None = None,
     fragment_ids: list[int] | None = None,
@@ -110,13 +111,13 @@ def _lancedb_table_factory_function(
         return _iter_batches()
 
 
-def _lancedb_count_result_function(
+def _lance_count_result_function(
     ds_uri: str,
     open_kwargs: dict[Any, Any] | None,
     required_column: str,
     filter: pa.compute.Expression | None = None,
 ) -> Iterator[PyRecordBatch]:
-    """Use LanceDB's API to count rows and return a record batch with the count result."""
+    """Use Lance's API to count rows and return a record batch with the count result."""
     ds = lance.dataset(ds_uri, **(open_kwargs or {}))
     logger.debug("Using metadata for counting all rows")
     count = ds.count_rows(filter=filter)
@@ -128,7 +129,27 @@ def _lancedb_count_result_function(
     yield result_batch._recordbatch
 
 
-class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
+def _lancedb_table_factory_function(*args: Any, **kwargs: Any) -> Iterator[PyRecordBatch]:
+    warnings.warn(
+        "_lancedb_table_factory_function is deprecated and will be removed in a future release. "
+        "Use _lance_table_factory_function instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _lance_table_factory_function(*args, **kwargs)
+
+
+def _lancedb_count_result_function(*args: Any, **kwargs: Any) -> Iterator[PyRecordBatch]:
+    warnings.warn(
+        "_lancedb_count_result_function is deprecated and will be removed in a future release. "
+        "Use _lance_count_result_function instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _lance_count_result_function(*args, **kwargs)
+
+
+class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
     def __init__(
         self,
         ds: lance.LanceDataset,
@@ -150,10 +171,10 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         self._schema = convert_lance_schema(base)
 
     def name(self) -> str:
-        return "LanceDBScanOperator"
+        return "LanceScanOperator"
 
     def display_name(self) -> str:
-        return f"LanceDBScanOperator({self._ds.uri})"
+        return f"LanceScanOperator({self._ds.uri})"
 
     def schema(self) -> Schema:
         return self._schema
@@ -257,8 +278,8 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         new_schema = Schema.from_pyarrow_schema(pa.schema([pa.field(fields[0], pa.uint64())]))
         open_kwargs = getattr(self._ds, "_lance_open_kwargs", None)
         yield ScanTask.python_factory_func_scan_task(
-            module=_lancedb_count_result_function.__module__,
-            func_name=_lancedb_count_result_function.__name__,
+            module=_lance_count_result_function.__module__,
+            func_name=_lance_count_result_function.__name__,
             func_args=(self._ds.uri, open_kwargs, fields[0], self._combine_filters_to_arrow()),
             schema=new_schema._schema,
             num_rows=1,
@@ -296,8 +317,8 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
 
                 task_schema = self._schema
                 yield ScanTask.python_factory_func_scan_task(
-                    module=_lancedb_table_factory_function.__module__,
-                    func_name=_lancedb_table_factory_function.__name__,
+                    module=_lance_table_factory_function.__module__,
+                    func_name=_lance_table_factory_function.__name__,
                     func_args=(
                         self._ds.uri,
                         open_kwargs,
@@ -331,8 +352,8 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
             size_bytes: int | None = None,
         ) -> ScanTask:
             return ScanTask.python_factory_func_scan_task(
-                module=_lancedb_table_factory_function.__module__,
-                func_name=_lancedb_table_factory_function.__name__,
+                module=_lance_table_factory_function.__module__,
+                func_name=_lance_table_factory_function.__name__,
                 func_args=(
                     self._ds.uri,
                     open_kwargs,
@@ -489,3 +510,28 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
             return 0
 
         return sum(file.file_size_bytes for file in fragment.metadata.files if file.file_size_bytes is not None)
+
+
+class LanceDBScanOperator(LanceScanOperator):
+    def __init__(
+        self,
+        ds: lance.LanceDataset,
+        fragment_group_size: int | None = None,
+        include_fragment_id: bool | None = False,
+    ):
+        warnings.warn(
+            "LanceDBScanOperator is deprecated and will be removed in a future release. Use LanceScanOperator instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(
+            ds,
+            fragment_group_size=fragment_group_size,
+            include_fragment_id=include_fragment_id,
+        )
+
+    def name(self) -> str:
+        return "LanceDBScanOperator"
+
+    def display_name(self) -> str:
+        return f"LanceDBScanOperator({self._ds.uri})"

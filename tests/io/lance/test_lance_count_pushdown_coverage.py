@@ -11,7 +11,12 @@ import daft
 from daft import col
 from daft.daft import CountMode
 from daft.recordbatch import RecordBatch
-from daft_lance.lance_scan import LanceDBScanOperator, _lancedb_count_result_function
+from daft_lance.lance_scan import (
+    LanceDBScanOperator,
+    LanceScanOperator,
+    _lance_count_result_function,
+    _lancedb_count_result_function,
+)
 
 
 class TestLanceCountResultFunction:
@@ -30,29 +35,41 @@ class TestLanceCountResultFunction:
         lance.write_dataset(pa.Table.from_pydict(test_data), tmp_dir)
         yield str(tmp_dir)
 
-    def test_lancedb_count_no_filters_direct_call(self, test_dataset_path):
+    def test_lance_count_no_filters_direct_call(self, test_dataset_path):
         """Test that no filters list is handled correctly."""
         ds = lance.dataset(test_dataset_path)
-        result_generator = _lancedb_count_result_function(ds.uri, None, "count")
+        result_generator = _lance_count_result_function(ds.uri, None, "count")
         result_batch = next(result_generator)
         record_batch = RecordBatch._from_pyrecordbatch(result_batch)
         result_dict = record_batch.to_pydict()
         assert result_dict["count"][0] == 6
 
-    def test_lancedb_count_with_filters_path(self, test_dataset_path):
+    def test_lance_count_with_filters_path(self, test_dataset_path):
         """Test that filters list is handled correctly."""
         ds = lance.dataset(test_dataset_path)
         filter_expr = pc.greater(pc.field("age"), pc.scalar(30))
-        result_generator = _lancedb_count_result_function(ds.uri, None, "count", filter=filter_expr)
+        result_generator = _lance_count_result_function(ds.uri, None, "count", filter=filter_expr)
         result_batch = next(result_generator)
         record_batch = RecordBatch._from_pyrecordbatch(result_batch)
         result_dict = record_batch.to_pydict()
         assert result_dict["count"][0] == 4
 
+    def test_deprecated_lancedb_count_result_function_alias(self, test_dataset_path):
+        """Test that the old count helper name remains available."""
+        ds = lance.dataset(test_dataset_path)
+
+        with pytest.deprecated_call(match="_lancedb_count_result_function is deprecated"):
+            result_generator = _lancedb_count_result_function(ds.uri, None, "count")
+
+        result_batch = next(result_generator)
+        record_batch = RecordBatch._from_pyrecordbatch(result_batch)
+        result_dict = record_batch.to_pydict()
+        assert result_dict["count"][0] == 6
+
     def test_unsupported_count_mode_fallback(self, test_dataset_path):
         """Test that unsupported count mode falls back to regular scan."""
         ds = lance.dataset(test_dataset_path)
-        scan_op = LanceDBScanOperator(ds)
+        scan_op = LanceScanOperator(ds)
 
         with patch.object(scan_op, "supported_count_modes", return_value=[CountMode.All]):
             with patch("daft_lance.lance_scan.logger") as mock_logger:
@@ -77,12 +94,23 @@ class TestLanceCountResultFunction:
     def test_empty_filters_list_handling(self, test_dataset_path):
         """Test that empty filters list is handled correctly."""
         ds = lance.dataset(test_dataset_path)
-        scan_op = LanceDBScanOperator(ds)
+        scan_op = LanceScanOperator(ds)
         pushed, remaining = scan_op.push_filters([])
 
         assert len(pushed) == 0
         assert len(remaining) == 0
         assert scan_op._pushed_filters is None
+
+    def test_deprecated_lancedb_scan_operator_alias(self, test_dataset_path):
+        """Test that the old public scan operator name remains available."""
+        ds = lance.dataset(test_dataset_path)
+
+        with pytest.deprecated_call(match="LanceDBScanOperator is deprecated"):
+            scan_op = LanceDBScanOperator(ds)
+
+        assert isinstance(scan_op, LanceScanOperator)
+        assert scan_op.name() == "LanceDBScanOperator"
+        assert scan_op.display_name() == f"LanceDBScanOperator({ds.uri})"
 
     def test_very_large_filter_expression(self, test_dataset_path):
         """Test that very large filter expressions are handled correctly."""
