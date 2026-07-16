@@ -388,9 +388,7 @@ def _create_segmented_index(
     # Reload dataset to pick up the latest version (segment files were written
     # by workers against the version that was current at their invocation time).
     namespace_kwargs = namespace_kwargs_for_dataset(lance_ds)
-    lance_ds = lance.dataset(
-        None if namespace_kwargs else uri, storage_options=storage_options, **namespace_kwargs
-    )
+    lance_ds = lance.dataset(None if namespace_kwargs else uri, storage_options=storage_options, **namespace_kwargs)
     index_metas = _prepare_index_segments_for_commit(lance_ds, index_type, index_metas)
 
     logger.info(
