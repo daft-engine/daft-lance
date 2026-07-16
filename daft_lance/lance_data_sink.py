@@ -5,7 +5,7 @@ import pathlib
 import uuid
 import warnings
 from itertools import chain
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import lance
 from lance.fragment import FragmentMetadata
@@ -144,7 +144,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         self._effective_pyarrow_schema = self._blob.build_effective_schema(self._pyarrow_schema)
 
     @property
-    def _namespace_kwargs(self) -> dict[str, object]:
+    def _namespace_kwargs(self) -> dict[str, Any]:
         return get_namespace_kwargs(self._namespace_impl, self._namespace_properties, self._table_id)
 
     @property
@@ -255,7 +255,8 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                     raise FileExistsError("Target path points to a file, cannot create a dataset here.")
             return None
 
-        self._table_schema = dataset.schema
+        table_schema = dataset.schema
+        self._table_schema = table_schema
         self._version = dataset.latest_version
 
         if self._mode == "create":
@@ -270,8 +271,8 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             self._table_schema = None
 
         if self._mode == "append" and not _pyarrow_schema_castable(
-            blob_aware_schema_for_validation(self._pyarrow_schema, self._table_schema),
-            blob_aware_schema_for_validation(self._table_schema, self._table_schema),
+            blob_aware_schema_for_validation(self._pyarrow_schema, table_schema),
+            blob_aware_schema_for_validation(table_schema, table_schema),
         ):
             raise ValueError(
                 "Schema of data does not match table schema\n"

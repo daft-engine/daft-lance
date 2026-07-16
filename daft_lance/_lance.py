@@ -47,7 +47,7 @@ def read_lance(
     block_size: int | None = None,
     commit_lock: object | None = None,
     index_cache_size: int | None = None,
-    default_scan_options: dict[str, str] | None = None,
+    default_scan_options: dict[str, Any] | None = None,
     metadata_cache_size_bytes: int | None = None,
     fragment_group_size: int | None = None,
     include_fragment_id: bool | None = None,

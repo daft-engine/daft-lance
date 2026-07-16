@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from typing import Any
 
 import pytest
 
@@ -23,7 +24,7 @@ def test_rest_namespace_write_read_append_roundtrip() -> None:
     catalog = os.environ.get("DAFT_LANCE_REST_CATALOG", "lance_catalog")
     schema = os.environ.get("DAFT_LANCE_REST_SCHEMA", "daft_ns_e2e")
     table_id = [catalog, schema, f"orders_{uuid.uuid4().hex[:8]}"]
-    ns = {"namespace_impl": "rest", "namespace_properties": namespace_properties}
+    ns: dict[str, Any] = {"namespace_impl": "rest", "namespace_properties": namespace_properties}
 
     namespace = ln.connect("rest", namespace_properties)
     try:
@@ -56,9 +57,8 @@ def test_rest_namespace_write_read_append_roundtrip() -> None:
         "score": [10, 20, 30, 40, 50],
     }
 
-    filtered = (
-        daft_lance.read_lance(table_id=table_id, **ns).where(daft.col("score") >= 30).select("id", "label").to_pydict()
-    )
+    predicate = daft.col("score") >= 30  # type: ignore[operator]
+    filtered = daft_lance.read_lance(table_id=table_id, **ns).where(predicate).select("id", "label").to_pydict()
     assert filtered == {"id": [3, 4, 5], "label": ["c", "d", "e"]}
 
     assert daft_lance.read_lance(table_id=table_id, **ns).count_rows() == 5
@@ -71,9 +71,9 @@ def test_rest_namespace_patch_daft_roundtrip() -> None:
     catalog = os.environ.get("DAFT_LANCE_REST_CATALOG", "lance_catalog")
     schema = os.environ.get("DAFT_LANCE_REST_SCHEMA", "daft_ns_e2e")
     table_id = [catalog, schema, f"patched_{uuid.uuid4().hex[:8]}"]
-    ns = {"namespace_impl": "rest", "namespace_properties": namespace_properties}
+    ns: dict[str, Any] = {"namespace_impl": "rest", "namespace_properties": namespace_properties}
 
     daft_lance.patch_daft()
 
     daft.from_pydict({"id": [1, 2]}).write_lance(table_id=table_id, mode="create", **ns).collect()
-    assert daft.read_lance(table_id=table_id, **ns).to_pydict() == {"id": [1, 2]}
+    assert daft.read_lance(table_id=table_id, **ns).to_pydict() == {"id": [1, 2]}  # type: ignore[call-arg]

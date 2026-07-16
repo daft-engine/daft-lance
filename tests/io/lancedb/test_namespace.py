@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -11,11 +13,11 @@ import daft_lance.namespace as namespace_mod
 pytestmark = pytest.mark.lance_native_teardown_crash_workaround
 
 
-def _dir_ns(tmp_path):
+def _dir_ns(tmp_path: Path) -> dict[str, Any]:
     return {"namespace_impl": "dir", "namespace_properties": {"root": str(tmp_path)}}
 
 
-def test_namespace_write_read_append_roundtrip(tmp_path):
+def test_namespace_write_read_append_roundtrip(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["roundtrip"]
 
@@ -30,7 +32,7 @@ def test_namespace_write_read_append_roundtrip(tmp_path):
     assert result == {"id": [1, 2, 3], "label": ["a", "b", "c"]}
 
 
-def test_namespace_overwrite(tmp_path):
+def test_namespace_overwrite(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["overwrite_tbl"]
 
@@ -41,7 +43,7 @@ def test_namespace_overwrite(tmp_path):
     assert result == {"id": [7, 8, 9]}
 
 
-def test_namespace_overwrite_missing_table_declares(tmp_path):
+def test_namespace_overwrite_missing_table_declares(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["overwrite_fresh"]
 
@@ -51,14 +53,16 @@ def test_namespace_overwrite_missing_table_declares(tmp_path):
     assert result == {"id": [1]}
 
 
-def test_namespace_overwrite_does_not_declare_on_ambiguous_error(monkeypatch, tmp_path):
+def test_namespace_overwrite_does_not_declare_on_ambiguous_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     class FakeNamespace:
         declared = False
 
-        def describe_table(self, request):
+        def describe_table(self, request: Any) -> Any:
             raise RuntimeError("permission denied: parent catalog does not exist")
 
-        def declare_table(self, request):
+        def declare_table(self, request: Any) -> Any:
             self.declared = True
             return SimpleNamespace(location=str(tmp_path / "should_not_exist.lance"))
 
@@ -76,14 +80,14 @@ def test_namespace_overwrite_does_not_declare_on_ambiguous_error(monkeypatch, tm
     assert not namespace.declared
 
 
-def test_namespace_untyped_404_table_not_found_is_missing():
+def test_namespace_untyped_404_table_not_found_is_missing() -> None:
     class RestTableNotFound(RuntimeError):
         status = 404
 
     assert namespace_mod.is_table_not_found(RestTableNotFound("table catalog.schema.table not found"))
 
 
-def test_namespace_read_supports_pushdowns(tmp_path):
+def test_namespace_read_supports_pushdowns(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["pushdowns"]
 
@@ -100,12 +104,13 @@ def test_namespace_read_supports_pushdowns(tmp_path):
         **ns,
     ).collect()
 
-    result = daft_lance.read_lance(table_id=table_id, **ns).where(daft.col("score") > 10).select("label").to_pydict()
+    predicate = daft.col("score") > 10  # type: ignore[operator]
+    result = daft_lance.read_lance(table_id=table_id, **ns).where(predicate).select("label").to_pydict()
 
     assert result == {"label": ["b", "c"]}
 
 
-def test_namespace_count_pushdown(tmp_path):
+def test_namespace_count_pushdown(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["count_tbl"]
 
@@ -114,7 +119,7 @@ def test_namespace_count_pushdown(tmp_path):
     assert daft_lance.read_lance(table_id=table_id, **ns).count_rows() == 10
 
 
-def test_namespace_patch_daft(tmp_path):
+def test_namespace_patch_daft(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["patched"]
 
@@ -122,7 +127,7 @@ def test_namespace_patch_daft(tmp_path):
     daft_lance.patch_daft()  # idempotent
 
     daft.from_pydict({"id": [1, 2]}).write_lance(table_id=table_id, mode="create", **ns).collect()
-    result = daft.read_lance(table_id=table_id, **ns).to_pydict()
+    result = daft.read_lance(table_id=table_id, **ns).to_pydict()  # type: ignore[call-arg]
     assert result == {"id": [1, 2]}
 
     # Plain-URI writes keep working through the patched method.
@@ -131,7 +136,7 @@ def test_namespace_patch_daft(tmp_path):
     assert daft.read_lance(uri).to_pydict() == {"id": [5]}
 
 
-def test_namespace_write_lance_merge_new_columns(tmp_path):
+def test_namespace_write_lance_merge_new_columns(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["merge_tbl"]
 
@@ -155,7 +160,7 @@ def test_namespace_write_lance_merge_new_columns(tmp_path):
     assert result["doubled"] == [20, 40, 60]
 
 
-def test_namespace_merge_columns_df(tmp_path):
+def test_namespace_merge_columns_df(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["merge_cols_df"]
 
@@ -179,7 +184,7 @@ def test_namespace_merge_columns_df(tmp_path):
     assert result["tripled"] == [3, 6, 9]
 
 
-def test_namespace_create_scalar_index(tmp_path):
+def test_namespace_create_scalar_index(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["indexed"]
 
@@ -199,10 +204,10 @@ def test_namespace_create_scalar_index(tmp_path):
     namespace = ln.connect("dir", {"root": str(tmp_path)})
     location = namespace.describe_table(DescribeTableRequest(id=table_id)).location
     indices = lance.dataset(location).list_indices()
-    assert any(idx["fields"] == ["price"] for idx in indices)
+    assert any(idx["fields"] == ["price"] for idx in indices)  # type: ignore[index]
 
 
-def test_namespace_compact_files(tmp_path):
+def test_namespace_compact_files(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["compacted"]
 
@@ -216,7 +221,7 @@ def test_namespace_compact_files(tmp_path):
     assert result == {"id": [1, 2, 3, 4]}
 
 
-def test_sink_construction_is_side_effect_free(tmp_path):
+def test_sink_construction_is_side_effect_free(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     schema = daft.from_pydict({"id": [1]}).schema()
 
@@ -227,7 +232,7 @@ def test_sink_construction_is_side_effect_free(tmp_path):
     assert (tmp_path / "deferred.lance").exists()
 
 
-def test_sink_invalid_params_do_not_declare_table(tmp_path):
+def test_sink_invalid_params_do_not_declare_table(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     schema = daft.from_pydict({"id": [1]}).schema()
 
@@ -237,7 +242,7 @@ def test_sink_invalid_params_do_not_declare_table(tmp_path):
     assert not (tmp_path / "orphan.lance").exists()
 
 
-def test_namespace_create_on_existing_table_raises(tmp_path):
+def test_namespace_create_on_existing_table_raises(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["exists"]
 
@@ -247,7 +252,7 @@ def test_namespace_create_on_existing_table_raises(tmp_path):
         daft_lance.write_lance(daft.from_pydict({"id": [2]}), table_id=table_id, mode="create", **ns).collect()
 
 
-def test_namespace_create_over_declared_placeholder(tmp_path):
+def test_namespace_create_over_declared_placeholder(tmp_path: Path) -> None:
     import lance_namespace as ln
     from lance_namespace import DeclareTableRequest
 
@@ -262,20 +267,20 @@ def test_namespace_create_over_declared_placeholder(tmp_path):
     assert daft_lance.read_lance(table_id=table_id, **ns).to_pydict() == {"id": [1, 2]}
 
 
-def test_create_declare_race_recovers_placeholder(monkeypatch, tmp_path):
+def test_create_declare_race_recovers_placeholder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
 
     class RacingNamespace:
-        def __init__(self):
+        def __init__(self) -> None:
             self.describe_calls = 0
 
-        def describe_table(self, request):
+        def describe_table(self, request: Any) -> Any:
             self.describe_calls += 1
             if self.describe_calls == 1:
                 raise TableNotFoundError("table not found: t")
             return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None, is_only_declared=True)
 
-        def declare_table(self, request):
+        def declare_table(self, request: Any) -> Any:
             raise TableAlreadyExistsError("Table already exists: t")
 
     fake = RacingNamespace()
@@ -292,20 +297,20 @@ def test_create_declare_race_recovers_placeholder(monkeypatch, tmp_path):
     assert fake.describe_calls == 2
 
 
-def test_create_declare_race_lost_to_real_table_raises(monkeypatch, tmp_path):
+def test_create_declare_race_lost_to_real_table_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
 
     class RacingNamespace:
-        def __init__(self):
+        def __init__(self) -> None:
             self.describe_calls = 0
 
-        def describe_table(self, request):
+        def describe_table(self, request: Any) -> Any:
             self.describe_calls += 1
             if self.describe_calls == 1:
                 raise TableNotFoundError("table not found: t")
             return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None, is_only_declared=False)
 
-        def declare_table(self, request):
+        def declare_table(self, request: Any) -> Any:
             raise TableAlreadyExistsError("Table already exists: t")
 
     monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: RacingNamespace())
@@ -319,7 +324,7 @@ def test_create_declare_race_lost_to_real_table_raises(monkeypatch, tmp_path):
         )
 
 
-def test_declared_placeholder_response_fallback_property():
+def test_declared_placeholder_response_fallback_property() -> None:
     assert namespace_mod.is_declared_placeholder_response(SimpleNamespace(is_only_declared=True))
     assert namespace_mod.is_declared_placeholder_response(
         SimpleNamespace(is_only_declared=None, properties={"lance.declared": "TRUE"})
@@ -329,7 +334,7 @@ def test_declared_placeholder_response_fallback_property():
     )
 
 
-def test_construct_lance_dataset_storage_options_priority(monkeypatch):
+def test_construct_lance_dataset_storage_options_priority(monkeypatch: pytest.MonkeyPatch) -> None:
     import daft_lance.utils as utils_mod
     from daft.io import IOConfig, S3Config
 
@@ -338,12 +343,12 @@ def test_construct_lance_dataset_storage_options_priority(monkeypatch):
     class FakeDataset:
         pass
 
-    def fake_dataset(uri, storage_options=None, version=None, **kwargs):
+    def fake_dataset(uri: Any, storage_options: Any = None, version: Any = None, **kwargs: Any) -> Any:
         captured["uri"] = uri
         captured["storage_options"] = storage_options
         return FakeDataset()
 
-    monkeypatch.setattr(utils_mod.lance, "dataset", fake_dataset)
+    monkeypatch.setattr("daft_lance.utils.lance.dataset", fake_dataset)
     monkeypatch.setattr(utils_mod, "get_namespace_kwargs", lambda *args: {})
     monkeypatch.setattr(
         utils_mod,
@@ -365,6 +370,7 @@ def test_construct_lance_dataset_storage_options_priority(monkeypatch):
     )
 
     merged = captured["storage_options"]
+    assert merged is not None
     assert merged["access_key_id"] == "vended-key"  # namespace-vended beats user-provided
     assert merged["session_token"] == "vended-token"
     assert merged["user_option"] == "kept"  # user-provided keys survive
@@ -372,7 +378,7 @@ def test_construct_lance_dataset_storage_options_priority(monkeypatch):
     assert captured["uri"] is None  # namespace addressing passes uri=None
 
 
-def test_construct_lance_dataset_io_config_reaches_namespace_location(monkeypatch):
+def test_construct_lance_dataset_io_config_reaches_namespace_location(monkeypatch: pytest.MonkeyPatch) -> None:
     import daft_lance.utils as utils_mod
     from daft.io import IOConfig, S3Config
 
@@ -381,11 +387,11 @@ def test_construct_lance_dataset_io_config_reaches_namespace_location(monkeypatc
     class FakeDataset:
         pass
 
-    def fake_dataset(uri, storage_options=None, version=None, **kwargs):
+    def fake_dataset(uri: Any, storage_options: Any = None, version: Any = None, **kwargs: Any) -> Any:
         captured["storage_options"] = storage_options
         return FakeDataset()
 
-    monkeypatch.setattr(utils_mod.lance, "dataset", fake_dataset)
+    monkeypatch.setattr("daft_lance.utils.lance.dataset", fake_dataset)
     monkeypatch.setattr(utils_mod, "get_namespace_kwargs", lambda *args: {})
     monkeypatch.setattr(
         utils_mod,
@@ -403,11 +409,12 @@ def test_construct_lance_dataset_io_config_reaches_namespace_location(monkeypatc
     )
 
     merged = captured["storage_options"]
+    assert merged is not None
     assert merged["access_key_id"] == "io-key"
     assert merged["secret_access_key"] == "io-secret"
 
 
-def test_sink_storage_options_priority(tmp_path):
+def test_sink_storage_options_priority(tmp_path: Path) -> None:
     from daft.io import IOConfig, S3Config
 
     ns = _dir_ns(tmp_path)
@@ -428,12 +435,13 @@ def test_sink_storage_options_priority(tmp_path):
     )
 
     merged = sink._merged_storage_options(resolved)
+    assert merged is not None
     assert merged["access_key_id"] == "vended-key"
     assert merged["user_option"] == "kept"
     assert merged["secret_access_key"] == "io-secret"
 
 
-def test_namespace_rejects_uri_and_namespace(tmp_path):
+def test_namespace_rejects_uri_and_namespace(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Cannot provide both 'uri' and namespace parameters"):
         daft_lance.read_lance(
             str(tmp_path / "dataset"),
@@ -443,7 +451,7 @@ def test_namespace_rejects_uri_and_namespace(tmp_path):
         )
 
 
-def test_namespace_requires_table_id(tmp_path):
+def test_namespace_requires_table_id(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="'table_id' must be provided"):
         daft_lance.read_lance(
             namespace_impl="dir",
@@ -451,11 +459,11 @@ def test_namespace_requires_table_id(tmp_path):
         )
 
 
-def test_namespace_requires_impl():
+def test_namespace_requires_impl() -> None:
     with pytest.raises(ValueError, match="'namespace_impl' must be provided"):
         daft_lance.read_lance(table_id=["tbl"])
 
 
-def test_namespace_requires_uri_or_namespace():
+def test_namespace_requires_uri_or_namespace() -> None:
     with pytest.raises(ValueError, match="Must provide either 'uri' OR"):
         daft_lance.read_lance()
