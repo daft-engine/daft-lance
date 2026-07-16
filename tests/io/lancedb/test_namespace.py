@@ -324,6 +324,80 @@ def test_create_declare_race_lost_to_real_table_raises(monkeypatch: pytest.Monke
         )
 
 
+def test_overwrite_resolves_declared_only_stub_on_strict_impl(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Strict impls 404 a plain describe on declared-only stubs; overwrite must still find them."""
+    from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
+
+    class StrictNamespace:
+        def describe_table(self, request: Any) -> Any:
+            if getattr(request, "check_declared", None) is True:
+                return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None, is_only_declared=True)
+            raise TableNotFoundError("table not found: t")
+
+        def declare_table(self, request: Any) -> Any:
+            raise TableAlreadyExistsError("Table already exists: t")
+
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: StrictNamespace())
+
+    resolved = namespace_mod.resolve_namespace_table(
+        namespace_impl="rest",
+        namespace_properties=None,
+        table_id=["t"],
+        mode="overwrite",
+    )
+    assert resolved is not None
+    assert resolved.uri.endswith("t.lance")
+    assert resolved.is_declared_placeholder
+
+
+def test_mem_wal_create_over_materialized_placeholder_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import daft_lance.lance_data_sink as sink_mod
+
+    ns = _dir_ns(tmp_path)
+    schema = daft.from_pydict({"id": [1]}).schema()
+    sink = daft_lance.LanceDataSink(None, schema, "create", table_id=["t"], use_mem_wal=True, **ns)
+
+    monkeypatch.setattr(
+        sink_mod,
+        "resolve_namespace_table",
+        lambda **kwargs: namespace_mod.ResolvedNamespaceTable(
+            uri=str(tmp_path / "t.lance"), is_declared_placeholder=True
+        ),
+    )
+    import pyarrow as pa
+
+    fake_dataset = SimpleNamespace(schema=pa.schema([("id", pa.int64())]), latest_version=1)
+    monkeypatch.setattr("daft_lance.lance_data_sink.lance.dataset", lambda *args, **kwargs: fake_dataset)
+
+    with pytest.raises(ValueError, match="use_mem_wal"):
+        sink.start()
+
+
+def test_construct_lance_dataset_empty_storage_options_falls_back_to_io_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import daft_lance.utils as utils_mod
+    from daft.io import IOConfig, S3Config
+
+    captured = {}
+
+    class FakeDataset:
+        pass
+
+    def fake_dataset(uri: Any, storage_options: Any = None, version: Any = None, **kwargs: Any) -> Any:
+        captured["storage_options"] = storage_options
+        return FakeDataset()
+
+    monkeypatch.setattr("daft_lance.utils.lance.dataset", fake_dataset)
+
+    io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
+    utils_mod.construct_lance_dataset("s3://bucket/t.lance", storage_options={}, io_config=io_config)
+
+    merged = captured["storage_options"]
+    assert merged is not None
+    assert merged["access_key_id"] == "io-key"
+
+
 def test_declared_placeholder_response_fallback_property() -> None:
     assert namespace_mod.is_declared_placeholder_response(SimpleNamespace(is_only_declared=True))
     assert namespace_mod.is_declared_placeholder_response(

@@ -126,7 +126,9 @@ def construct_lance_dataset(
 
     io_derived_options = io_config_to_storage_options(io_config, resolved_uri) if io_config is not None else None
     if uri is not None:
-        base_options = storage_options if storage_options is not None else io_derived_options
+        # Falsy check on purpose: entry points historically treated an empty dict
+        # like None and fell through to the io_config-derived options.
+        base_options = storage_options or io_derived_options
         merged_storage_options = merge_storage_options(base_options, namespace_storage_options)
     else:
         merged_storage_options = merge_storage_options(io_derived_options, storage_options, namespace_storage_options)

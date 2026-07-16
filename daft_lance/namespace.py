@@ -246,12 +246,18 @@ def resolve_namespace_table(
     if mode == "create":
         return _resolve_for_create(namespace, table_id)
 
-    try:
-        return _resolved_from_response(_describe_table(namespace, table_id))
-    except Exception as error:
-        if mode == "overwrite" and is_table_not_found(error):
-            return _declare_or_recover(namespace, table_id, check_declared=False)
-        raise
+    if mode == "overwrite":
+        # check_declared: a plain describe may 404 on declared-only stubs, and a
+        # stub is a perfectly fine overwrite target.
+        try:
+            response = _describe_table(namespace, table_id, check_declared=True)
+        except Exception as error:
+            if not is_table_not_found(error):
+                raise
+            return _declare_or_recover(namespace, table_id, for_create=False)
+        return _resolved_from_response(response, is_declared_placeholder=is_declared_placeholder_response(response))
+
+    return _resolved_from_response(_describe_table(namespace, table_id))
 
 
 def _resolve_for_create(namespace: Any, table_id: list[str]) -> ResolvedNamespaceTable:
@@ -266,21 +272,22 @@ def _resolve_for_create(namespace: Any, table_id: list[str]) -> ResolvedNamespac
     except Exception as error:
         if not is_table_not_found(error):
             raise
-        return _declare_or_recover(namespace, table_id, check_declared=True)
+        return _declare_or_recover(namespace, table_id, for_create=True)
     return _classify_existing_for_create(response, table_id)
 
 
-def _declare_or_recover(namespace: Any, table_id: list[str], *, check_declared: bool) -> ResolvedNamespaceTable:
+def _declare_or_recover(namespace: Any, table_id: list[str], *, for_create: bool) -> ResolvedNamespaceTable:
     try:
         return _declare_table(namespace, table_id)
     except Exception as error:
         if not is_table_already_exists(error):
             raise
-        # Lost a declare race; re-describe and classify what won.
-        response = _describe_table(namespace, table_id, check_declared=check_declared)
-        if not check_declared:
-            return _resolved_from_response(response)
-        return _classify_existing_for_create(response, table_id)
+        # Lost a declare race; re-describe (check_declared so a declared-only
+        # winner does not 404 on strict impls) and classify what won.
+        response = _describe_table(namespace, table_id, check_declared=True)
+        if for_create:
+            return _classify_existing_for_create(response, table_id)
+        return _resolved_from_response(response, is_declared_placeholder=is_declared_placeholder_response(response))
 
 
 def _classify_existing_for_create(response: Any, table_id: list[str]) -> ResolvedNamespaceTable:

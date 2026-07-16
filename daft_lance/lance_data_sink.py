@@ -267,6 +267,11 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 )
             # The namespace declared a stub table and this location already holds
             # a (placeholder) dataset; overwrite it instead of failing the create.
+            if self._use_mem_wal:
+                raise ValueError(
+                    "use_mem_wal=True cannot create over a namespace-declared placeholder "
+                    'dataset; write with use_mem_wal=False or use mode="overwrite".'
+                )
             self._overwrite_placeholder_dataset = True
             self._table_schema = None
 
