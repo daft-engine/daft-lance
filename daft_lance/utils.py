@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import lance
 
 from daft.dependencies import pa
+from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.schema import Schema as DaftSchema
 from daft_lance.namespace import (
     get_namespace_kwargs,
@@ -17,6 +18,8 @@ from daft_lance.namespace import (
 
 if TYPE_CHECKING:
     import pathlib
+
+    from daft.daft import IOConfig
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +95,19 @@ def construct_lance_dataset(
     uri: str | pathlib.Path | None,
     version: int | str | None = None,
     storage_options: dict[str, Any] | None = None,
+    io_config: IOConfig | None = None,
     namespace_impl: str | None = None,
     namespace_properties: dict[str, str] | None = None,
     table_id: list[str] | None = None,
     **kwargs: Any,
 ) -> lance.LanceDataset:
-    """Construct a Lance dataset with common options."""
+    """Construct a Lance dataset with common options.
+
+    Storage options are layered from lowest to highest priority:
+    io_config-derived < user-provided ``storage_options`` < namespace-vended.
+    For a plain ``uri``, user-provided ``storage_options`` replace the
+    io_config-derived ones entirely (historical behavior).
+    """
     validate_uri_or_namespace(uri, namespace_impl, table_id)
     resolved_uri = str(uri) if uri is not None else None
     namespace_storage_options = None
@@ -113,7 +123,13 @@ def construct_lance_dataset(
             namespace_storage_options = resolved.storage_options
     if resolved_uri is None:
         raise ValueError("Unable to resolve Lance dataset URI.")
-    merged_storage_options = merge_storage_options(storage_options, namespace_storage_options)
+
+    io_derived_options = io_config_to_storage_options(io_config, resolved_uri) if io_config is not None else None
+    if uri is not None:
+        base_options = storage_options if storage_options is not None else io_derived_options
+        merged_storage_options = merge_storage_options(base_options, namespace_storage_options)
+    else:
+        merged_storage_options = merge_storage_options(io_derived_options, storage_options, namespace_storage_options)
 
     original_default_scan_options = kwargs.pop("default_scan_options", None)
     safe_default_scan_options = None

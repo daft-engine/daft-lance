@@ -329,6 +329,110 @@ def test_declared_placeholder_response_fallback_property():
     )
 
 
+def test_construct_lance_dataset_storage_options_priority(monkeypatch):
+    import daft_lance.utils as utils_mod
+    from daft.io import IOConfig, S3Config
+
+    captured = {}
+
+    class FakeDataset:
+        pass
+
+    def fake_dataset(uri, storage_options=None, version=None, **kwargs):
+        captured["uri"] = uri
+        captured["storage_options"] = storage_options
+        return FakeDataset()
+
+    monkeypatch.setattr(utils_mod.lance, "dataset", fake_dataset)
+    monkeypatch.setattr(utils_mod, "get_namespace_kwargs", lambda *args: {})
+    monkeypatch.setattr(
+        utils_mod,
+        "resolve_namespace_table",
+        lambda **kwargs: namespace_mod.ResolvedNamespaceTable(
+            uri="s3://bucket/t.lance",
+            storage_options={"access_key_id": "vended-key", "session_token": "vended-token"},
+        ),
+    )
+
+    io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
+    utils_mod.construct_lance_dataset(
+        None,
+        io_config=io_config,
+        storage_options={"access_key_id": "user-key", "user_option": "kept"},
+        namespace_impl="rest",
+        namespace_properties={"uri": "http://namespace.example"},
+        table_id=["t"],
+    )
+
+    merged = captured["storage_options"]
+    assert merged["access_key_id"] == "vended-key"  # namespace-vended beats user-provided
+    assert merged["session_token"] == "vended-token"
+    assert merged["user_option"] == "kept"  # user-provided keys survive
+    assert merged["secret_access_key"] == "io-secret"  # io_config fills the gaps
+    assert captured["uri"] is None  # namespace addressing passes uri=None
+
+
+def test_construct_lance_dataset_io_config_reaches_namespace_location(monkeypatch):
+    import daft_lance.utils as utils_mod
+    from daft.io import IOConfig, S3Config
+
+    captured = {}
+
+    class FakeDataset:
+        pass
+
+    def fake_dataset(uri, storage_options=None, version=None, **kwargs):
+        captured["storage_options"] = storage_options
+        return FakeDataset()
+
+    monkeypatch.setattr(utils_mod.lance, "dataset", fake_dataset)
+    monkeypatch.setattr(utils_mod, "get_namespace_kwargs", lambda *args: {})
+    monkeypatch.setattr(
+        utils_mod,
+        "resolve_namespace_table",
+        lambda **kwargs: namespace_mod.ResolvedNamespaceTable(uri="s3://bucket/t.lance", storage_options=None),
+    )
+
+    io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
+    utils_mod.construct_lance_dataset(
+        None,
+        io_config=io_config,
+        namespace_impl="rest",
+        namespace_properties={"uri": "http://namespace.example"},
+        table_id=["t"],
+    )
+
+    merged = captured["storage_options"]
+    assert merged["access_key_id"] == "io-key"
+    assert merged["secret_access_key"] == "io-secret"
+
+
+def test_sink_storage_options_priority(tmp_path):
+    from daft.io import IOConfig, S3Config
+
+    ns = _dir_ns(tmp_path)
+    schema = daft.from_pydict({"id": [1]}).schema()
+    io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
+
+    sink = daft_lance.LanceDataSink(
+        None,
+        schema,
+        "create",
+        io_config,
+        table_id=["t"],
+        storage_options={"user_option": "kept", "access_key_id": "user-key"},
+        **ns,
+    )
+    resolved = namespace_mod.ResolvedNamespaceTable(
+        uri="s3://bucket/t.lance", storage_options={"access_key_id": "vended-key"}
+    )
+
+    merged = sink._merged_storage_options(resolved)
+    assert merged["access_key_id"] == "vended-key"
+    assert merged["user_option"] == "kept"
+    assert merged["secret_access_key"] == "io-secret"
+
+
 def test_namespace_rejects_uri_and_namespace(tmp_path):
     with pytest.raises(ValueError, match="Cannot provide both 'uri' and namespace parameters"):
         daft_lance.read_lance(

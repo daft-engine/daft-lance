@@ -9,7 +9,6 @@ from daft.api_annotations import PublicAPI
 from daft.daft import IOConfig, ScanOperatorHandle
 from daft.dataframe import DataFrame
 from daft.io._checkpoint import attach_checkpoint
-from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.builder import LogicalPlanBuilder
 
 from .lance_compaction import compact_files_internal
@@ -148,11 +147,10 @@ def read_lance(
         )
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = io_config_to_storage_options(io_config, uri_str) if uri_str is not None else None
 
     ds = construct_lance_dataset(
         uri_str,
-        storage_options=storage_options,
+        io_config=io_config,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
@@ -243,13 +241,12 @@ def merge_columns(
         )
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    if uri is not None:
-        storage_options = storage_options or io_config_to_storage_options(io_config, uri)
 
     # Build Lance dataset handle for committing
     lance_ds = construct_lance_dataset(
         uri,
         storage_options=storage_options,
+        io_config=io_config,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
@@ -346,13 +343,12 @@ def merge_columns_df(
         >>> daft_lance.merge_columns_df(df, "s3://my-lancedb-bucket/data/")
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    if uri is not None:
-        storage_options = storage_options or io_config_to_storage_options(io_config, uri)
 
     # Build Lance dataset handle for committing
     lance_ds = construct_lance_dataset(
         uri,
         storage_options=storage_options,
+        io_config=io_config,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
@@ -499,12 +495,11 @@ def create_scalar_index(
         >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="title", replace=False)
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    if uri is not None:
-        storage_options = storage_options or io_config_to_storage_options(io_config, str(uri))
 
     lance_ds = construct_lance_dataset(
         uri,
         storage_options=storage_options,
+        io_config=io_config,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
@@ -591,14 +586,11 @@ def compact_files(
         RuntimeError: When compaction fails or no successful results
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    if uri is not None:
-        storage_options = storage_options or io_config_to_storage_options(
-            io_config, str(uri) if isinstance(uri, pathlib.Path) else uri
-        )
 
     lance_ds = construct_lance_dataset(
         uri,
         storage_options=storage_options,
+        io_config=io_config,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
@@ -709,14 +701,13 @@ def write_lance(
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
     storage_options = kwargs.pop("storage_options", None)
-    if uri is not None:
-        storage_options = storage_options or io_config_to_storage_options(io_config, str(uri))
 
     lance_ds: LanceDataset | None
     try:
         lance_ds = construct_lance_dataset(
             uri,
             storage_options=storage_options,
+            io_config=io_config,
             namespace_impl=namespace_impl,
             namespace_properties=namespace_properties,
             table_id=table_id,

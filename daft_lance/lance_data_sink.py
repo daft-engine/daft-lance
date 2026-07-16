@@ -125,7 +125,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         resolved = self._resolve_table()
         self._table_uri = resolved.uri
         self._declared_placeholder = resolved.is_declared_placeholder
-        self._storage_options = merge_storage_options(self._base_storage_options(), resolved.storage_options)
+        self._storage_options = self._merged_storage_options(resolved)
 
         existing = self._absorb_existing_dataset()
         existing_version = getattr(existing, "data_storage_version", None) if existing is not None else None
@@ -165,12 +165,17 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             raise ValueError("Unable to resolve Lance dataset URI from namespace.")
         return resolved
 
-    def _base_storage_options(self) -> dict[str, str] | None:
-        if self._uri is None:
-            return self._user_storage_options
-        if self._user_storage_options is not None:
-            return self._user_storage_options
-        return io_config_to_storage_options(self._io_config, str(self._uri))
+    def _merged_storage_options(self, resolved: ResolvedNamespaceTable) -> dict[str, str] | None:
+        """Layer storage options: io_config-derived < user-provided < namespace-vended.
+
+        For a plain uri, user-provided options replace the io_config-derived ones
+        entirely (historical behavior).
+        """
+        io_derived = io_config_to_storage_options(self._io_config, resolved.uri)
+        if self._uri is not None:
+            base = self._user_storage_options if self._user_storage_options is not None else io_derived
+            return merge_storage_options(base, resolved.storage_options)
+        return merge_storage_options(io_derived, self._user_storage_options, resolved.storage_options)
 
     @staticmethod
     def _reject_unsupported_modes(

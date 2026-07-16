@@ -289,15 +289,16 @@ def _classify_existing_for_create(response: Any, table_id: list[str]) -> Resolve
     )
 
 
-def merge_storage_options(
-    storage_options: dict[str, Any] | None,
-    namespace_storage_options: dict[str, str] | None,
-) -> dict[str, Any] | None:
+def merge_storage_options(*layers: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Merge storage-option layers; later layers take precedence.
+
+    Callers order layers from lowest to highest priority, conventionally:
+    io_config-derived < user-provided ``storage_options`` < namespace-vended.
+    """
     merged: dict[str, Any] = {}
-    if storage_options:
-        merged.update(storage_options)
-    if namespace_storage_options:
-        merged.update(namespace_storage_options)
+    for layer in layers:
+        if layer:
+            merged.update(layer)
     return merged or None
 
 
