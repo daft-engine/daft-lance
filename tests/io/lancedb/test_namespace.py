@@ -216,6 +216,119 @@ def test_namespace_compact_files(tmp_path):
     assert result == {"id": [1, 2, 3, 4]}
 
 
+def test_sink_construction_is_side_effect_free(tmp_path):
+    ns = _dir_ns(tmp_path)
+    schema = daft.from_pydict({"id": [1]}).schema()
+
+    sink = daft_lance.LanceDataSink(None, schema, "create", table_id=["deferred"], **ns)
+    assert not (tmp_path / "deferred.lance").exists()
+
+    sink.start()
+    assert (tmp_path / "deferred.lance").exists()
+
+
+def test_sink_invalid_params_do_not_declare_table(tmp_path):
+    ns = _dir_ns(tmp_path)
+    schema = daft.from_pydict({"id": [1]}).schema()
+
+    with pytest.raises(ValueError, match="blob_columns"):
+        daft_lance.LanceDataSink(None, schema, "create", table_id=["orphan"], blob_columns=["missing"], **ns)
+
+    assert not (tmp_path / "orphan.lance").exists()
+
+
+def test_namespace_create_on_existing_table_raises(tmp_path):
+    ns = _dir_ns(tmp_path)
+    table_id = ["exists"]
+
+    daft_lance.write_lance(daft.from_pydict({"id": [1]}), table_id=table_id, mode="create", **ns).collect()
+
+    with pytest.raises(ValueError, match="already exists"):
+        daft_lance.write_lance(daft.from_pydict({"id": [2]}), table_id=table_id, mode="create", **ns).collect()
+
+
+def test_namespace_create_over_declared_placeholder(tmp_path):
+    import lance_namespace as ln
+    from lance_namespace import DeclareTableRequest
+
+    ns = _dir_ns(tmp_path)
+    table_id = ["declared_first"]
+
+    namespace = ln.connect("dir", {"root": str(tmp_path)})
+    namespace.declare_table(DeclareTableRequest(id=table_id, location=None))
+
+    daft_lance.write_lance(daft.from_pydict({"id": [1, 2]}), table_id=table_id, mode="create", **ns).collect()
+
+    assert daft_lance.read_lance(table_id=table_id, **ns).to_pydict() == {"id": [1, 2]}
+
+
+def test_create_declare_race_recovers_placeholder(monkeypatch, tmp_path):
+    from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
+
+    class RacingNamespace:
+        def __init__(self):
+            self.describe_calls = 0
+
+        def describe_table(self, request):
+            self.describe_calls += 1
+            if self.describe_calls == 1:
+                raise TableNotFoundError("table not found: t")
+            return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None, is_only_declared=True)
+
+        def declare_table(self, request):
+            raise TableAlreadyExistsError("Table already exists: t")
+
+    fake = RacingNamespace()
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: fake)
+
+    resolved = namespace_mod.resolve_namespace_table(
+        namespace_impl="rest",
+        namespace_properties=None,
+        table_id=["t"],
+        mode="create",
+    )
+    assert resolved is not None
+    assert resolved.is_declared_placeholder
+    assert fake.describe_calls == 2
+
+
+def test_create_declare_race_lost_to_real_table_raises(monkeypatch, tmp_path):
+    from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
+
+    class RacingNamespace:
+        def __init__(self):
+            self.describe_calls = 0
+
+        def describe_table(self, request):
+            self.describe_calls += 1
+            if self.describe_calls == 1:
+                raise TableNotFoundError("table not found: t")
+            return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None, is_only_declared=False)
+
+        def declare_table(self, request):
+            raise TableAlreadyExistsError("Table already exists: t")
+
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: RacingNamespace())
+
+    with pytest.raises(ValueError, match="already exists"):
+        namespace_mod.resolve_namespace_table(
+            namespace_impl="rest",
+            namespace_properties=None,
+            table_id=["t"],
+            mode="create",
+        )
+
+
+def test_declared_placeholder_response_fallback_property():
+    assert namespace_mod.is_declared_placeholder_response(SimpleNamespace(is_only_declared=True))
+    assert namespace_mod.is_declared_placeholder_response(
+        SimpleNamespace(is_only_declared=None, properties={"lance.declared": "TRUE"})
+    )
+    assert not namespace_mod.is_declared_placeholder_response(
+        SimpleNamespace(is_only_declared=None, properties={}, metadata=None)
+    )
+
+
 def test_namespace_rejects_uri_and_namespace(tmp_path):
     with pytest.raises(ValueError, match="Cannot provide both 'uri' and namespace parameters"):
         daft_lance.read_lance(

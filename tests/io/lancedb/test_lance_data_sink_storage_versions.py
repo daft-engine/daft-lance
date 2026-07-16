@@ -47,6 +47,7 @@ def test_append_inherits_storage_version(tmp_path):
     # inherit from the existing dataset.
     schema = pa.schema([("a", pa.int64())])
     sink = LanceDataSink(uri=uri, schema=schema, mode="append")
+    sink.start()
     assert sink._data_storage_version == initial_version
 
     df2 = _make_df(5)
@@ -64,8 +65,9 @@ def test_storage_version_mismatch_on_append_rejected(tmp_path):
     df1.write_lance(uri, mode="create", data_storage_version="2.1")
 
     schema = pa.schema([("a", pa.int64())])
+    sink = LanceDataSink(uri=uri, schema=schema, mode="append", data_storage_version="2.2")
     with pytest.raises(ValueError, match="does not match existing dataset version"):
-        LanceDataSink(uri=uri, schema=schema, mode="append", data_storage_version="2.2")
+        sink.start()
 
 
 def test_use_legacy_format_emits_deprecation_warning(tmp_path):

@@ -55,6 +55,7 @@ def test_accumulate_small_micropartitions(schema, tmp_path):
 
     with patch("daft_lance.lance_data_sink.lance", fake):
         sink = LanceDataSink(uri=str(tmp_path / "tbl"), schema=schema, mode="create", max_rows_per_file=25)
+        sink.start()
         mps = [_make_mp(10), _make_mp(20), _make_mp(30)]
         results = list(sink.write(iter(mps)))
 
@@ -69,6 +70,7 @@ def test_flush_remaining_at_end(schema, tmp_path):
 
     with patch("daft_lance.lance_data_sink.lance", fake):
         sink = LanceDataSink(uri=str(tmp_path / "tbl"), schema=schema, mode="create", max_rows_per_file=25)
+        sink.start()
         mps = [_make_mp(10), _make_mp(5)]
         results = list(sink.write(iter(mps)))
 
@@ -83,6 +85,7 @@ def test_large_micropartition_writes_directly(schema, tmp_path):
 
     with patch("daft_lance.lance_data_sink.lance", fake):
         sink = LanceDataSink(uri=str(tmp_path / "tbl"), schema=schema, mode="create", max_rows_per_file=25)
+        sink.start()
         mps = [_make_mp(30)]
         results = list(sink.write(iter(mps)))
 
@@ -102,6 +105,7 @@ def test_accumulation_default_batches_across_micropartitions(schema, tmp_path):
 
     with patch("daft_lance.lance_data_sink.lance", fake):
         sink = LanceDataSink(uri=str(tmp_path / "tbl"), schema=schema, mode="create")
+        sink.start()
         mps = [_make_mp(10), _make_mp(10), _make_mp(10)]
         results = list(sink.write(iter(mps)))
 

@@ -102,12 +102,15 @@ def construct_lance_dataset(
     resolved_uri = str(uri) if uri is not None else None
     namespace_storage_options = None
     if resolved_uri is None:
-        resolved_uri, namespace_storage_options = resolve_namespace_table(
+        resolved = resolve_namespace_table(
             namespace_impl=namespace_impl,
             namespace_properties=namespace_properties,
             table_id=table_id,
             mode="read",
         )
+        if resolved is not None:
+            resolved_uri = resolved.uri
+            namespace_storage_options = resolved.storage_options
     if resolved_uri is None:
         raise ValueError("Unable to resolve Lance dataset URI.")
     merged_storage_options = merge_storage_options(storage_options, namespace_storage_options)

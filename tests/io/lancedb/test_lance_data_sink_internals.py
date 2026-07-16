@@ -17,14 +17,16 @@ from daft_lance.lance_data_sink import LanceDataSink
 
 def test_load_existing_dataset_missing_raises_for_append(tmp_path):
     schema = pa.schema([("a", pa.int64())])
+    sink = LanceDataSink(uri=str(tmp_path / f"missing-{uuid.uuid4()}"), schema=schema, mode="append")
     with pytest.raises(ValueError, match="Cannot append to non-existent Lance dataset"):
-        LanceDataSink(uri=str(tmp_path / f"missing-{uuid.uuid4()}"), schema=schema, mode="append")
+        sink.start()
 
 
 def test_load_existing_dataset_missing_returns_none_for_create(tmp_path):
     schema = pa.schema([("a", pa.int64())])
     sink = LanceDataSink(uri=str(tmp_path / f"missing-{uuid.uuid4()}"), schema=schema, mode="create")
-    # Construction succeeds; the dataset will be created on the first write.
+    sink.start()
+    # Start succeeds; the dataset will be created on the first write.
     assert sink is not None
 
 
@@ -143,6 +145,7 @@ def test_default_path_coalesces_multi_partition_input(tmp_path):
 
     with patch("daft_lance.lance_data_sink.lance", fake):
         sink = LanceDataSink(uri=str(tmp_path / "tbl"), schema=schema, mode="create")
+        sink.start()
         write_results = list(sink.write(iter(mps)))
 
     # Default ``max_rows_per_file`` is 1_048_576. 20 partitions x 100K = 2M rows
@@ -161,6 +164,7 @@ def test_prepare_arrow_table_missing_column_rejected(tmp_path):
     lance.write_dataset(initial, uri)
     # Try to append with only one column
     sink = LanceDataSink(uri=uri, schema=schema, mode="append")
+    sink.start()
     missing_col = pa.table({"a": pa.array([2], type=pa.int64())})
     with pytest.raises(Exception):  # any error is fine; the redesign currently relies on the cast to fail
         sink._prepare_arrow_table(missing_col)

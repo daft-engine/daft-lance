@@ -33,9 +33,7 @@ def _effective_uri(lance_ds: LanceDataset, uri: str | pathlib.Path | None) -> st
     return str(uri) if uri is not None else str(lance_ds.uri)
 
 
-def _effective_storage_options(
-    lance_ds: LanceDataset, storage_options: dict[str, Any] | None
-) -> dict[str, Any] | None:
+def _effective_storage_options(lance_ds: LanceDataset, storage_options: dict[str, Any] | None) -> dict[str, Any] | None:
     """Storage options actually used to open the dataset (includes namespace-vended ones)."""
     open_kwargs = getattr(lance_ds, "_lance_open_kwargs", None) or {}
     return open_kwargs.get("storage_options") or storage_options

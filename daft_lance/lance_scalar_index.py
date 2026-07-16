@@ -465,9 +465,7 @@ def _create_partitioned_index(
 
     logger.info("Starting index metadata merging by reloading dataset to get latest state")
     namespace_kwargs = namespace_kwargs_for_dataset(lance_ds)
-    lance_ds = lance.dataset(
-        None if namespace_kwargs else uri, storage_options=storage_options, **namespace_kwargs
-    )
+    lance_ds = lance.dataset(None if namespace_kwargs else uri, storage_options=storage_options, **namespace_kwargs)
     lance_ds.merge_index_metadata(index_id, index_type)
 
     logger.info("Starting atomic index creation and commit")

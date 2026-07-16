@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
@@ -92,11 +93,59 @@ def _response_location(response: Any) -> str:
     return _normalize_file_uri(str(location))
 
 
-def _declare_table(namespace: Any, table_id: list[str]) -> tuple[str, dict[str, str] | None]:
+@dataclass(frozen=True)
+class ResolvedNamespaceTable:
+    """A namespace table resolved to a physical location.
+
+    ``is_declared_placeholder`` is True when the location comes from a
+    ``declare_table`` call (fresh or pre-existing declared-only stub): some
+    namespace implementations materialize a stub dataset at declare time, and a
+    ``mode="create"`` write must overwrite that stub instead of failing.
+    """
+
+    uri: str
+    storage_options: dict[str, str] | None = None
+    is_declared_placeholder: bool = False
+
+
+def _resolved_from_response(response: Any, *, is_declared_placeholder: bool = False) -> ResolvedNamespaceTable:
+    return ResolvedNamespaceTable(
+        uri=_response_location(response),
+        storage_options=_storage_options(response),
+        is_declared_placeholder=is_declared_placeholder,
+    )
+
+
+def _describe_table(namespace: Any, table_id: list[str], *, check_declared: bool = False) -> Any:
+    from lance_namespace import DescribeTableRequest
+
+    request = (
+        DescribeTableRequest(id=table_id, check_declared=True) if check_declared else DescribeTableRequest(id=table_id)
+    )
+    return namespace.describe_table(request)
+
+
+def _declare_table(namespace: Any, table_id: list[str]) -> ResolvedNamespaceTable:
     from lance_namespace import DeclareTableRequest
 
     response = namespace.declare_table(DeclareTableRequest(id=table_id, location=None))
-    return _response_location(response), _storage_options(response)
+    return _resolved_from_response(response, is_declared_placeholder=True)
+
+
+def is_declared_placeholder_response(response: Any) -> bool:
+    """Whether a ``describe_table`` response describes a declared-only stub table.
+
+    ``is_only_declared`` is the standard signal (only reliable when the request
+    was made with ``check_declared=True``); the ``lance.declared`` property is a
+    compatibility fallback for services that expose the state that way.
+    """
+    if getattr(response, "is_only_declared", None) is True:
+        return True
+    for attr in ("properties", "metadata"):
+        mapping = getattr(response, attr, None)
+        if mapping and str(dict(mapping).get("lance.declared", "")).strip().lower() == "true":
+            return True
+    return False
 
 
 def is_table_not_found(error: Exception) -> bool:
@@ -122,6 +171,28 @@ def is_table_not_found(error: Exception) -> bool:
     return "no such table" in message or (
         "table" in message and ("not found" in message or "does not exist" in message)
     )
+
+
+def is_table_already_exists(error: Exception) -> bool:
+    """Whether an exception from ``declare_table`` means the table already exists.
+
+    Mirrors :func:`is_table_not_found`: prefer the typed error, fall back to a
+    clearly-classified conflict from untyped REST errors.
+    """
+    try:
+        from lance_namespace.errors import TableAlreadyExistsError
+
+        if isinstance(error, TableAlreadyExistsError):
+            return True
+    except ImportError:
+        pass
+
+    status_code = _error_status_code(error)
+    if status_code != 409:
+        return False
+
+    message = str(error).lower()
+    return "table" in message and "already exists" in message
 
 
 def _error_status_code(error: Exception) -> int | None:
@@ -157,28 +228,65 @@ def resolve_namespace_table(
     namespace_properties: dict[str, str] | None,
     table_id: list[str] | None,
     mode: str = "read",
-) -> tuple[str | None, dict[str, str] | None]:
-    """Resolve a namespace table to ``(location, storage_options)``.
+) -> ResolvedNamespaceTable | None:
+    """Resolve a namespace table to a :class:`ResolvedNamespaceTable`.
 
-    ``mode="create"`` declares the table; ``mode="overwrite"`` declares it only when
-    it does not exist yet; other modes require the table to exist.
+    ``mode="create"`` requires the table to not exist (declared-only stubs are
+    reused as placeholders); ``mode="overwrite"`` declares the table when it does
+    not exist yet; other modes require the table to exist. Only ``mode="create"``
+    and ``mode="overwrite"`` have side effects (a ``declare_table`` call).
     """
     namespace = get_or_create_namespace(namespace_impl, namespace_properties)
     if namespace is None or table_id is None:
-        return None, None
+        return None
 
     if mode == "create":
-        return _declare_table(namespace, table_id)
-
-    from lance_namespace import DescribeTableRequest
+        return _resolve_for_create(namespace, table_id)
 
     try:
-        response = namespace.describe_table(DescribeTableRequest(id=table_id))
-        return _response_location(response), _storage_options(response)
+        return _resolved_from_response(_describe_table(namespace, table_id))
     except Exception as error:
         if mode == "overwrite" and is_table_not_found(error):
-            return _declare_table(namespace, table_id)
+            return _declare_or_recover(namespace, table_id, check_declared=False)
         raise
+
+
+def _resolve_for_create(namespace: Any, table_id: list[str]) -> ResolvedNamespaceTable:
+    """Describe-first create resolution.
+
+    ``declare_table`` fails with a conflict on any existing table (declared-only
+    or real), so classify via ``describe_table`` before declaring, and again if
+    a concurrent declare wins the race in between.
+    """
+    try:
+        response = _describe_table(namespace, table_id, check_declared=True)
+    except Exception as error:
+        if not is_table_not_found(error):
+            raise
+        return _declare_or_recover(namespace, table_id, check_declared=True)
+    return _classify_existing_for_create(response, table_id)
+
+
+def _declare_or_recover(namespace: Any, table_id: list[str], *, check_declared: bool) -> ResolvedNamespaceTable:
+    try:
+        return _declare_table(namespace, table_id)
+    except Exception as error:
+        if not is_table_already_exists(error):
+            raise
+        # Lost a declare race; re-describe and classify what won.
+        response = _describe_table(namespace, table_id, check_declared=check_declared)
+        if not check_declared:
+            return _resolved_from_response(response)
+        return _classify_existing_for_create(response, table_id)
+
+
+def _classify_existing_for_create(response: Any, table_id: list[str]) -> ResolvedNamespaceTable:
+    if is_declared_placeholder_response(response):
+        return _resolved_from_response(response, is_declared_placeholder=True)
+    raise ValueError(
+        f"Table {table_id!r} already exists in the namespace and cannot be created. "
+        'Use mode="overwrite" to replace it or mode="append" to add to it.'
+    )
 
 
 def merge_storage_options(
