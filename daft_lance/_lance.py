@@ -63,6 +63,11 @@ def read_lance(
         uri: The URI of the Lance table to read from. Accepts a local path or an
             object-store URI like "s3://bucket/path".
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         version : optional, int | str
             If specified, load a specific version of the Lance dataset. Else, loads the
             latest version. A version number (`int`) or a tag (`str`) can be provided.
@@ -205,6 +210,11 @@ def merge_columns(
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         transform: A transformation function or UDF to apply to the data.
         read_columns: List of column names to read for the transformation.
         reader_schema: Schema for the reader.
@@ -305,6 +315,11 @@ def merge_columns_df(
         df: DataFrame containing the new columns to merge along with fragment_id and join key columns
         uri: URL to the LanceDB table (supports remote URLs to object stores such as `s3://` or `gs://`)
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         read_columns: List of column names to read for the transformation.
         reader_schema: Schema for the reader.
         storage_options: Extra options for storage connection.
@@ -417,6 +432,11 @@ def create_scalar_index(
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         column: Column name to index
         index_type: Type of index to build.
             For distributed segmented execution this supports "BITMAP", "BTREE", "INVERTED", and "FTS".
@@ -556,6 +576,11 @@ def compact_files(
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         storage_options: Extra options for storage connection.
         version: If specified, load a specific version of the Lance dataset.
         asof: If specified, find the latest version created on or earlier than the given argument value.
@@ -680,7 +705,7 @@ def write_lance(
         ...     df, namespace_impl="dir", namespace_properties={"root": "/tmp/tables"}, table_id=["t"]
         ... ).collect()  # doctest: +SKIP
     """
-    validate_uri_or_namespace(uri, namespace_impl, table_id)
+    validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
 
     if schema is None:
         schema = df.schema()

@@ -108,7 +108,7 @@ def construct_lance_dataset(
     For a plain ``uri``, user-provided ``storage_options`` replace the
     io_config-derived ones entirely (historical behavior).
     """
-    validate_uri_or_namespace(uri, namespace_impl, table_id)
+    validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
     resolved_uri = str(uri) if uri is not None else None
     namespace_storage_options = None
     if resolved_uri is None:

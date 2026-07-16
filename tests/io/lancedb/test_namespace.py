@@ -459,6 +459,11 @@ def test_namespace_requires_table_id(tmp_path: Path) -> None:
         )
 
 
+def test_namespace_properties_require_impl(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="'namespace_impl' must be provided when 'namespace_properties'"):
+        daft_lance.read_lance(str(tmp_path / "dataset"), namespace_properties={"root": str(tmp_path)})
+
+
 def test_namespace_requires_impl() -> None:
     with pytest.raises(ValueError, match="'namespace_impl' must be provided"):
         daft_lance.read_lance(table_id=["tbl"])

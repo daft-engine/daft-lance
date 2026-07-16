@@ -19,10 +19,13 @@ def validate_uri_or_namespace(
     uri: str | os.PathLike[str] | None,
     namespace_impl: str | None,
     table_id: list[str] | None,
+    namespace_properties: dict[str, str] | None = None,
 ) -> None:
     has_uri = uri is not None
     has_ns = has_namespace_params(namespace_impl, table_id)
 
+    if namespace_properties is not None and namespace_impl is None:
+        raise ValueError("'namespace_impl' must be provided when 'namespace_properties' is provided.")
     if namespace_impl is not None and table_id is None:
         raise ValueError("'table_id' must be provided when 'namespace_impl' is provided.")
     if table_id is not None and namespace_impl is None:

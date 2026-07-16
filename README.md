@@ -81,7 +81,13 @@ daft_lance.read_lance(table_id=table_id, **namespace).show()
 
 When the catalog holds the storage configuration (bucket, endpoint, credentials), the
 `describe_table` response vends `storage_options` to the client, so you do not need to pass
-object-store credentials yourself.
+object-store credentials yourself. If the namespace does not vend credentials, your
+`io_config` (or explicit `storage_options`) is applied to the resolved location; when both
+are present, namespace-vended options take precedence.
+
+Namespace clients are cached per (implementation, properties) pair. The cache size defaults
+to 16 and can be tuned with the `DAFT_LANCE_NAMESPACE_CACHE_SIZE` environment variable
+(read once at import time).
 
 #### Drop-in Daft APIs
 

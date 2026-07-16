@@ -68,7 +68,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         compact_after_write: bool = True,
     ) -> None:
         self._reject_unsupported_modes(mode, use_legacy_format)
-        validate_uri_or_namespace(uri, namespace_impl, table_id)
+        validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
         if uri is not None and not isinstance(uri, (str, pathlib.Path)):
             raise TypeError(f"Expected URI to be str or pathlib.Path, got {type(uri)}")
 
