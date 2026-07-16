@@ -215,7 +215,16 @@ def test_namespace_compact_files(tmp_path: Path) -> None:
     for i in range(3):
         daft_lance.write_lance(daft.from_pydict({"id": [i + 2]}), table_id=table_id, mode="append", **ns).collect()
 
+    import lance
+    import lance_namespace as ln
+    from lance_namespace import DescribeTableRequest
+
+    location = ln.connect("dir", {"root": str(tmp_path)}).describe_table(DescribeTableRequest(id=table_id)).location
+    fragments_before = len(lance.dataset(location).get_fragments())
+
     daft_lance.compact_files(table_id=table_id, compaction_options={"target_rows_per_fragment": 1024}, **ns)
+
+    assert len(lance.dataset(location).get_fragments()) < fragments_before
 
     result = daft_lance.read_lance(table_id=table_id, **ns).sort("id").to_pydict()
     assert result == {"id": [1, 2, 3, 4]}
@@ -396,6 +405,29 @@ def test_construct_lance_dataset_empty_storage_options_falls_back_to_io_config(
     merged = captured["storage_options"]
     assert merged is not None
     assert merged["access_key_id"] == "io-key"
+
+
+def test_sink_survives_pickle_after_start(tmp_path: Path) -> None:
+    """start() state must round-trip through pickle: workers run write() on a copy."""
+    import pickle
+
+    ns = _dir_ns(tmp_path)
+    schema = daft.from_pydict({"id": [1]}).schema()
+
+    sink = daft_lance.LanceDataSink(None, schema, "create", table_id=["pickled"], **ns)
+    sink.start()
+
+    worker_sink = pickle.loads(pickle.dumps(sink))
+    assert worker_sink._table_uri == sink._table_uri
+    assert worker_sink._storage_options == sink._storage_options
+    assert worker_sink._effective_pyarrow_schema == sink._effective_pyarrow_schema
+
+    from daft.recordbatch import MicroPartition
+
+    results = list(worker_sink.write(iter([MicroPartition.from_pydict({"id": [1, 2]})])))
+    stats = sink.finalize(results).to_pydict()
+    assert stats["version"] == [1]
+    assert daft_lance.read_lance(table_id=["pickled"], **ns).to_pydict() == {"id": [1, 2]}
 
 
 def test_declared_placeholder_response_fallback_property() -> None:
