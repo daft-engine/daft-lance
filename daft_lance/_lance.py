@@ -145,10 +145,12 @@ def read_lance(
     uri_str = str(uri) if uri is not None else None
     if uri_str is not None and uri_str.startswith("rest://"):
         raise ValueError(
-            "rest:// Lance URIs are no longer supported by daft.read_lance. "
-            "The previous REST-namespace integration did not match the real "
-            "lance-namespace API and has been removed. Use a local path or "
-            "object-store URI, or the daft-lance package."
+            "rest:// Lance URIs are not supported. To read a table through a REST "
+            "Lance Namespace, use the namespace parameters instead of a uri: "
+            'read_lance(namespace_impl="rest", '
+            'namespace_properties={"uri": "http://host:port"}, '
+            'table_id=["catalog", "schema", "table"]). '
+            "Otherwise pass a local path or object-store URI."
         )
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
