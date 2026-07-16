@@ -89,18 +89,11 @@ Namespace clients are cached per (implementation, properties) pair. The cache si
 to 16 and can be tuned with the `DAFT_LANCE_NAMESPACE_CACHE_SIZE` environment variable
 (read once at import time).
 
-#### Drop-in Daft APIs
+#### Daft's own entry points
 
-If you prefer Daft's own entry points, call `daft_lance.patch_daft()` once to route
-`daft.read_lance` and `DataFrame.write_lance` through daft-lance (namespace parameters included):
-
-```python
-import daft, daft_lance
-
-daft_lance.patch_daft()
-df.write_lance(table_id=["my_table"], mode="create", **namespace).collect()
-daft.read_lance(table_id=["my_table"], **namespace).show()
-```
+Native namespace support in `daft.read_lance` / `DataFrame.write_lance` is tracked in
+[Eventual-Inc/Daft#7282](https://github.com/Eventual-Inc/Daft/issues/7282); until that lands,
+use the `daft_lance` entry points shown above for namespace-addressed tables.
 
 ## Migration
 

@@ -63,17 +63,3 @@ def test_rest_namespace_write_read_append_roundtrip() -> None:
 
     assert daft_lance.read_lance(table_id=table_id, **ns).count_rows() == 5
     assert lance.dataset(None, namespace_client=namespace, table_id=table_id).count_rows() == 5
-
-
-def test_rest_namespace_patch_daft_roundtrip() -> None:
-    """The opt-in ``patch_daft()`` path: ``daft.read_lance`` / ``df.write_lance``."""
-    namespace_properties = {"uri": os.environ["DAFT_LANCE_REST_URI"]}
-    catalog = os.environ.get("DAFT_LANCE_REST_CATALOG", "lance_catalog")
-    schema = os.environ.get("DAFT_LANCE_REST_SCHEMA", "daft_ns_e2e")
-    table_id = [catalog, schema, f"patched_{uuid.uuid4().hex[:8]}"]
-    ns: dict[str, Any] = {"namespace_impl": "rest", "namespace_properties": namespace_properties}
-
-    daft_lance.patch_daft()
-
-    daft.from_pydict({"id": [1, 2]}).write_lance(table_id=table_id, mode="create", **ns).collect()
-    assert daft.read_lance(table_id=table_id, **ns).to_pydict() == {"id": [1, 2]}  # type: ignore[call-arg]

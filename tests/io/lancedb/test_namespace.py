@@ -119,23 +119,6 @@ def test_namespace_count_pushdown(tmp_path: Path) -> None:
     assert daft_lance.read_lance(table_id=table_id, **ns).count_rows() == 10
 
 
-def test_namespace_patch_daft(tmp_path: Path) -> None:
-    ns = _dir_ns(tmp_path)
-    table_id = ["patched"]
-
-    daft_lance.patch_daft()
-    daft_lance.patch_daft()  # idempotent
-
-    daft.from_pydict({"id": [1, 2]}).write_lance(table_id=table_id, mode="create", **ns).collect()
-    result = daft.read_lance(table_id=table_id, **ns).to_pydict()  # type: ignore[call-arg]
-    assert result == {"id": [1, 2]}
-
-    # Plain-URI writes keep working through the patched method.
-    uri = str(tmp_path / "plain.lance")
-    daft.from_pydict({"id": [5]}).write_lance(uri).collect()
-    assert daft.read_lance(uri).to_pydict() == {"id": [5]}
-
-
 def test_namespace_write_lance_merge_new_columns(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["merge_tbl"]
