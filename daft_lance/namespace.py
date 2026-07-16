@@ -1,3 +1,30 @@
+"""Lance Namespace (catalog) integration layer.
+
+Tables can be addressed by a ``(namespace_impl, namespace_properties, table_id)``
+triple instead of a raw uri; this module owns everything between that triple and
+a pylance call. Three design decisions shape the code:
+
+1. **Only the triple is serialized, never the client.** Namespace clients are
+   not picklable, so distributed tasks carry the triple and every process
+   rebuilds its client through a per-process ``lru_cache``
+   (:func:`get_or_create_namespace`). This is why entry points thread the three
+   raw parameters around instead of a client object.
+
+2. **Table resolution is describe-first** (:func:`resolve_namespace_table`).
+   The protocol only offers ``declare_table`` (conflicts on ANY existing table,
+   even a declared-only stub) and ``describe_table`` (404s on declared-only
+   stubs unless ``check_declared=True``), so the create/overwrite semantics an
+   engine needs — "reuse a declared-only stub, reject a real table, survive a
+   concurrent declare" — are assembled here from those two primitives.
+
+3. **Error classification is defensive** (:func:`is_table_not_found` /
+   :func:`is_table_already_exists`): native namespace impls raise typed errors,
+   but the Rust-backed REST client can surface untyped ones, so both fall back
+   to strict status-code + message matching. Never branch on a bare
+   ``except Exception`` around namespace calls — an auth or network failure
+   must not be mistaken for "table does not exist".
+"""
+
 from __future__ import annotations
 
 import os
@@ -12,6 +39,7 @@ _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "1
 
 
 def has_namespace_params(namespace_impl: str | None, table_id: list[str] | None) -> bool:
+    """Whether namespace addressing is in effect (``namespace_properties`` stays optional)."""
     return namespace_impl is not None and table_id is not None
 
 
@@ -21,6 +49,7 @@ def validate_uri_or_namespace(
     table_id: list[str] | None,
     namespace_properties: dict[str, str] | None = None,
 ) -> None:
+    """Enforce that exactly one addressing style is used: ``uri`` XOR the namespace triple."""
     has_uri = uri is not None
     has_ns = has_namespace_params(namespace_impl, table_id)
 
@@ -39,6 +68,13 @@ def validate_uri_or_namespace(
 
 
 def _normalize_file_uri(location: str) -> str:
+    """Strip a ``file://`` scheme to a plain filesystem path.
+
+    Namespace impls return locations as URIs (dir namespace vends
+    ``file:///...``), but the location is later used where a plain path is
+    required: ``write_fragments(dataset_uri=...)``, ``LanceDataset.commit``,
+    and ``pathlib`` checks in the sink. Object-store URIs pass through as-is.
+    """
     parsed = urlparse(location)
     if parsed.scheme == "file":
         return parsed.path
@@ -54,6 +90,14 @@ def _get_cached_namespace(namespace_impl: str, namespace_properties_tuple: tuple
 
 
 def get_or_create_namespace(namespace_impl: str | None, namespace_properties: dict[str, str] | None) -> Any | None:
+    """Per-process namespace client pool.
+
+    ``ln.connect`` may build HTTP clients / perform auth, and workers re-derive
+    the client for every scan task and fragment write, so connections are cached
+    per (impl, properties). Properties are canonicalized to a sorted tuple
+    because ``lru_cache`` keys must be hashable and dict ordering must not
+    create duplicate connections.
+    """
     if namespace_impl is None:
         return None
     namespace_properties_tuple = tuple(sorted(namespace_properties.items())) if namespace_properties else None
@@ -240,6 +284,19 @@ def resolve_namespace_table(
     reused as placeholders); ``mode="overwrite"`` declares the table when it does
     not exist yet; other modes require the table to exist. Only ``mode="create"``
     and ``mode="overwrite"`` have side effects (a ``declare_table`` call).
+
+    Resolution state machine (describe always with ``check_declared=True`` except
+    in read mode)::
+
+        create:    describe ─ found ──► real table? error : reuse stub (placeholder)
+                            └ 404 ───► declare ─ conflict? re-describe & classify
+        overwrite: describe ─ found ──► use it (stub or real)
+                            └ 404 ───► declare ─ conflict? re-describe & use winner
+        read:      describe ─ found ──► use it
+                            └ error ─► raise
+
+    The "declare ─ conflict?" legs exist because a concurrent writer can win the
+    declare race between our describe and our declare.
     """
     namespace = get_or_create_namespace(namespace_impl, namespace_properties)
     if namespace is None or table_id is None:
@@ -279,6 +336,11 @@ def _resolve_for_create(namespace: Any, table_id: list[str]) -> ResolvedNamespac
 
 
 def _declare_or_recover(namespace: Any, table_id: list[str], *, for_create: bool) -> ResolvedNamespaceTable:
+    """Declare the table; if a concurrent declare won the race, classify the winner.
+
+    ``for_create=True`` keeps create semantics (a real-table winner is an error);
+    ``for_create=False`` (overwrite) accepts whatever won.
+    """
     try:
         return _declare_table(namespace, table_id)
     except Exception as error:
