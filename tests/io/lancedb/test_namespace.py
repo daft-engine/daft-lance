@@ -430,6 +430,49 @@ def test_sink_survives_pickle_after_start(tmp_path: Path) -> None:
     assert daft_lance.read_lance(table_id=["pickled"], **ns).to_pydict() == {"id": [1, 2]}
 
 
+def test_namespace_requests_explicitly_vend_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Whether a namespace vends credentials is implementation-defined unless requested."""
+    from lance_namespace.errors import TableNotFoundError
+
+    requests: list[Any] = []
+
+    class RecordingNamespace:
+        def describe_table(self, request: Any) -> Any:
+            requests.append(request)
+            raise TableNotFoundError("table not found: t")
+
+        def declare_table(self, request: Any) -> Any:
+            requests.append(request)
+            return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None)
+
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: RecordingNamespace())
+
+    for mode in ("create", "overwrite"):
+        namespace_mod.resolve_namespace_table(
+            namespace_impl="rest", namespace_properties=None, table_id=["t"], mode=mode
+        )
+    with pytest.raises(TableNotFoundError):
+        namespace_mod.resolve_namespace_table(
+            namespace_impl="rest", namespace_properties=None, table_id=["t"], mode="read"
+        )
+
+    assert requests, "expected describe/declare requests to be issued"
+    assert all(request.vend_credentials is True for request in requests)
+
+
+def test_sink_empty_storage_options_falls_back_to_io_config(tmp_path: Path) -> None:
+    """storage_options={} must behave like the read entry points: fall through to io_config."""
+    from daft.io import IOConfig, S3Config
+
+    io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
+    schema = daft.from_pydict({"id": [1]}).schema()
+
+    sink = daft_lance.LanceDataSink("s3://bucket/t.lance", schema, "create", io_config, storage_options={})
+    merged = sink._merged_storage_options(namespace_mod.ResolvedNamespaceTable(uri="s3://bucket/t.lance"))
+    assert merged is not None
+    assert merged["access_key_id"] == "io-key"
+
+
 def test_declared_placeholder_response_fallback_property() -> None:
     assert namespace_mod.is_declared_placeholder_response(SimpleNamespace(is_only_declared=True))
     assert namespace_mod.is_declared_placeholder_response(

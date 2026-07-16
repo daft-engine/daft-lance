@@ -122,16 +122,18 @@ def _resolved_from_response(response: Any, *, is_declared_placeholder: bool = Fa
 def _describe_table(namespace: Any, table_id: list[str], *, check_declared: bool = False) -> Any:
     from lance_namespace import DescribeTableRequest
 
-    request = (
-        DescribeTableRequest(id=table_id, check_declared=True) if check_declared else DescribeTableRequest(id=table_id)
-    )
-    return namespace.describe_table(request)
+    # vend_credentials is explicit: when unset, whether the namespace returns
+    # storage credentials is implementation-defined.
+    kwargs: dict[str, Any] = {"id": table_id, "vend_credentials": True}
+    if check_declared:
+        kwargs["check_declared"] = True
+    return namespace.describe_table(DescribeTableRequest(**kwargs))
 
 
 def _declare_table(namespace: Any, table_id: list[str]) -> ResolvedNamespaceTable:
     from lance_namespace import DeclareTableRequest
 
-    response = namespace.declare_table(DeclareTableRequest(id=table_id, location=None))
+    response = namespace.declare_table(DeclareTableRequest(id=table_id, location=None, vend_credentials=True))
     return _resolved_from_response(response, is_declared_placeholder=True)
 
 

@@ -168,12 +168,13 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _merged_storage_options(self, resolved: ResolvedNamespaceTable) -> dict[str, str] | None:
         """Layer storage options: io_config-derived < user-provided < namespace-vended.
 
-        For a plain uri, user-provided options replace the io_config-derived ones
-        entirely (historical behavior).
+        For a plain uri, non-empty user-provided options replace the
+        io_config-derived ones entirely (falsy fallthrough, matching the read
+        entry points via construct_lance_dataset).
         """
         io_derived = io_config_to_storage_options(self._io_config, resolved.uri)
         if self._uri is not None:
-            base = self._user_storage_options if self._user_storage_options is not None else io_derived
+            base = self._user_storage_options or io_derived
             return merge_storage_options(base, resolved.storage_options)
         return merge_storage_options(io_derived, self._user_storage_options, resolved.storage_options)
 
