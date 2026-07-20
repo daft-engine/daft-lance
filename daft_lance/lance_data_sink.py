@@ -103,8 +103,6 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         self._effective_pyarrow_schema: pa.Schema | None = None
         self._version: int = 0
         self._table_schema: pa.Schema | None = None
-        self._declared_placeholder = False
-        self._overwrite_placeholder_dataset = False
 
         self._schema = Schema._from_field_name_and_types(
             [
@@ -124,7 +122,6 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         """
         resolved = self._resolve_table()
         self._table_uri = resolved.uri
-        self._declared_placeholder = resolved.is_declared_placeholder
         self._storage_options = self._merged_storage_options(resolved)
 
         existing = self._absorb_existing_dataset()
@@ -261,20 +258,10 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         self._version = dataset.latest_version
 
         if self._mode == "create":
-            if not self._declared_placeholder:
-                raise ValueError(
-                    "Cannot create a Lance dataset at a location where one already exists. "
-                    'Use mode="overwrite" to replace it or mode="append" to add to it.'
-                )
-            # The namespace declared a stub table and this location already holds
-            # a (placeholder) dataset; overwrite it instead of failing the create.
-            if self._use_mem_wal:
-                raise ValueError(
-                    "use_mem_wal=True cannot create over a namespace-declared placeholder "
-                    'dataset; write with use_mem_wal=False or use mode="overwrite".'
-                )
-            self._overwrite_placeholder_dataset = True
-            self._table_schema = None
+            raise ValueError(
+                "Cannot create a Lance dataset at a location where one already exists. "
+                'Use mode="overwrite" to replace it or mode="append" to add to it.'
+            )
 
         if self._mode == "append" and not _pyarrow_schema_castable(
             blob_aware_schema_for_validation(self._pyarrow_schema, table_schema),
@@ -305,11 +292,10 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _write_arrow_table(self, table: pa.Table) -> WriteResult[list[FragmentMetadata]]:
         assert self._table_uri is not None, "LanceDataSink.start() must run before writes"
         wrapped = self._blob.wrap_table(table)
-        write_mode = "overwrite" if self._overwrite_placeholder_dataset else self._mode
         fragments = lance.fragment.write_fragments(
             wrapped,
             dataset_uri=self._table_uri,
-            mode=write_mode,
+            mode=self._mode,
             storage_options=self._storage_options,
             max_rows_per_file=self._max_rows_per_file,
             max_rows_per_group=self._max_rows_per_group,

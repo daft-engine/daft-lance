@@ -19,6 +19,7 @@ def test_rest_namespace_write_read_append_roundtrip() -> None:
     import lance
     import lance_namespace as ln
     from lance_namespace import CreateNamespaceRequest, DescribeTableRequest, NamespaceExistsRequest
+    from lance_namespace.errors import TableAlreadyExistsError
 
     namespace_properties = {"uri": os.environ["DAFT_LANCE_REST_URI"]}
     catalog = os.environ.get("DAFT_LANCE_REST_CATALOG", "lance_catalog")
@@ -63,3 +64,37 @@ def test_rest_namespace_write_read_append_roundtrip() -> None:
 
     assert daft_lance.read_lance(table_id=table_id, **ns).count_rows() == 5
     assert lance.dataset(None, namespace_client=namespace, table_id=table_id).count_rows() == 5
+
+    with pytest.raises(TableAlreadyExistsError):
+        daft_lance.write_lance(
+            daft.from_pydict({"id": [99], "label": ["duplicate"], "score": [990]}),
+            table_id=table_id,
+            mode="create",
+            **ns,
+        ).collect()
+    assert daft_lance.read_lance(table_id=table_id, **ns).count_rows() == 5
+
+    daft_lance.write_lance(
+        daft.from_pydict({"id": [6], "label": ["overwritten"], "score": [60]}),
+        table_id=table_id,
+        mode="overwrite",
+        **ns,
+    ).collect()
+    assert daft_lance.read_lance(table_id=table_id, **ns).to_pydict() == {
+        "id": [6],
+        "label": ["overwritten"],
+        "score": [60],
+    }
+
+    missing_table_id = [catalog, schema, f"overwrite_missing_{uuid.uuid4().hex[:8]}"]
+    daft_lance.write_lance(
+        daft.from_pydict({"id": [7], "label": ["created-by-overwrite"], "score": [70]}),
+        table_id=missing_table_id,
+        mode="overwrite",
+        **ns,
+    ).collect()
+    assert daft_lance.read_lance(table_id=missing_table_id, **ns).to_pydict() == {
+        "id": [7],
+        "label": ["created-by-overwrite"],
+        "score": [70],
+    }

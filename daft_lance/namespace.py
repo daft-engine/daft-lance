@@ -10,19 +10,10 @@ a pylance call. Three design decisions shape the code:
    (:func:`get_or_create_namespace`). This is why entry points thread the three
    raw parameters around instead of a client object.
 
-2. **Table resolution is describe-first** (:func:`resolve_namespace_table`).
-   The protocol only offers ``declare_table`` (conflicts on ANY existing table,
-   even a declared-only stub) and ``describe_table`` (404s on declared-only
-   stubs unless ``check_declared=True``), so the create/overwrite semantics an
-   engine needs — "reuse a declared-only stub, reject a real table, survive a
-   concurrent declare" — are assembled here from those two primitives.
-
-3. **Error classification is defensive** (:func:`is_table_not_found` /
-   :func:`is_table_already_exists`): native namespace impls raise typed errors,
-   but the Rust-backed REST client can surface untyped ones, so both fall back
-   to strict status-code + message matching. Never branch on a bare
-   ``except Exception`` around namespace calls — an auth or network failure
-   must not be mistaken for "table does not exist".
+2. **Table creation delegates to the namespace.** ``mode="create"`` maps to
+   the atomic ``declare_table`` operation, while overwrite describes first and
+   declares only when the namespace raises its typed ``TableNotFoundError``.
+   Other namespace failures propagate unchanged.
 """
 
 from __future__ import annotations
@@ -142,133 +133,32 @@ def _response_location(response: Any) -> str:
 
 @dataclass(frozen=True)
 class ResolvedNamespaceTable:
-    """A namespace table resolved to a physical location.
-
-    ``is_declared_placeholder`` is True when the location comes from a
-    ``declare_table`` call (fresh or pre-existing declared-only stub): some
-    namespace implementations materialize a stub dataset at declare time, and a
-    ``mode="create"`` write must overwrite that stub instead of failing.
-    """
+    """A namespace table resolved to a physical location and storage options."""
 
     uri: str
     storage_options: dict[str, str] | None = None
-    is_declared_placeholder: bool = False
 
 
-def _resolved_from_response(response: Any, *, is_declared_placeholder: bool = False) -> ResolvedNamespaceTable:
+def _resolved_from_response(response: Any) -> ResolvedNamespaceTable:
     return ResolvedNamespaceTable(
         uri=_response_location(response),
         storage_options=_storage_options(response),
-        is_declared_placeholder=is_declared_placeholder,
     )
 
 
-def _describe_table(namespace: Any, table_id: list[str], *, check_declared: bool = False) -> Any:
+def _describe_table(namespace: Any, table_id: list[str]) -> Any:
     from lance_namespace import DescribeTableRequest
 
     # vend_credentials is explicit: when unset, whether the namespace returns
     # storage credentials is implementation-defined.
-    kwargs: dict[str, Any] = {"id": table_id, "vend_credentials": True}
-    if check_declared:
-        kwargs["check_declared"] = True
-    return namespace.describe_table(DescribeTableRequest(**kwargs))
+    return namespace.describe_table(DescribeTableRequest(id=table_id, vend_credentials=True))
 
 
 def _declare_table(namespace: Any, table_id: list[str]) -> ResolvedNamespaceTable:
     from lance_namespace import DeclareTableRequest
 
     response = namespace.declare_table(DeclareTableRequest(id=table_id, location=None, vend_credentials=True))
-    return _resolved_from_response(response, is_declared_placeholder=True)
-
-
-def is_declared_placeholder_response(response: Any) -> bool:
-    """Whether a ``describe_table`` response describes a declared-only stub table.
-
-    ``is_only_declared`` is the standard signal (only reliable when the request
-    was made with ``check_declared=True``); the ``lance.declared`` property is a
-    compatibility fallback for services that expose the state that way.
-    """
-    if getattr(response, "is_only_declared", None) is True:
-        return True
-    for attr in ("properties", "metadata"):
-        mapping = getattr(response, attr, None)
-        if mapping and str(dict(mapping).get("lance.declared", "")).strip().lower() == "true":
-            return True
-    return False
-
-
-def is_table_not_found(error: Exception) -> bool:
-    """Whether an exception from ``describe_table`` means the table does not exist.
-
-    Native implementations raise the typed ``TableNotFoundError``; the Rust-backed
-    REST client may surface untyped errors, so only fall back when the error is
-    clearly a 404 for a table resource.
-    """
-    try:
-        from lance_namespace.errors import TableNotFoundError
-
-        if isinstance(error, TableNotFoundError):
-            return True
-    except ImportError:
-        pass
-
-    status_code = _error_status_code(error)
-    if status_code != 404:
-        return False
-
-    message = str(error).lower()
-    return "no such table" in message or (
-        "table" in message and ("not found" in message or "does not exist" in message)
-    )
-
-
-def is_table_already_exists(error: Exception) -> bool:
-    """Whether an exception from ``declare_table`` means the table already exists.
-
-    Mirrors :func:`is_table_not_found`: prefer the typed error, fall back to a
-    clearly-classified conflict from untyped REST errors.
-    """
-    try:
-        from lance_namespace.errors import TableAlreadyExistsError
-
-        if isinstance(error, TableAlreadyExistsError):
-            return True
-    except ImportError:
-        pass
-
-    status_code = _error_status_code(error)
-    if status_code != 409:
-        return False
-
-    message = str(error).lower()
-    return "table" in message and "already exists" in message
-
-
-def _error_status_code(error: Exception) -> int | None:
-    """Best-effort HTTP status extraction for untyped namespace REST errors."""
-    for attr in ("status", "status_code", "code"):
-        value = getattr(error, attr, None)
-        status_code = _coerce_status_code(value)
-        if status_code is not None:
-            return status_code
-
-    response = getattr(error, "response", None)
-    if response is not None:
-        for attr in ("status", "status_code"):
-            value = getattr(response, attr, None)
-            status_code = _coerce_status_code(value)
-            if status_code is not None:
-                return status_code
-
-    return None
-
-
-def _coerce_status_code(value: Any) -> int | None:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return None
+    return _resolved_from_response(response)
 
 
 def resolve_namespace_table(
@@ -280,87 +170,25 @@ def resolve_namespace_table(
 ) -> ResolvedNamespaceTable | None:
     """Resolve a namespace table to a :class:`ResolvedNamespaceTable`.
 
-    ``mode="create"`` requires the table to not exist (declared-only stubs are
-    reused as placeholders); ``mode="overwrite"`` declares the table when it does
-    not exist yet; other modes require the table to exist. Only ``mode="create"``
-    and ``mode="overwrite"`` have side effects (a ``declare_table`` call).
-
-    Resolution state machine (describe always with ``check_declared=True`` except
-    in read mode)::
-
-        create:    describe ─ found ──► real table? error : reuse stub (placeholder)
-                            └ 404 ───► declare ─ conflict? re-describe & classify
-        overwrite: describe ─ found ──► use it (stub or real)
-                            └ 404 ───► declare ─ conflict? re-describe & use winner
-        read:      describe ─ found ──► use it
-                            └ error ─► raise
-
-    The "declare ─ conflict?" legs exist because a concurrent writer can win the
-    declare race between our describe and our declare.
+    ``mode="create"`` atomically declares a new table. ``mode="overwrite"``
+    declares the table only when a typed ``TableNotFoundError`` is raised;
+    other modes require the table to exist.
     """
     namespace = get_or_create_namespace(namespace_impl, namespace_properties)
     if namespace is None or table_id is None:
         return None
 
     if mode == "create":
-        return _resolve_for_create(namespace, table_id)
-
-    if mode == "overwrite":
-        # check_declared: a plain describe may 404 on declared-only stubs, and a
-        # stub is a perfectly fine overwrite target.
-        try:
-            response = _describe_table(namespace, table_id, check_declared=True)
-        except Exception as error:
-            if not is_table_not_found(error):
-                raise
-            return _declare_or_recover(namespace, table_id, for_create=False)
-        return _resolved_from_response(response, is_declared_placeholder=is_declared_placeholder_response(response))
-
-    return _resolved_from_response(_describe_table(namespace, table_id))
-
-
-def _resolve_for_create(namespace: Any, table_id: list[str]) -> ResolvedNamespaceTable:
-    """Describe-first create resolution.
-
-    ``declare_table`` fails with a conflict on any existing table (declared-only
-    or real), so classify via ``describe_table`` before declaring, and again if
-    a concurrent declare wins the race in between.
-    """
-    try:
-        response = _describe_table(namespace, table_id, check_declared=True)
-    except Exception as error:
-        if not is_table_not_found(error):
-            raise
-        return _declare_or_recover(namespace, table_id, for_create=True)
-    return _classify_existing_for_create(response, table_id)
-
-
-def _declare_or_recover(namespace: Any, table_id: list[str], *, for_create: bool) -> ResolvedNamespaceTable:
-    """Declare the table; if a concurrent declare won the race, classify the winner.
-
-    ``for_create=True`` keeps create semantics (a real-table winner is an error);
-    ``for_create=False`` (overwrite) accepts whatever won.
-    """
-    try:
         return _declare_table(namespace, table_id)
-    except Exception as error:
-        if not is_table_already_exists(error):
-            raise
-        # Lost a declare race; re-describe (check_declared so a declared-only
-        # winner does not 404 on strict impls) and classify what won.
-        response = _describe_table(namespace, table_id, check_declared=True)
-        if for_create:
-            return _classify_existing_for_create(response, table_id)
-        return _resolved_from_response(response, is_declared_placeholder=is_declared_placeholder_response(response))
 
+    from lance_namespace.errors import TableNotFoundError
 
-def _classify_existing_for_create(response: Any, table_id: list[str]) -> ResolvedNamespaceTable:
-    if is_declared_placeholder_response(response):
-        return _resolved_from_response(response, is_declared_placeholder=True)
-    raise ValueError(
-        f"Table {table_id!r} already exists in the namespace and cannot be created. "
-        'Use mode="overwrite" to replace it or mode="append" to add to it.'
-    )
+    try:
+        return _resolved_from_response(_describe_table(namespace, table_id))
+    except TableNotFoundError:
+        if mode == "overwrite":
+            return _declare_table(namespace, table_id)
+        raise
 
 
 def merge_storage_options(*layers: dict[str, Any] | None) -> dict[str, Any] | None:

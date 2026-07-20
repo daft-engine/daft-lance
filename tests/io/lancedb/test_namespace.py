@@ -9,8 +9,7 @@ import pytest
 import daft
 import daft_lance
 import daft_lance.namespace as namespace_mod
-
-pytestmark = pytest.mark.lance_native_teardown_crash_workaround
+from daft_lance.lance_data_sink import LanceDataSink
 
 
 def _dir_ns(tmp_path: Path) -> dict[str, Any]:
@@ -80,13 +79,6 @@ def test_namespace_overwrite_does_not_declare_on_ambiguous_error(
     assert not namespace.declared
 
 
-def test_namespace_untyped_404_table_not_found_is_missing() -> None:
-    class RestTableNotFound(RuntimeError):
-        status = 404
-
-    assert namespace_mod.is_table_not_found(RestTableNotFound("table catalog.schema.table not found"))
-
-
 def test_namespace_read_supports_pushdowns(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["pushdowns"]
@@ -117,30 +109,6 @@ def test_namespace_count_pushdown(tmp_path: Path) -> None:
     daft_lance.write_lance(daft.from_pydict({"id": list(range(10))}), table_id=table_id, mode="create", **ns).collect()
 
     assert daft_lance.read_lance(table_id=table_id, **ns).count_rows() == 10
-
-
-def test_namespace_write_lance_merge_new_columns(tmp_path: Path) -> None:
-    ns = _dir_ns(tmp_path)
-    table_id = ["merge_tbl"]
-
-    daft_lance.write_lance(
-        daft.from_pydict({"id": [1, 2, 3], "score": [10, 20, 30]}),
-        table_id=table_id,
-        mode="create",
-        **ns,
-    ).collect()
-
-    df = daft_lance.read_lance(
-        table_id=table_id,
-        default_scan_options={"with_row_address": True},
-        include_fragment_id=True,
-        **ns,
-    )
-    df = df.with_column("doubled", df["score"] * 2)
-    daft_lance.write_lance(df, table_id=table_id, mode="merge", **ns).collect()
-
-    result = daft_lance.read_lance(table_id=table_id, **ns).sort("id").to_pydict()
-    assert result["doubled"] == [20, 40, 60]
 
 
 def test_namespace_merge_columns_df(tmp_path: Path) -> None:
@@ -187,7 +155,7 @@ def test_namespace_create_scalar_index(tmp_path: Path) -> None:
     namespace = ln.connect("dir", {"root": str(tmp_path)})
     location = namespace.describe_table(DescribeTableRequest(id=table_id)).location
     indices = lance.dataset(location).list_indices()
-    assert any(idx["fields"] == ["price"] for idx in indices)  # type: ignore[index]
+    assert any(idx["fields"] == ["price"] for idx in indices)
 
 
 def test_namespace_compact_files(tmp_path: Path) -> None:
@@ -217,7 +185,7 @@ def test_sink_construction_is_side_effect_free(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     schema = daft.from_pydict({"id": [1]}).schema()
 
-    sink = daft_lance.LanceDataSink(None, schema, "create", table_id=["deferred"], **ns)
+    sink = LanceDataSink(None, schema, "create", table_id=["deferred"], **ns)
     assert not (tmp_path / "deferred.lance").exists()
 
     sink.start()
@@ -229,24 +197,27 @@ def test_sink_invalid_params_do_not_declare_table(tmp_path: Path) -> None:
     schema = daft.from_pydict({"id": [1]}).schema()
 
     with pytest.raises(ValueError, match="blob_columns"):
-        daft_lance.LanceDataSink(None, schema, "create", table_id=["orphan"], blob_columns=["missing"], **ns)
+        LanceDataSink(None, schema, "create", table_id=["orphan"], blob_columns=["missing"], **ns)
 
     assert not (tmp_path / "orphan.lance").exists()
 
 
 def test_namespace_create_on_existing_table_raises(tmp_path: Path) -> None:
+    from lance_namespace.errors import TableAlreadyExistsError
+
     ns = _dir_ns(tmp_path)
     table_id = ["exists"]
 
     daft_lance.write_lance(daft.from_pydict({"id": [1]}), table_id=table_id, mode="create", **ns).collect()
 
-    with pytest.raises(ValueError, match="already exists"):
+    with pytest.raises(TableAlreadyExistsError, match="already exists"):
         daft_lance.write_lance(daft.from_pydict({"id": [2]}), table_id=table_id, mode="create", **ns).collect()
 
 
-def test_namespace_create_over_declared_placeholder(tmp_path: Path) -> None:
+def test_namespace_create_on_declared_table_raises(tmp_path: Path) -> None:
     import lance_namespace as ln
     from lance_namespace import DeclareTableRequest
+    from lance_namespace.errors import TableAlreadyExistsError
 
     ns = _dir_ns(tmp_path)
     table_id = ["declared_first"]
@@ -254,115 +225,54 @@ def test_namespace_create_over_declared_placeholder(tmp_path: Path) -> None:
     namespace = ln.connect("dir", {"root": str(tmp_path)})
     namespace.declare_table(DeclareTableRequest(id=table_id, location=None))
 
-    daft_lance.write_lance(daft.from_pydict({"id": [1, 2]}), table_id=table_id, mode="create", **ns).collect()
+    with pytest.raises(TableAlreadyExistsError, match="already exists"):
+        daft_lance.write_lance(daft.from_pydict({"id": [1, 2]}), table_id=table_id, mode="create", **ns).collect()
 
-    assert daft_lance.read_lance(table_id=table_id, **ns).to_pydict() == {"id": [1, 2]}
 
+def test_namespace_create_declares_without_describe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    requests: list[Any] = []
 
-def test_create_declare_race_recovers_placeholder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
-
-    class RacingNamespace:
-        def __init__(self) -> None:
-            self.describe_calls = 0
-
+    class RecordingNamespace:
         def describe_table(self, request: Any) -> Any:
-            self.describe_calls += 1
-            if self.describe_calls == 1:
-                raise TableNotFoundError("table not found: t")
-            return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None, is_only_declared=True)
+            raise AssertionError("create must not describe before declaring")
 
         def declare_table(self, request: Any) -> Any:
-            raise TableAlreadyExistsError("Table already exists: t")
+            requests.append(request)
+            return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None)
 
-    fake = RacingNamespace()
-    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: fake)
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: RecordingNamespace())
 
     resolved = namespace_mod.resolve_namespace_table(
-        namespace_impl="rest",
-        namespace_properties=None,
-        table_id=["t"],
-        mode="create",
+        namespace_impl="rest", namespace_properties=None, table_id=["t"], mode="create"
     )
-    assert resolved is not None
-    assert resolved.is_declared_placeholder
-    assert fake.describe_calls == 2
 
-
-def test_create_declare_race_lost_to_real_table_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
-
-    class RacingNamespace:
-        def __init__(self) -> None:
-            self.describe_calls = 0
-
-        def describe_table(self, request: Any) -> Any:
-            self.describe_calls += 1
-            if self.describe_calls == 1:
-                raise TableNotFoundError("table not found: t")
-            return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None, is_only_declared=False)
-
-        def declare_table(self, request: Any) -> Any:
-            raise TableAlreadyExistsError("Table already exists: t")
-
-    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: RacingNamespace())
-
-    with pytest.raises(ValueError, match="already exists"):
-        namespace_mod.resolve_namespace_table(
-            namespace_impl="rest",
-            namespace_properties=None,
-            table_id=["t"],
-            mode="create",
-        )
-
-
-def test_overwrite_resolves_declared_only_stub_on_strict_impl(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Strict impls 404 a plain describe on declared-only stubs; overwrite must still find them."""
-    from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
-
-    class StrictNamespace:
-        def describe_table(self, request: Any) -> Any:
-            if getattr(request, "check_declared", None) is True:
-                return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None, is_only_declared=True)
-            raise TableNotFoundError("table not found: t")
-
-        def declare_table(self, request: Any) -> Any:
-            raise TableAlreadyExistsError("Table already exists: t")
-
-    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: StrictNamespace())
-
-    resolved = namespace_mod.resolve_namespace_table(
-        namespace_impl="rest",
-        namespace_properties=None,
-        table_id=["t"],
-        mode="overwrite",
-    )
     assert resolved is not None
     assert resolved.uri.endswith("t.lance")
-    assert resolved.is_declared_placeholder
+    assert len(requests) == 1
+    assert requests[0].vend_credentials is True
 
 
-def test_mem_wal_create_over_materialized_placeholder_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    import daft_lance.lance_data_sink as sink_mod
+def test_namespace_overwrite_uses_plain_describe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    requests: list[Any] = []
 
-    ns = _dir_ns(tmp_path)
-    schema = daft.from_pydict({"id": [1]}).schema()
-    sink = daft_lance.LanceDataSink(None, schema, "create", table_id=["t"], use_mem_wal=True, **ns)
+    class RecordingNamespace:
+        def describe_table(self, request: Any) -> Any:
+            requests.append(request)
+            return SimpleNamespace(location=str(tmp_path / "t.lance"), storage_options=None)
 
-    monkeypatch.setattr(
-        sink_mod,
-        "resolve_namespace_table",
-        lambda **kwargs: namespace_mod.ResolvedNamespaceTable(
-            uri=str(tmp_path / "t.lance"), is_declared_placeholder=True
-        ),
+        def declare_table(self, request: Any) -> Any:
+            raise AssertionError("an existing overwrite target must not be declared")
+
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: RecordingNamespace())
+
+    resolved = namespace_mod.resolve_namespace_table(
+        namespace_impl="rest", namespace_properties=None, table_id=["t"], mode="overwrite"
     )
-    import pyarrow as pa
 
-    fake_dataset = SimpleNamespace(schema=pa.schema([("id", pa.int64())]), latest_version=1)
-    monkeypatch.setattr("daft_lance.lance_data_sink.lance.dataset", lambda *args, **kwargs: fake_dataset)
-
-    with pytest.raises(ValueError, match="use_mem_wal"):
-        sink.start()
+    assert resolved is not None
+    assert len(requests) == 1
+    assert requests[0].model_fields_set == {"id", "vend_credentials"}
+    assert requests[0].vend_credentials is True
 
 
 def test_construct_lance_dataset_empty_storage_options_falls_back_to_io_config(
@@ -397,7 +307,7 @@ def test_sink_survives_pickle_after_start(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     schema = daft.from_pydict({"id": [1]}).schema()
 
-    sink = daft_lance.LanceDataSink(None, schema, "create", table_id=["pickled"], **ns)
+    sink = LanceDataSink(None, schema, "create", table_id=["pickled"], **ns)
     sink.start()
 
     worker_sink = pickle.loads(pickle.dumps(sink))
@@ -450,20 +360,10 @@ def test_sink_empty_storage_options_falls_back_to_io_config(tmp_path: Path) -> N
     io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
     schema = daft.from_pydict({"id": [1]}).schema()
 
-    sink = daft_lance.LanceDataSink("s3://bucket/t.lance", schema, "create", io_config, storage_options={})
+    sink = LanceDataSink("s3://bucket/t.lance", schema, "create", io_config, storage_options={})
     merged = sink._merged_storage_options(namespace_mod.ResolvedNamespaceTable(uri="s3://bucket/t.lance"))
     assert merged is not None
     assert merged["access_key_id"] == "io-key"
-
-
-def test_declared_placeholder_response_fallback_property() -> None:
-    assert namespace_mod.is_declared_placeholder_response(SimpleNamespace(is_only_declared=True))
-    assert namespace_mod.is_declared_placeholder_response(
-        SimpleNamespace(is_only_declared=None, properties={"lance.declared": "TRUE"})
-    )
-    assert not namespace_mod.is_declared_placeholder_response(
-        SimpleNamespace(is_only_declared=None, properties={}, metadata=None)
-    )
 
 
 def test_construct_lance_dataset_storage_options_priority(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -553,7 +453,7 @@ def test_sink_storage_options_priority(tmp_path: Path) -> None:
     schema = daft.from_pydict({"id": [1]}).schema()
     io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
 
-    sink = daft_lance.LanceDataSink(
+    sink = LanceDataSink(
         None,
         schema,
         "create",

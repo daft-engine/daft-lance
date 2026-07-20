@@ -16,7 +16,7 @@ from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
 from .lance_scan import LanceDBScanOperator
-from .namespace import is_table_not_found, validate_uri_or_namespace
+from .namespace import validate_uri_or_namespace
 from .utils import construct_lance_dataset
 
 if TYPE_CHECKING:
@@ -638,43 +638,13 @@ def compact_files(
     )
 
 
-def _is_missing_dataset_error(error: Exception) -> bool:
-    """Whether opening a dataset failed because it does not exist yet."""
-    if isinstance(error, (FileNotFoundError,)):
-        return True
-    if isinstance(error, (ValueError, OSError)) and "was not found" in str(error):
-        return True
-    return is_table_not_found(error)
-
-
-def _stats_dataframe(lance_ds: LanceDataset) -> DataFrame:
-    """Build the same stats DataFrame that LanceDataSink.finalize returns."""
-    import pyarrow as _pa
-
-    from daft.recordbatch import MicroPartition
-
-    stats = lance_ds.stats.dataset_stats()
-    return DataFrame._from_micropartitions(
-        MicroPartition.from_pydict(
-            {
-                "num_fragments": _pa.array([stats["num_fragments"]], type=_pa.int64()),
-                "num_deleted_rows": _pa.array([stats["num_deleted_rows"]], type=_pa.int64()),
-                "num_small_files": _pa.array([stats["num_small_files"]], type=_pa.int64()),
-                "version": _pa.array([lance_ds.version], type=_pa.int64()),
-            }
-        )
-    )
-
-
 @PublicAPI
 def write_lance(
     df: DataFrame,
     uri: str | pathlib.Path | None = None,
-    mode: Literal["create", "append", "overwrite", "merge"] = "create",
+    mode: Literal["create", "append", "overwrite"] = "create",
     io_config: IOConfig | None = None,
     schema: Any | None = None,
-    left_on: str | None = None,
-    right_on: str | None = None,
     *,
     table_id: list[str] | None = None,
     namespace_impl: str | None = None,
@@ -686,11 +656,9 @@ def write_lance(
     Args:
         df: The DataFrame to write.
         uri: The URI of the Lance table. Mutually exclusive with the namespace parameters.
-        mode: One of "create", "append", "overwrite", or "merge" (add new columns to
-            existing rows; requires ``fragment_id`` and a join key column in ``df``).
+        mode: One of "create", "append", or "overwrite".
         io_config: A custom IOConfig to use when accessing Lance data.
         schema: Desired schema to enforce during write; defaults to the DataFrame schema.
-        left_on/right_on: Join keys for ``mode="merge"``; default "_rowaddr".
         table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
         namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
         namespace_properties: Properties for connecting to the namespace, e.g.
@@ -712,82 +680,14 @@ def write_lance(
     if schema is None:
         schema = df.schema()
 
-    if mode != "merge":
-        sanitized_kwargs = {k: v for k, v in kwargs.items() if k not in ("left_on", "right_on")}
-        sink = LanceDataSink(
-            uri,
-            schema,
-            mode,
-            io_config,
-            table_id=table_id,
-            namespace_impl=namespace_impl,
-            namespace_properties=namespace_properties,
-            **sanitized_kwargs,
-        )
-        return df.write_sink(sink)
-
-    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = kwargs.pop("storage_options", None)
-
-    lance_ds: LanceDataset | None
-    try:
-        lance_ds = construct_lance_dataset(
-            uri,
-            storage_options=storage_options,
-            io_config=io_config,
-            namespace_impl=namespace_impl,
-            namespace_properties=namespace_properties,
-            table_id=table_id,
-        )
-    except Exception as error:
-        if not _is_missing_dataset_error(error):
-            raise
-        lance_ds = None
-
-    sanitized_kwargs = {k: v for k, v in kwargs.items() if k not in ("left_on", "right_on")}
-
-    if lance_ds is None:
-        # Merge against a missing table degenerates to create.
-        sink = LanceDataSink(
-            uri,
-            schema,
-            "create",
-            io_config,
-            table_id=table_id,
-            namespace_impl=namespace_impl,
-            namespace_properties=namespace_properties,
-            storage_options=storage_options,
-            **sanitized_kwargs,
-        )
-        return df.write_sink(sink)
-
-    existing_fields = {getattr(f, "name", str(f)) for f in lance_ds.schema}
-    meta_exclusions = {"fragment_id", "_rowaddr", "_rowid"}
-    new_cols = [c for c in df.column_names if c not in existing_fields and c not in meta_exclusions]
-
-    if len(new_cols) == 0:
-        # No schema evolution: merge degenerates to append.
-        sink = LanceDataSink(
-            uri,
-            schema,
-            "append",
-            io_config,
-            table_id=table_id,
-            namespace_impl=namespace_impl,
-            namespace_properties=namespace_properties,
-            storage_options=storage_options,
-            **sanitized_kwargs,
-        )
-        return df.write_sink(sink)
-
-    join_left = left_on or "_rowaddr"
-    join_right = right_on or join_left
-    merged = merge_columns_from_df(
-        df,
-        lance_ds=lance_ds,
-        uri=_effective_uri(lance_ds, uri),
-        left_on=join_left,
-        right_on=join_right,
-        storage_options=_effective_storage_options(lance_ds, storage_options),
+    sink = LanceDataSink(
+        uri,
+        schema,
+        mode,
+        io_config,
+        table_id=table_id,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        **kwargs,
     )
-    return _stats_dataframe(merged)
+    return df.write_sink(sink)

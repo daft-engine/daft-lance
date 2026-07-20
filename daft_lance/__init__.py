@@ -12,10 +12,8 @@ from ._lance import (
     read_lance,
     write_lance,
 )
-from .lance_data_sink import LanceDataSink
 
 __all__ = [
-    "LanceDataSink",
     "compact_files",
     "create_scalar_index",
     "merge_columns",
