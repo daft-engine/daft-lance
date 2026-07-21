@@ -23,6 +23,43 @@ def _double_score(batch: Any) -> Any:
     return pa.RecordBatch.from_arrays([pc.multiply(batch["score"], 2)], ["doubled"])
 
 
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("file:///tmp/plain/t.lance", "/tmp/plain/t.lance"),
+        ("file:///tmp/root%20space/t.lance", "/tmp/root space/t.lance"),
+        ("file:///tmp/%E4%B8%AD%E6%96%87/t.lance", "/tmp/中文/t.lance"),
+        ("file:///tmp/100%25/t.lance", "/tmp/100%/t.lance"),
+        # Object-store URIs pass through untouched, encoding included.
+        ("s3://bucket/root%20space/t.lance", "s3://bucket/root%20space/t.lance"),
+    ],
+)
+def test_normalize_file_uri_percent_decodes_paths(location: str, expected: str) -> None:
+    assert namespace_mod._normalize_file_uri(location) == expected
+
+
+@pytest.mark.parametrize("root_name", ["daft lance", "中文目录"])
+def test_namespace_roundtrip_with_encoded_location(tmp_path: Path, root_name: str) -> None:
+    """A namespace root/table whose location percent-encodes must still round-trip.
+
+    The dir namespace vends ``file://.../daft%20lance/table%20space.lance``; writing
+    to the literal encoded form would create a directory that the later
+    ``describe_table`` never resolves to.
+    """
+    root = tmp_path / root_name
+    root.mkdir()
+    ns = _dir_ns(root)
+    table_id = ["table space"]
+
+    df = daft.from_pydict({"id": [1, 2], "label": ["a", "b"]})
+    daft_lance.write_lance(df, table_id=table_id, mode="create", **ns).collect()
+
+    assert daft_lance.read_lance(table_id=table_id, **ns).to_pydict() == {"id": [1, 2], "label": ["a", "b"]}
+    # The data landed under the decoded name, not a literal "%20" sibling.
+    assert (root / "table space.lance").is_dir()
+    assert not (root / "table%20space.lance").exists()
+
+
 def test_namespace_write_read_append_roundtrip(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["roundtrip"]
@@ -386,6 +423,19 @@ def test_namespace_commit_kwargs_include_managed_versioning(monkeypatch: pytest.
     }
 
 
+def test_namespace_with_mem_wal_is_rejected(tmp_path: Path) -> None:
+    schema = daft.from_pydict({"id": [1]}).schema()
+    with pytest.raises(ValueError, match="use_mem_wal=True is not supported"):
+        LanceDataSink(
+            uri=None,
+            schema=schema,
+            mode="create",
+            table_id=["memwal"],
+            use_mem_wal=True,
+            **_dir_ns(tmp_path),
+        )
+
+
 def test_construct_lance_dataset_empty_storage_options_falls_back_to_io_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -404,10 +454,10 @@ def test_construct_lance_dataset_empty_storage_options_falls_back_to_io_config(
     monkeypatch.setattr("daft_lance.utils.lance.dataset", fake_dataset)
 
     io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
-    dataset = utils_mod.construct_lance_dataset("s3://bucket/t.lance", storage_options={}, io_config=io_config)
+    handle = utils_mod.construct_lance_dataset_handle("s3://bucket/t.lance", storage_options={}, io_config=io_config)
 
     merged = captured["storage_options"]
-    assert isinstance(dataset, FakeDataset)
+    assert isinstance(handle.dataset, FakeDataset)
     assert merged is not None
     assert merged["access_key_id"] == "io-key"
 
@@ -548,7 +598,7 @@ def test_construct_lance_dataset_io_config_reaches_namespace_location(monkeypatc
     )
 
     io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
-    utils_mod.construct_lance_dataset(
+    utils_mod.construct_lance_dataset_handle(
         None,
         io_config=io_config,
         namespace_impl="rest",
