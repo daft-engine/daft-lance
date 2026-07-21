@@ -69,6 +69,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         compact_after_write: bool = True,
     ) -> None:
         self._reject_unsupported_modes(mode, use_legacy_format)
+        self._reject_namespace_mem_wal(namespace_impl, table_id, use_mem_wal)
         validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
         if uri is not None and not isinstance(uri, (str, pathlib.Path)):
             raise TypeError(f"Expected URI to be str or pathlib.Path, got {type(uri)}")
@@ -204,6 +205,24 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 "use data_storage_version instead.",
                 DeprecationWarning,
                 stacklevel=3,
+            )
+
+    @staticmethod
+    def _reject_namespace_mem_wal(namespace_impl: str | None, table_id: list[str] | None, use_mem_wal: bool) -> None:
+        """Reject the namespace + mem-WAL combination instead of failing mid-write.
+
+        The namespace write path declares the table up front (a metadata-only
+        reservation), but the mem-WAL path then asks Lance for a namespace-aware
+        ``write_dataset(mode="create")``, which declares the same table a second
+        time and raises ``TableAlreadyExistsError``. Supporting this needs the
+        mem-WAL path to skip our own declare and let the native create own it;
+        until then, fail loudly at construction time.
+        """
+        if use_mem_wal and namespace_impl is not None and table_id is not None:
+            raise ValueError(
+                "use_mem_wal=True is not supported with namespace-addressed tables "
+                "('namespace_impl' + 'table_id'). Write to a 'uri' instead, or set "
+                "use_mem_wal=False."
             )
 
     def _init_lance_knobs(
