@@ -213,34 +213,6 @@ def construct_lance_dataset_handle(
     )
 
 
-def construct_lance_dataset(
-    uri: str | pathlib.Path | None,
-    version: int | str | None = None,
-    storage_options: dict[str, Any] | None = None,
-    io_config: IOConfig | None = None,
-    namespace_impl: str | None = None,
-    namespace_properties: dict[str, str] | None = None,
-    table_id: list[str] | None = None,
-    **kwargs: Any,
-) -> lance.LanceDataset:
-    """Construct a Lance dataset with common options.
-
-    This compatibility wrapper preserves the historical return type. Internal
-    callers that also need the resolved URI or reusable open arguments should
-    use :func:`construct_lance_dataset_handle`.
-    """
-    return construct_lance_dataset_handle(
-        uri,
-        version=version,
-        storage_options=storage_options,
-        io_config=io_config,
-        namespace_impl=namespace_impl,
-        namespace_properties=namespace_properties,
-        table_id=table_id,
-        **kwargs,
-    ).dataset
-
-
 def combine_filters_to_arrow(predicates: list[Any] | None) -> pa.compute.Expression | None:
     """Combine a list of Daft PyExpr predicates into a single Arrow Expression.
 
