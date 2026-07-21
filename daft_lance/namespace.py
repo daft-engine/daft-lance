@@ -205,7 +205,7 @@ def merge_storage_options(*layers: dict[str, Any] | None) -> dict[str, Any] | No
 
 
 def pop_namespace_params(open_kwargs: dict[str, Any]) -> tuple[str | None, dict[str, str] | None, list[str] | None]:
-    """Remove and return the namespace triple from a ``_lance_open_kwargs`` dict."""
+    """Remove and return the namespace triple from serialized open arguments."""
     return (
         open_kwargs.pop("namespace_impl", None),
         open_kwargs.pop("namespace_properties", None),
@@ -213,23 +213,8 @@ def pop_namespace_params(open_kwargs: dict[str, Any]) -> tuple[str | None, dict[
     )
 
 
-def namespace_kwargs_for_dataset(ds: Any) -> dict[str, Any]:
-    """Namespace kwargs for commit-style calls, recovered from ``ds._lance_open_kwargs``.
-
-    ``lance.LanceDataset.commit`` is a static method, so a dataset opened through a
-    namespace does not carry its client into commits; re-derive it from the open
-    kwargs stashed by ``construct_lance_dataset``.
-    """
-    open_kwargs = getattr(ds, "_lance_open_kwargs", None) or {}
-    return get_namespace_kwargs(
-        open_kwargs.get("namespace_impl"),
-        open_kwargs.get("namespace_properties"),
-        open_kwargs.get("table_id"),
-    )
-
-
 def open_dataset_from_open_kwargs(ds_uri: str | None, open_kwargs: dict[str, Any] | None) -> lance.LanceDataset:
-    """Re-open a dataset on a worker from serialized ``_lance_open_kwargs``.
+    """Re-open a dataset on a worker from serialized open arguments.
 
     The namespace client is not picklable, so only the (impl, properties, table_id)
     triple travels with the task; the client is re-created here via the lru cache.

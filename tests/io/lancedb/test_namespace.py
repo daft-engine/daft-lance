@@ -16,6 +16,13 @@ def _dir_ns(tmp_path: Path) -> dict[str, Any]:
     return {"namespace_impl": "dir", "namespace_properties": {"root": str(tmp_path)}}
 
 
+def _double_score(batch: Any) -> Any:
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    return pa.RecordBatch.from_arrays([pc.multiply(batch["score"], 2)], ["doubled"])
+
+
 def test_namespace_write_read_append_roundtrip(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["roundtrip"]
@@ -135,6 +142,51 @@ def test_namespace_merge_columns_df(tmp_path: Path) -> None:
     assert result["tripled"] == [3, 6, 9]
 
 
+def test_namespace_merge_columns_transform(tmp_path: Path) -> None:
+    ns = _dir_ns(tmp_path)
+    table_id = ["merge_cols_transform"]
+
+    daft_lance.write_lance(
+        daft.from_pydict({"id": [1, 2, 3], "score": [10, 20, 30]}),
+        table_id=table_id,
+        mode="create",
+        **ns,
+    ).collect()
+
+    daft_lance.merge_columns(table_id=table_id, transform=_double_score, read_columns=["score"], **ns)
+
+    result = daft_lance.read_lance(table_id=table_id, **ns).sort("id").to_pydict()
+    assert result["doubled"] == [20, 40, 60]
+
+
+def test_namespace_merge_columns_df_slow_path(tmp_path: Path) -> None:
+    ns = _dir_ns(tmp_path)
+    table_id = ["merge_cols_slow"]
+
+    daft_lance.write_lance(
+        daft.from_pydict({"id": [1, 2, 3], "score": [10, 20, 30]}),
+        table_id=table_id,
+        mode="create",
+        **ns,
+    ).collect()
+
+    source = daft_lance.read_lance(
+        table_id=table_id,
+        default_scan_options={"with_row_address": True},
+        include_fragment_id=True,
+        **ns,
+    ).limit(2)
+    source = source.with_column("partial_score", source["score"] * 10)
+    daft_lance.merge_columns_df(
+        source.select("fragment_id", "_rowaddr", "partial_score"),
+        table_id=table_id,
+        **ns,
+    )
+
+    result = daft_lance.read_lance(table_id=table_id, **ns).sort("id").to_pydict()
+    assert result["partial_score"] == [100, 200, None]
+
+
 def test_namespace_create_scalar_index(tmp_path: Path) -> None:
     ns = _dir_ns(tmp_path)
     table_id = ["indexed"]
@@ -156,6 +208,36 @@ def test_namespace_create_scalar_index(tmp_path: Path) -> None:
     location = namespace.describe_table(DescribeTableRequest(id=table_id)).location
     indices = lance.dataset(location).list_indices()
     assert any(idx["fields"] == ["price"] for idx in indices)
+
+
+@pytest.mark.parametrize("segmented", [False, True])
+def test_namespace_create_distributed_inverted_index(tmp_path: Path, segmented: bool) -> None:
+    ns = _dir_ns(tmp_path)
+    table_id = [f"inverted_{segmented}"]
+
+    daft_lance.write_lance(
+        daft.from_pydict({"id": list(range(20)), "text": [f"document {i}" for i in range(20)]}),
+        table_id=table_id,
+        mode="create",
+        **ns,
+    ).collect()
+
+    daft_lance.create_scalar_index(
+        table_id=table_id,
+        column="text",
+        index_type="INVERTED",
+        name="text_idx",
+        segmented=segmented,
+        **ns,
+    )
+
+    import lance
+    import lance_namespace as ln
+    from lance_namespace import DescribeTableRequest
+
+    location = ln.connect("dir", {"root": str(tmp_path)}).describe_table(DescribeTableRequest(id=table_id)).location
+    indices = lance.dataset(location).list_indices()
+    assert any(idx["name"] == "text_idx" and idx["fields"] == ["text"] for idx in indices)
 
 
 def test_namespace_compact_files(tmp_path: Path) -> None:
@@ -293,9 +375,10 @@ def test_construct_lance_dataset_empty_storage_options_falls_back_to_io_config(
     monkeypatch.setattr("daft_lance.utils.lance.dataset", fake_dataset)
 
     io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
-    utils_mod.construct_lance_dataset("s3://bucket/t.lance", storage_options={}, io_config=io_config)
+    dataset = utils_mod.construct_lance_dataset("s3://bucket/t.lance", storage_options={}, io_config=io_config)
 
     merged = captured["storage_options"]
+    assert isinstance(dataset, FakeDataset)
     assert merged is not None
     assert merged["access_key_id"] == "io-key"
 
@@ -392,7 +475,7 @@ def test_construct_lance_dataset_storage_options_priority(monkeypatch: pytest.Mo
     )
 
     io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
-    utils_mod.construct_lance_dataset(
+    handle = utils_mod.construct_lance_dataset_handle(
         None,
         io_config=io_config,
         storage_options={"access_key_id": "user-key", "user_option": "kept"},
@@ -408,6 +491,9 @@ def test_construct_lance_dataset_storage_options_priority(monkeypatch: pytest.Mo
     assert merged["user_option"] == "kept"  # user-provided keys survive
     assert merged["secret_access_key"] == "io-secret"  # io_config fills the gaps
     assert captured["uri"] is None  # namespace addressing passes uri=None
+    assert handle.storage_options == merged
+    assert handle.uri == "s3://bucket/t.lance"
+    assert not hasattr(handle.dataset, "_lance_open_kwargs")
 
 
 def test_construct_lance_dataset_io_config_reaches_namespace_location(monkeypatch: pytest.MonkeyPatch) -> None:

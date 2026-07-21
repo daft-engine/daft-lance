@@ -17,7 +17,7 @@ from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
 from .lance_scan import LanceDBScanOperator
 from .namespace import validate_uri_or_namespace
-from .utils import construct_lance_dataset
+from .utils import construct_lance_dataset_handle
 
 if TYPE_CHECKING:
     from lance.dataset import LanceDataset
@@ -25,17 +25,6 @@ if TYPE_CHECKING:
 
     from daft.checkpoint import CheckpointConfig
     from daft.dependencies import pa
-
-
-def _effective_uri(lance_ds: LanceDataset, uri: str | pathlib.Path | None) -> str:
-    """The dataset location: the user-supplied URI, or the namespace-resolved one."""
-    return str(uri) if uri is not None else str(lance_ds.uri)
-
-
-def _effective_storage_options(lance_ds: LanceDataset, storage_options: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Storage options actually used to open the dataset (includes namespace-vended ones)."""
-    open_kwargs = getattr(lance_ds, "_lance_open_kwargs", None) or {}
-    return open_kwargs.get("storage_options") or storage_options
 
 
 @PublicAPI
@@ -155,7 +144,7 @@ def read_lance(
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
-    ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri_str,
         io_config=io_config,
         namespace_impl=namespace_impl,
@@ -171,9 +160,11 @@ def read_lance(
     )
 
     lance_operator = LanceDBScanOperator(
-        ds,
+        dataset_handle.dataset,
         fragment_group_size=fragment_group_size,
         include_fragment_id=include_fragment_id,
+        open_kwargs=dataset_handle.open_kwargs,
+        default_scan_options=dataset_handle.default_scan_options,
     )
 
     handle = ScanOperatorHandle.from_python_scan_operator(lance_operator)
@@ -255,7 +246,7 @@ def merge_columns(
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
     # Build Lance dataset handle for committing
-    lance_ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri,
         storage_options=storage_options,
         io_config=io_config,
@@ -272,12 +263,13 @@ def merge_columns(
     )
 
     return merge_columns_internal(
-        lance_ds,
-        _effective_uri(lance_ds, uri),
+        dataset_handle.dataset,
+        dataset_handle.uri,
         transform=transform,
         read_columns=read_columns,
         reader_schema=reader_schema,
-        storage_options=_effective_storage_options(lance_ds, storage_options),
+        storage_options=dataset_handle.storage_options,
+        namespace_kwargs=dataset_handle.namespace_kwargs,
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
     )
@@ -362,7 +354,7 @@ def merge_columns_df(
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
     # Build Lance dataset handle for committing
-    lance_ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri,
         storage_options=storage_options,
         io_config=io_config,
@@ -386,11 +378,12 @@ def merge_columns_df(
 
     return merge_columns_from_df(
         df,
-        lance_ds=lance_ds,
-        uri=_effective_uri(lance_ds, uri),
+        lance_ds=dataset_handle.dataset,
+        uri=dataset_handle.uri,
         read_columns=read_columns,
         reader_schema=reader_schema,
-        storage_options=_effective_storage_options(lance_ds, storage_options),
+        storage_options=dataset_handle.storage_options,
+        namespace_kwargs=dataset_handle.namespace_kwargs,
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
         left_on=left_on,
@@ -518,7 +511,7 @@ def create_scalar_index(
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
-    lance_ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri,
         storage_options=storage_options,
         io_config=io_config,
@@ -535,13 +528,14 @@ def create_scalar_index(
     )
 
     create_scalar_index_internal(
-        lance_ds=lance_ds,
-        uri=_effective_uri(lance_ds, uri),
+        lance_ds=dataset_handle.dataset,
+        uri=dataset_handle.uri,
         column=column,
         index_type=index_type,
         name=name,
         replace=replace,
-        storage_options=_effective_storage_options(lance_ds, storage_options),
+        storage_options=dataset_handle.storage_options,
+        namespace_kwargs=dataset_handle.namespace_kwargs,
         fragment_group_size=fragment_group_size,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
@@ -614,7 +608,7 @@ def compact_files(
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
-    lance_ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri,
         storage_options=storage_options,
         io_config=io_config,
@@ -631,7 +625,7 @@ def compact_files(
     )
 
     return compact_files_internal(
-        lance_ds=lance_ds,
+        lance_ds=dataset_handle.dataset,
         compaction_options=compaction_options,
         partition_num=partition_num,
         concurrency=concurrency,

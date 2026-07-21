@@ -14,8 +14,6 @@ from daft.datatype import DataType
 from daft.udf import cls as daft_cls
 from daft.udf import method
 
-from .namespace import namespace_kwargs_for_dataset
-
 if TYPE_CHECKING:
     import pathlib
     from collections.abc import Callable
@@ -60,6 +58,7 @@ def merge_columns_internal(
     read_columns: list[str] | None = None,
     reader_schema: pa.Schema | None = None,
     storage_options: dict[str, Any] | None = None,
+    namespace_kwargs: dict[str, Any] | None = None,
     daft_remote_args: dict[str, Any] | None = None,
     concurrency: int | None = None,
 ) -> lance.LanceDataset:
@@ -95,7 +94,7 @@ def merge_columns_internal(
         op,
         read_version=lance_ds.version,
         storage_options=storage_options,
-        **namespace_kwargs_for_dataset(lance_ds),
+        **(namespace_kwargs or {}),
     )
 
 
@@ -372,6 +371,7 @@ def merge_columns_from_df(
     read_columns: list[str] | None = None,
     reader_schema: pa.Schema | None = None,
     storage_options: dict[str, Any] | None = None,
+    namespace_kwargs: dict[str, Any] | None = None,
     daft_remote_args: dict[str, Any] | None = None,
     concurrency: int | None = None,
     left_on: str | None = "_rowaddr",
@@ -416,7 +416,14 @@ def merge_columns_from_df(
     use_fast_path = _can_use_fast_path(df, lance_ds, join_key)
 
     if use_fast_path:
-        return _merge_fast_path(df, lance_ds, uri, new_cols, storage_options=storage_options)
+        return _merge_fast_path(
+            df,
+            lance_ds,
+            uri,
+            new_cols,
+            storage_options=storage_options,
+            namespace_kwargs=namespace_kwargs,
+        )
     else:
         return _merge_slow_path(
             df,
@@ -428,6 +435,7 @@ def merge_columns_from_df(
             reader_schema,
             batch_size,
             storage_options=storage_options,
+            namespace_kwargs=namespace_kwargs,
         )
 
 
@@ -437,6 +445,7 @@ def _merge_fast_path(
     uri: str | pathlib.Path,
     new_column_names: list[str],
     storage_options: dict[str, Any] | None = None,
+    namespace_kwargs: dict[str, Any] | None = None,
 ) -> lance.LanceDataset:
     """Metadata-only add_columns: write raw .lance files and stitch into fragment metadata."""
     handler = FastPathFragmentWriter(lance_ds, str(uri), new_column_names, storage_options=storage_options)
@@ -476,7 +485,7 @@ def _merge_fast_path(
         op,
         read_version=lance_ds.version,
         storage_options=storage_options,
-        **namespace_kwargs_for_dataset(lance_ds),
+        **(namespace_kwargs or {}),
     )
 
 
@@ -490,6 +499,7 @@ def _merge_slow_path(
     reader_schema: pa.Schema | None,
     batch_size: int | None,
     storage_options: dict[str, Any] | None = None,
+    namespace_kwargs: dict[str, Any] | None = None,
 ) -> lance.LanceDataset:
     """Original keyed-join merge path: rewrites fragment data."""
     handler_udf = GroupFragmentMergeUDF(
@@ -525,5 +535,5 @@ def _merge_slow_path(
         op,
         read_version=lance_ds.version,
         storage_options=storage_options,
-        **namespace_kwargs_for_dataset(lance_ds),
+        **(namespace_kwargs or {}),
     )

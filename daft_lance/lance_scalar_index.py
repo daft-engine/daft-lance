@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 import lance
 
 from daft.dependencies import pa
-from daft_lance.namespace import namespace_kwargs_for_dataset
 from daft_lance.utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
@@ -140,6 +139,7 @@ def create_scalar_index_internal(
     name: str | None = None,
     replace: bool = False,
     storage_options: dict[str, Any] | None = None,
+    namespace_kwargs: dict[str, Any] | None = None,
     fragment_group_size: int | None = None,
     num_partitions: int | None = None,
     max_concurrency: int | None = None,
@@ -297,6 +297,7 @@ def create_scalar_index_internal(
             index_type=index_type,
             name=name,
             storage_options=storage_options,
+            namespace_kwargs=namespace_kwargs,
             fragment_data=fragment_data,
             fragment_ids_to_use=fragment_ids_to_use,
             num_partitions=num_partitions,
@@ -312,6 +313,7 @@ def create_scalar_index_internal(
             name=name,
             replace=replace,
             storage_options=storage_options,
+            namespace_kwargs=namespace_kwargs,
             fragment_data=fragment_data,
             fragment_ids_to_use=fragment_ids_to_use,
             num_partitions=num_partitions,
@@ -328,6 +330,7 @@ def _create_segmented_index(
     index_type: str,
     name: str,
     storage_options: dict[str, Any] | None,
+    namespace_kwargs: dict[str, Any] | None,
     fragment_data: list[dict[str, list[int]]],
     fragment_ids_to_use: list[int],
     num_partitions: int | None,
@@ -387,8 +390,11 @@ def _create_segmented_index(
 
     # Reload dataset to pick up the latest version (segment files were written
     # by workers against the version that was current at their invocation time).
-    namespace_kwargs = namespace_kwargs_for_dataset(lance_ds)
-    lance_ds = lance.dataset(None if namespace_kwargs else uri, storage_options=storage_options, **namespace_kwargs)
+    lance_ds = lance.dataset(
+        None if namespace_kwargs else uri,
+        storage_options=storage_options,
+        **(namespace_kwargs or {}),
+    )
     index_metas = _prepare_index_segments_for_commit(lance_ds, index_type, index_metas)
 
     logger.info(
@@ -423,6 +429,7 @@ def _create_partitioned_index(
     name: str,
     replace: bool,
     storage_options: dict[str, Any] | None,
+    namespace_kwargs: dict[str, Any] | None,
     fragment_data: list[dict[str, list[int]]],
     fragment_ids_to_use: list[int],
     num_partitions: int | None,
@@ -462,8 +469,11 @@ def _create_partitioned_index(
         df.collect()
 
     logger.info("Starting index metadata merging by reloading dataset to get latest state")
-    namespace_kwargs = namespace_kwargs_for_dataset(lance_ds)
-    lance_ds = lance.dataset(None if namespace_kwargs else uri, storage_options=storage_options, **namespace_kwargs)
+    lance_ds = lance.dataset(
+        None if namespace_kwargs else uri,
+        storage_options=storage_options,
+        **(namespace_kwargs or {}),
+    )
     lance_ds.merge_index_metadata(index_id, index_type)
 
     logger.info("Starting atomic index creation and commit")
@@ -509,7 +519,7 @@ def _create_partitioned_index(
         create_index_op,
         read_version=lance_ds.version,
         storage_options=storage_options,
-        **namespace_kwargs,
+        **(namespace_kwargs or {}),
     )
 
     logger.info("Index %s created successfully with ID %s", name, index_id)

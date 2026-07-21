@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import lance
@@ -22,6 +23,34 @@ if TYPE_CHECKING:
     from daft.daft import IOConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LanceDatasetHandle:
+    """An opened Lance dataset together with the context needed to reuse it.
+
+    ``lance.LanceDataset`` does not expose all arguments used to open it.  Keep
+    those arguments in this Daft-owned value object instead of attaching
+    private attributes to the third-party dataset instance.
+    """
+
+    dataset: lance.LanceDataset
+    uri: str
+    open_kwargs: dict[str, Any] = field(repr=False)
+    default_scan_options: dict[str, Any] | None = field(default=None, repr=False)
+
+    @property
+    def storage_options(self) -> dict[str, Any] | None:
+        options = self.open_kwargs.get("storage_options")
+        return options if isinstance(options, dict) else None
+
+    @property
+    def namespace_kwargs(self) -> dict[str, Any]:
+        return get_namespace_kwargs(
+            self.open_kwargs.get("namespace_impl"),
+            self.open_kwargs.get("namespace_properties"),
+            self.open_kwargs.get("table_id"),
+        )
 
 
 def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int) -> list[dict[str, list[int]]]:
@@ -91,7 +120,7 @@ def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int
     return non_empty_batches
 
 
-def construct_lance_dataset(
+def construct_lance_dataset_handle(
     uri: str | pathlib.Path | None,
     version: int | str | None = None,
     storage_options: dict[str, Any] | None = None,
@@ -100,8 +129,8 @@ def construct_lance_dataset(
     namespace_properties: dict[str, str] | None = None,
     table_id: list[str] | None = None,
     **kwargs: Any,
-) -> lance.LanceDataset:
-    """Construct a Lance dataset with common options.
+) -> LanceDatasetHandle:
+    """Construct a Lance dataset and retain its reusable open context.
 
     Storage options are layered from lowest to highest priority:
     io_config-derived < user-provided ``storage_options`` < namespace-vended.
@@ -144,7 +173,7 @@ def construct_lance_dataset(
         kwargs["default_scan_options"] = original_default_scan_options
 
     dataset_uri = None if has_namespace_params(namespace_impl, table_id) else resolved_uri
-    ds = lance.dataset(
+    dataset = lance.dataset(
         dataset_uri,
         storage_options=merged_storage_options,
         version=version,
@@ -160,19 +189,42 @@ def construct_lance_dataset(
         "table_id": table_id,
     }
     effective_kwargs.update(kwargs or {})
-    try:
-        ds._lance_open_kwargs = effective_kwargs  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    return LanceDatasetHandle(
+        dataset=dataset,
+        uri=resolved_uri,
+        open_kwargs=effective_kwargs,
+        # Preserve the full user-provided defaults (including nearest) for
+        # Daft's planning even if keys were stripped before calling Lance.
+        default_scan_options=original_default_scan_options if isinstance(original_default_scan_options, dict) else None,
+    )
 
-    # Preserve the full user-provided defaults (including nearest) for Daft's planning
-    # even if we stripped keys out before calling `lance.dataset`.
-    try:
-        ds._daft_default_scan_options = original_default_scan_options  # type: ignore[attr-defined]
-    except Exception:
-        pass
 
-    return ds
+def construct_lance_dataset(
+    uri: str | pathlib.Path | None,
+    version: int | str | None = None,
+    storage_options: dict[str, Any] | None = None,
+    io_config: IOConfig | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    table_id: list[str] | None = None,
+    **kwargs: Any,
+) -> lance.LanceDataset:
+    """Construct a Lance dataset with common options.
+
+    This compatibility wrapper preserves the historical return type. Internal
+    callers that also need the resolved URI or reusable open arguments should
+    use :func:`construct_lance_dataset_handle`.
+    """
+    return construct_lance_dataset_handle(
+        uri,
+        version=version,
+        storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
+        **kwargs,
+    ).dataset
 
 
 def combine_filters_to_arrow(predicates: list[Any] | None) -> pa.compute.Expression | None:

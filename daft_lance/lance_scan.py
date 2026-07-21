@@ -135,8 +135,12 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         ds: lance.LanceDataset,
         fragment_group_size: int | None = None,
         include_fragment_id: bool | None = False,
+        open_kwargs: dict[str, Any] | None = None,
+        default_scan_options: dict[str, Any] | None = None,
     ):
         self._ds = ds
+        self._open_kwargs = dict(open_kwargs or {})
+        self._default_scan_options = default_scan_options
         self._pushed_filters: list[PyExpr] | None = None
         self._remaining_filters: list[PyExpr] | None = None
         self._fragment_group_size = fragment_group_size
@@ -256,11 +260,10 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         """Create scan task for counting rows."""
         fields = pushdowns.aggregation_required_column_names()
         new_schema = Schema.from_pyarrow_schema(pa.schema([pa.field(fields[0], pa.uint64())]))
-        open_kwargs = getattr(self._ds, "_lance_open_kwargs", None)
         yield ScanTask.python_factory_func_scan_task(
             module=_lancedb_count_result_function.__module__,
             func_name=_lancedb_count_result_function.__name__,
-            func_args=(self._ds.uri, open_kwargs, fields[0], self._combine_filters_to_arrow()),
+            func_args=(self._ds.uri, self._open_kwargs, fields[0], self._combine_filters_to_arrow()),
             schema=new_schema._schema,
             num_rows=1,
             size_bytes=None,
@@ -276,7 +279,6 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         assert self._pushed_filters is None, "Expected no filters when creating scan tasks with limit and no filters"
         assert pushdowns.limit is not None, "Expected a limit when creating scan tasks with limit and no filters"
 
-        open_kwargs = getattr(self._ds, "_lance_open_kwargs", None)
         fragments = self._ds.get_fragments()
         remaining_limit = pushdowns.limit
 
@@ -301,7 +303,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                     func_name=_lancedb_table_factory_function.__name__,
                     func_args=(
                         self._ds.uri,
-                        open_kwargs,
+                        self._open_kwargs,
                         [fragment.fragment_id],
                         required_columns,
                         None,
@@ -321,7 +323,6 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
         self, pushdowns: PyPushdowns, required_columns: list[str] | None, nearest_option: dict[str, Any] | None = None
     ) -> Iterator[ScanTask]:
         """Create regular scan tasks without count pushdown."""
-        open_kwargs = getattr(self._ds, "_lance_open_kwargs", None)
         fragments = self._ds.get_fragments()
         pushed_expr = self._combine_filters_to_arrow()
 
@@ -336,7 +337,7 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
                 func_name=_lancedb_table_factory_function.__name__,
                 func_args=(
                     self._ds.uri,
-                    open_kwargs,
+                    self._open_kwargs,
                     fragment_ids,
                     required_columns,
                     pushed_expr,
@@ -460,15 +461,15 @@ class LanceDBScanOperator(ScanOperator, SupportsPushdownFilters):
     def _nearest_default_option(self) -> dict[str, Any] | None:
         """Return the default nearest option configured on the Lance dataset, if any.
 
-        Prefer Daft-specific `_daft_default_scan_options` to preserve options stripped before `lance.dataset` (e.g., `nearest`).
+        Daft keeps the original options explicitly because unsupported planning
+        keys such as ``nearest`` are stripped before calling ``lance.dataset``.
         """
-        default_opts = getattr(self._ds, "_daft_default_scan_options", None)
+        default_opts = self._default_scan_options
         if not isinstance(default_opts, dict):
+            # Preserve direct ``LanceDBScanOperator(ds)`` compatibility. This
+            # is Lance's own stored constructor option, not Daft metadata
+            # attached to the third-party object.
             default_opts = getattr(self._ds, "_default_scan_options", None)
-        if not isinstance(default_opts, dict):
-            open_kwargs = getattr(self._ds, "_lance_open_kwargs", None)
-            if isinstance(open_kwargs, dict):
-                default_opts = open_kwargs.get("default_scan_options")
         if not isinstance(default_opts, dict):
             return None
 
