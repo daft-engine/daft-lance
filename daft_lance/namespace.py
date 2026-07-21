@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import lance
 from lance_namespace import DeclareTableResponse, DescribeTableResponse, LanceNamespace
@@ -66,10 +66,15 @@ def _normalize_file_uri(location: str) -> str:
     ``file:///...``), but the location is later used where a plain path is
     required: ``write_fragments(dataset_uri=...)``, ``LanceDataset.commit``,
     and ``pathlib`` checks in the sink. Object-store URIs pass through as-is.
+
+    The path is percent-decoded: namespaces vend URI-encoded locations (a table
+    under ``daft lance/`` comes back as ``daft%20lance/``), and writing to the
+    literal encoded form would create a different directory than the one
+    ``describe_table`` later resolves to.
     """
     parsed = urlparse(location)
     if parsed.scheme == "file":
-        return parsed.path
+        return unquote(parsed.path)
     return location
 
 
