@@ -101,7 +101,7 @@ def read_lance(
             each fragment will be processed individually (default behavior).
         include_fragment_id : Optional, bool
             Whether to display fragment_id.
-            if you have the behavior of 'merge_columns_df' or 'write_lance(mode = 'merge')', the `include_fragment_id` must be set to True
+            Set this to True when preparing input for ``merge_columns_df``.
         checkpoint: Optional :class:`daft.CheckpointConfig` for progress tracking across runs. Bundles the
             checkpoint store, the source key column (``on=``), and optional anti-join tuning. Rows whose key
             already exists in the store are skipped on re-run. Requires the Ray runner.
@@ -269,7 +269,7 @@ def merge_columns(
         read_columns=read_columns,
         reader_schema=reader_schema,
         storage_options=dataset_handle.storage_options,
-        namespace_kwargs=dataset_handle.namespace_kwargs,
+        namespace_kwargs=dataset_handle.commit_kwargs,
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
     )
@@ -383,7 +383,7 @@ def merge_columns_df(
         read_columns=read_columns,
         reader_schema=reader_schema,
         storage_options=dataset_handle.storage_options,
-        namespace_kwargs=dataset_handle.namespace_kwargs,
+        namespace_kwargs=dataset_handle.commit_kwargs,
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
         left_on=left_on,
@@ -536,6 +536,7 @@ def create_scalar_index(
         replace=replace,
         storage_options=dataset_handle.storage_options,
         namespace_kwargs=dataset_handle.namespace_kwargs,
+        namespace_commit_kwargs=dataset_handle.commit_kwargs,
         fragment_group_size=fragment_group_size,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
@@ -661,6 +662,12 @@ def write_lance(
 
     Returns:
         DataFrame: write statistics (num_fragments, num_deleted_rows, num_small_files, version).
+
+    Note:
+        Target-dependent validation is performed when the returned DataFrame is
+        executed (for example, by ``collect()``), not while the logical write
+        plan is constructed. This includes missing/duplicate targets, append
+        schema compatibility, and storage-version conflicts.
 
     Examples:
         >>> import daft, daft_lance

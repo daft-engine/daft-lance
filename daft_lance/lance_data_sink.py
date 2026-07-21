@@ -28,6 +28,7 @@ from daft_lance._blob import (
 )
 from daft_lance.namespace import (
     ResolvedNamespaceTable,
+    get_namespace_commit_kwargs,
     get_namespace_kwargs,
     get_write_fragments_kwargs,
     merge_storage_options,
@@ -99,6 +100,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         # Construction must stay side-effect free: no namespace calls, no dataset opens.
         self._table_uri: str | None = None
         self._storage_options: dict[str, str] | None = None
+        self._managed_versioning = False
         self._data_storage_version: LanceStorageVersion | None = None
         self._effective_pyarrow_schema: pa.Schema | None = None
         self._version: int = 0
@@ -123,6 +125,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         resolved = self._resolve_table()
         self._table_uri = resolved.uri
         self._storage_options = self._merged_storage_options(resolved)
+        self._managed_versioning = resolved.managed_versioning
 
         existing = self._absorb_existing_dataset()
         existing_version = getattr(existing, "data_storage_version", None) if existing is not None else None
@@ -145,6 +148,15 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         return get_namespace_kwargs(self._namespace_impl, self._namespace_properties, self._table_id)
 
     @property
+    def _namespace_commit_kwargs(self) -> dict[str, Any]:
+        return get_namespace_commit_kwargs(
+            self._namespace_impl,
+            self._namespace_properties,
+            self._table_id,
+            self._managed_versioning,
+        )
+
+    @property
     def _dataset_uri_arg(self) -> str | None:
         return None if self._namespace_impl is not None and self._table_id is not None else self._table_uri
 
@@ -165,14 +177,12 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _merged_storage_options(self, resolved: ResolvedNamespaceTable) -> dict[str, str] | None:
         """Layer storage options: io_config-derived < user-provided < namespace-vended.
 
-        For a plain uri, non-empty user-provided options replace the
-        io_config-derived ones entirely (falsy fallthrough, matching the read
-        entry points via construct_lance_dataset).
+        For a plain URI, explicitly provided options (including ``{}``) replace
+        the io_config-derived ones, preserving the historical sink behavior.
         """
         io_derived = io_config_to_storage_options(self._io_config, resolved.uri)
         if self._uri is not None:
-            base = self._user_storage_options or io_derived
-            return merge_storage_options(base, resolved.storage_options)
+            return self._user_storage_options if self._user_storage_options is not None else io_derived
         return merge_storage_options(io_derived, self._user_storage_options, resolved.storage_options)
 
     @staticmethod
@@ -415,7 +425,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             operation,
             read_version=self._version,
             storage_options=self._storage_options,
-            **self._namespace_kwargs,
+            **self._namespace_commit_kwargs,
         )
         stats = dataset.stats.dataset_stats()
         stats_dict = MicroPartition.from_pydict(

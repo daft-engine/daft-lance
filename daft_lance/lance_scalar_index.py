@@ -140,6 +140,7 @@ def create_scalar_index_internal(
     replace: bool = False,
     storage_options: dict[str, Any] | None = None,
     namespace_kwargs: dict[str, Any] | None = None,
+    namespace_commit_kwargs: dict[str, Any] | None = None,
     fragment_group_size: int | None = None,
     num_partitions: int | None = None,
     max_concurrency: int | None = None,
@@ -314,6 +315,7 @@ def create_scalar_index_internal(
             replace=replace,
             storage_options=storage_options,
             namespace_kwargs=namespace_kwargs,
+            namespace_commit_kwargs=namespace_commit_kwargs,
             fragment_data=fragment_data,
             fragment_ids_to_use=fragment_ids_to_use,
             num_partitions=num_partitions,
@@ -430,6 +432,7 @@ def _create_partitioned_index(
     replace: bool,
     storage_options: dict[str, Any] | None,
     namespace_kwargs: dict[str, Any] | None,
+    namespace_commit_kwargs: dict[str, Any] | None,
     fragment_data: list[dict[str, list[int]]],
     fragment_ids_to_use: list[int],
     num_partitions: int | None,
@@ -519,7 +522,7 @@ def _create_partitioned_index(
         create_index_op,
         read_version=lance_ds.version,
         storage_options=storage_options,
-        **(namespace_kwargs or {}),
+        **(namespace_commit_kwargs or namespace_kwargs or {}),
     )
 
     logger.info("Index %s created successfully with ID %s", name, index_id)

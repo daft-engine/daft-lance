@@ -1,7 +1,7 @@
 """Unit-level tests for LanceDataSink internals.
 
-Phase 1 covers the _load_existing_dataset typed-exception path and the Lance
-message-format pin.
+These tests also pin the sink lifecycle contract: construction validates local
+arguments only, while target-dependent validation runs in ``start()``.
 """
 
 from __future__ import annotations
@@ -28,6 +28,26 @@ def test_load_existing_dataset_missing_returns_none_for_create(tmp_path):
     sink.start()
     # Start succeeds; the dataset will be created on the first write.
     assert sink is not None
+
+
+def test_uri_create_existing_error_is_deferred_until_start(tmp_path):
+    uri = str(tmp_path / "existing")
+    lance.write_dataset(pa.table({"a": [1]}), uri)
+
+    sink = LanceDataSink(uri=uri, schema=pa.schema([("a", pa.int64())]), mode="create")
+
+    with pytest.raises(ValueError, match="already exists"):
+        sink.start()
+
+
+def test_uri_append_schema_error_is_deferred_until_start(tmp_path):
+    uri = str(tmp_path / "schema-mismatch")
+    lance.write_dataset(pa.table({"a": pa.array([1], type=pa.int64())}), uri)
+
+    sink = LanceDataSink(uri=uri, schema=pa.schema([("a", pa.struct([("value", pa.string())]))]), mode="append")
+
+    with pytest.raises(ValueError, match="Schema of data does not match"):
+        sink.start()
 
 
 def test_mode_merge_rejected_at_construction(tmp_path):

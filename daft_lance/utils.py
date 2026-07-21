@@ -10,6 +10,7 @@ from daft.dependencies import pa
 from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.schema import Schema as DaftSchema
 from daft_lance.namespace import (
+    get_namespace_commit_kwargs,
     get_namespace_kwargs,
     has_namespace_params,
     merge_storage_options,
@@ -37,6 +38,7 @@ class LanceDatasetHandle:
     dataset: lance.LanceDataset
     uri: str
     open_kwargs: dict[str, Any] = field(repr=False)
+    managed_versioning: bool = False
     default_scan_options: dict[str, Any] | None = field(default=None, repr=False)
 
     @property
@@ -50,6 +52,15 @@ class LanceDatasetHandle:
             self.open_kwargs.get("namespace_impl"),
             self.open_kwargs.get("namespace_properties"),
             self.open_kwargs.get("table_id"),
+        )
+
+    @property
+    def commit_kwargs(self) -> dict[str, Any]:
+        return get_namespace_commit_kwargs(
+            self.open_kwargs.get("namespace_impl"),
+            self.open_kwargs.get("namespace_properties"),
+            self.open_kwargs.get("table_id"),
+            self.managed_versioning,
         )
 
 
@@ -140,6 +151,7 @@ def construct_lance_dataset_handle(
     validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
     resolved_uri = str(uri) if uri is not None else None
     namespace_storage_options = None
+    managed_versioning = False
     if resolved_uri is None:
         resolved = resolve_namespace_table(
             namespace_impl=namespace_impl,
@@ -150,6 +162,7 @@ def construct_lance_dataset_handle(
         if resolved is not None:
             resolved_uri = resolved.uri
             namespace_storage_options = resolved.storage_options
+            managed_versioning = resolved.managed_versioning
     if resolved_uri is None:
         raise ValueError("Unable to resolve Lance dataset URI.")
 
@@ -193,6 +206,7 @@ def construct_lance_dataset_handle(
         dataset=dataset,
         uri=resolved_uri,
         open_kwargs=effective_kwargs,
+        managed_versioning=managed_versioning,
         # Preserve the full user-provided defaults (including nearest) for
         # Daft's planning even if keys were stripped before calling Lance.
         default_scan_options=original_default_scan_options if isinstance(original_default_scan_options, dict) else None,

@@ -357,6 +357,35 @@ def test_namespace_overwrite_uses_plain_describe(monkeypatch: pytest.MonkeyPatch
     assert requests[0].vend_credentials is True
 
 
+def test_namespace_response_preserves_managed_versioning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    response = SimpleNamespace(
+        location=str(tmp_path / "managed.lance"),
+        storage_options={"token": "temporary"},
+        managed_versioning=True,
+    )
+
+    resolved = namespace_mod._resolved_from_response(response)
+
+    assert resolved.managed_versioning is True
+
+
+def test_namespace_commit_kwargs_include_managed_versioning(monkeypatch: pytest.MonkeyPatch) -> None:
+    namespace_client = object()
+    monkeypatch.setattr(
+        namespace_mod,
+        "get_namespace_kwargs",
+        lambda *args: {"namespace_client": namespace_client, "table_id": ["catalog", "table"]},
+    )
+
+    kwargs = namespace_mod.get_namespace_commit_kwargs("rest", {}, ["catalog", "table"], True)
+
+    assert kwargs == {
+        "namespace_client": namespace_client,
+        "table_id": ["catalog", "table"],
+        "namespace_client_managed_versioning": True,
+    }
+
+
 def test_construct_lance_dataset_empty_storage_options_falls_back_to_io_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -436,8 +465,8 @@ def test_namespace_requests_explicitly_vend_credentials(monkeypatch: pytest.Monk
     assert all(request.vend_credentials is True for request in requests)
 
 
-def test_sink_empty_storage_options_falls_back_to_io_config(tmp_path: Path) -> None:
-    """storage_options={} must behave like the read entry points: fall through to io_config."""
+def test_sink_empty_storage_options_remain_explicit_for_uri(tmp_path: Path) -> None:
+    """The URI sink historically treats storage_options={} as explicitly empty."""
     from daft.io import IOConfig, S3Config
 
     io_config = IOConfig(s3=S3Config(key_id="io-key", access_key="io-secret", region_name="us-east-1"))
@@ -445,8 +474,7 @@ def test_sink_empty_storage_options_falls_back_to_io_config(tmp_path: Path) -> N
 
     sink = LanceDataSink("s3://bucket/t.lance", schema, "create", io_config, storage_options={})
     merged = sink._merged_storage_options(namespace_mod.ResolvedNamespaceTable(uri="s3://bucket/t.lance"))
-    assert merged is not None
-    assert merged["access_key_id"] == "io-key"
+    assert merged == {}
 
 
 def test_construct_lance_dataset_storage_options_priority(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -471,6 +499,7 @@ def test_construct_lance_dataset_storage_options_priority(monkeypatch: pytest.Mo
         lambda **kwargs: namespace_mod.ResolvedNamespaceTable(
             uri="s3://bucket/t.lance",
             storage_options={"access_key_id": "vended-key", "session_token": "vended-token"},
+            managed_versioning=True,
         ),
     )
 
@@ -493,6 +522,7 @@ def test_construct_lance_dataset_storage_options_priority(monkeypatch: pytest.Mo
     assert captured["uri"] is None  # namespace addressing passes uri=None
     assert handle.storage_options == merged
     assert handle.uri == "s3://bucket/t.lance"
+    assert handle.managed_versioning is True
     assert not hasattr(handle.dataset, "_lance_open_kwargs")
 
 

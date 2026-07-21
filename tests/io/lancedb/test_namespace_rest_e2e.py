@@ -15,13 +15,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_rest_namespace_write_read_append_roundtrip() -> None:
+def test_rest_namespace_write_read_append_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
     import lance
     import lance_namespace as ln
     from lance_namespace import CreateNamespaceRequest, DescribeTableRequest, NamespaceExistsRequest
     from lance_namespace.errors import TableAlreadyExistsError
 
     namespace_properties = {"uri": os.environ["DAFT_LANCE_REST_URI"]}
+
+    # Ensure object-store access in this test cannot silently succeed through
+    # ambient AWS credentials instead of credentials vended by the catalog.
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", os.devnull)
+    monkeypatch.setenv("AWS_CONFIG_FILE", os.devnull)
     catalog = os.environ.get("DAFT_LANCE_REST_CATALOG", "lance_catalog")
     schema = os.environ.get("DAFT_LANCE_REST_SCHEMA", "daft_ns_e2e")
     table_id = [catalog, schema, f"orders_{uuid.uuid4().hex[:8]}"]
@@ -47,9 +66,10 @@ def test_rest_namespace_write_read_append_roundtrip() -> None:
         **ns,
     ).collect()
 
-    describe = namespace.describe_table(DescribeTableRequest(id=table_id))
+    describe = namespace.describe_table(DescribeTableRequest(id=table_id, vend_credentials=True))
     location = getattr(describe, "location", None) or getattr(describe, "table_uri", None)
     assert location
+    assert describe.storage_options, "catalog must vend storage options for this integration test"
 
     result = daft_lance.read_lance(table_id=table_id, **ns).to_pydict()
     assert result == {

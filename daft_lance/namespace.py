@@ -113,6 +113,19 @@ def get_namespace_kwargs(
     return {"namespace_client": namespace, "table_id": table_id}
 
 
+def get_namespace_commit_kwargs(
+    namespace_impl: str | None,
+    namespace_properties: dict[str, str] | None,
+    table_id: list[str] | None,
+    managed_versioning: bool,
+) -> dict[str, Any]:
+    """Namespace kwargs for commit APIs, including catalog-managed versioning."""
+    kwargs = get_namespace_kwargs(namespace_impl, namespace_properties, table_id)
+    if kwargs:
+        kwargs["namespace_client_managed_versioning"] = managed_versioning
+    return kwargs
+
+
 # `lance.fragment.write_fragments` accepts the same namespace kwargs as `lance.dataset`.
 get_write_fragments_kwargs = get_namespace_kwargs
 
@@ -133,16 +146,18 @@ def _response_location(response: Any) -> str:
 
 @dataclass(frozen=True)
 class ResolvedNamespaceTable:
-    """A namespace table resolved to a physical location and storage options."""
+    """A namespace table resolved to its physical access and versioning policy."""
 
     uri: str
     storage_options: dict[str, str] | None = None
+    managed_versioning: bool = False
 
 
 def _resolved_from_response(response: Any) -> ResolvedNamespaceTable:
     return ResolvedNamespaceTable(
         uri=_response_location(response),
         storage_options=_storage_options(response),
+        managed_versioning=getattr(response, "managed_versioning", None) is True,
     )
 
 
