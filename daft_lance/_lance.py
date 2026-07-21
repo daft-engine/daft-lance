@@ -8,8 +8,10 @@ from daft import context
 from daft.api_annotations import PublicAPI
 from daft.daft import IOConfig, ScanOperatorHandle
 from daft.dataframe import DataFrame
+from daft.dependencies import pa
 from daft.io._checkpoint import attach_checkpoint
 from daft.logical.builder import LogicalPlanBuilder
+from daft.schema import Schema
 
 from .lance_compaction import compact_files_internal
 from .lance_data_sink import LanceDataSink
@@ -24,7 +26,6 @@ if TYPE_CHECKING:
     from lance.udf import BatchUDF
 
     from daft.checkpoint import CheckpointConfig
-    from daft.dependencies import pa
 
 
 @PublicAPI
@@ -639,7 +640,7 @@ def write_lance(
     uri: str | pathlib.Path | None = None,
     mode: Literal["create", "append", "overwrite"] = "create",
     io_config: IOConfig | None = None,
-    schema: Any | None = None,
+    schema: Schema | pa.Schema | None = None,
     *,
     table_id: list[str] | None = None,
     namespace_impl: str | None = None,

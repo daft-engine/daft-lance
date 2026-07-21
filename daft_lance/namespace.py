@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import lance
+from lance_namespace import DeclareTableResponse, DescribeTableResponse, LanceNamespace
 
 _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "16"))
 
@@ -73,14 +74,18 @@ def _normalize_file_uri(location: str) -> str:
 
 
 @lru_cache(maxsize=_NAMESPACE_CACHE_SIZE)
-def _get_cached_namespace(namespace_impl: str, namespace_properties_tuple: tuple[tuple[str, str], ...] | None) -> Any:
+def _get_cached_namespace(
+    namespace_impl: str, namespace_properties_tuple: tuple[tuple[str, str], ...] | None
+) -> LanceNamespace:
     import lance_namespace as ln
 
     namespace_properties = dict(namespace_properties_tuple) if namespace_properties_tuple else {}
     return ln.connect(namespace_impl, namespace_properties)
 
 
-def get_or_create_namespace(namespace_impl: str | None, namespace_properties: dict[str, str] | None) -> Any | None:
+def get_or_create_namespace(
+    namespace_impl: str | None, namespace_properties: dict[str, str] | None
+) -> LanceNamespace | None:
     """Per-process namespace client pool.
 
     ``ln.connect`` may build HTTP clients / perform auth, and workers re-derive
@@ -130,14 +135,14 @@ def get_namespace_commit_kwargs(
 get_write_fragments_kwargs = get_namespace_kwargs
 
 
-def _storage_options(response: Any) -> dict[str, str] | None:
+def _storage_options(response: DescribeTableResponse | DeclareTableResponse) -> dict[str, str] | None:
     storage_options = getattr(response, "storage_options", None)
     if storage_options is None:
         return None
     return dict(storage_options)
 
 
-def _response_location(response: Any) -> str:
+def _response_location(response: DescribeTableResponse | DeclareTableResponse) -> str:
     location = getattr(response, "location", None) or getattr(response, "table_uri", None)
     if not location:
         raise ValueError("Namespace response did not include a table location.")
@@ -153,7 +158,7 @@ class ResolvedNamespaceTable:
     managed_versioning: bool = False
 
 
-def _resolved_from_response(response: Any) -> ResolvedNamespaceTable:
+def _resolved_from_response(response: DescribeTableResponse | DeclareTableResponse) -> ResolvedNamespaceTable:
     return ResolvedNamespaceTable(
         uri=_response_location(response),
         storage_options=_storage_options(response),
@@ -161,7 +166,7 @@ def _resolved_from_response(response: Any) -> ResolvedNamespaceTable:
     )
 
 
-def _describe_table(namespace: Any, table_id: list[str]) -> Any:
+def _describe_table(namespace: LanceNamespace, table_id: list[str]) -> DescribeTableResponse:
     from lance_namespace import DescribeTableRequest
 
     # vend_credentials is explicit: when unset, whether the namespace returns
@@ -169,7 +174,7 @@ def _describe_table(namespace: Any, table_id: list[str]) -> Any:
     return namespace.describe_table(DescribeTableRequest(id=table_id, vend_credentials=True))
 
 
-def _declare_table(namespace: Any, table_id: list[str]) -> ResolvedNamespaceTable:
+def _declare_table(namespace: LanceNamespace, table_id: list[str]) -> ResolvedNamespaceTable:
     from lance_namespace import DeclareTableRequest
 
     response = namespace.declare_table(DeclareTableRequest(id=table_id, location=None, vend_credentials=True))
