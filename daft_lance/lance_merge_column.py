@@ -24,6 +24,14 @@ if TYPE_CHECKING:
 _FRAGMENT_HANDLER_RETURN_DTYPE = DataType.struct({"fragment_meta": DataType.binary(), "schema": DataType.binary()})
 
 
+def _include_untouched_fragments(fragment_metas: list[Any], lance_ds: lance.LanceDataset) -> None:
+    """Add metadata for fragments that were not rewritten by a partial merge."""
+    touched_fragment_ids = {int(fragment_meta.to_json()["id"]) for fragment_meta in fragment_metas}
+    fragment_metas.extend(
+        fragment.metadata for fragment in lance_ds.get_fragments() if fragment.fragment_id not in touched_fragment_ids
+    )
+
+
 @daft_cls
 class FragmentHandler:
     def __init__(
@@ -464,7 +472,6 @@ def _merge_fast_path(
     commit_messages = grouped.collect().to_pydict()["commit_message"]
     new_schema = None
     fragment_metas: list[Any] = []
-    enriched_frag_ids: set[int] = set()
 
     for commit_message in commit_messages:
         fragment_meta_bytes = commit_message["fragment_meta"]
@@ -473,18 +480,13 @@ def _merge_fast_path(
             continue
         fmeta = daft.pickle.loads(fragment_meta_bytes)
         fragment_metas.append(fmeta)
-        # pylance 6.0.0 FragmentMetadata exposes the id only via to_json()
-        enriched_frag_ids.add(int(fmeta.to_json()["id"]))
         if new_schema is None:
             new_schema = daft.pickle.loads(schema_bytes)
 
     if new_schema is None:
         raise ValueError("Fast path produced no fragment metadata")
 
-    # Include untouched fragments (they'll get NULLs for new columns)
-    for frag in lance_ds.get_fragments():
-        if frag.fragment_id not in enriched_frag_ids:
-            fragment_metas.append(frag.metadata)
+    _include_untouched_fragments(fragment_metas, lance_ds)
 
     op = lance.LanceOperation.Merge(fragment_metas, LanceSchema.from_pyarrow(new_schema))
     return lance.LanceDataset.commit(
@@ -534,6 +536,7 @@ def _merge_slow_path(
             continue
     if new_schema is None:
         return lance_ds
+    _include_untouched_fragments(fragment_metas, lance_ds)
     op = lance.LanceOperation.Merge(fragment_metas, new_schema)
     return lance_ds.commit(
         open_context.uri,
