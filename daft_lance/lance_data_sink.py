@@ -467,8 +467,18 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 self._mem_wal_total_bytes,
             )
             from daft_lance.lance_compaction import compact_files_internal
+            from daft_lance.namespace import DatasetOpenContext
 
-            compact_files_internal(dataset)
+            # Mem-WAL rejects namespace addressing up front (issue #54), so this
+            # is always a uri-only table and the context carries no triple.
+            compact_files_internal(
+                dataset,
+                DatasetOpenContext.from_dataset(
+                    dataset,
+                    str(self._dataset_uri_arg),
+                    storage_options=self._storage_options,
+                ),
+            )
             dataset = lance.dataset(
                 self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
             )

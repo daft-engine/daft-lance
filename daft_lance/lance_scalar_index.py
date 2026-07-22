@@ -9,7 +9,7 @@ import daft
 from daft import execution_config_ctx, from_pylist
 
 if TYPE_CHECKING:
-    import pathlib
+    from daft_lance.namespace import DatasetOpenContext
 
 import lance
 
@@ -27,7 +27,7 @@ class FragmentIndexHandler:
 
     def __init__(
         self,
-        lance_ds: lance.LanceDataset,
+        open_context: DatasetOpenContext,
         column: str,
         index_type: str,
         name: str,
@@ -35,13 +35,19 @@ class FragmentIndexHandler:
         replace: bool,
         **kwargs: Any,
     ) -> None:
-        self.lance_ds = lance_ds
+        self.open_context = open_context
         self.column = column
         self.index_type = index_type
         self.name = name
         self.fragment_uuid = fragment_uuid
         self.replace = replace
         self.kwargs = kwargs
+        self._lance_ds: lance.LanceDataset | None = None
+
+    def _dataset(self) -> lance.LanceDataset:
+        if self._lance_ds is None:
+            self._lance_ds = self.open_context.open_pinned()
+        return self._lance_ds
 
     def __call__(self, fragment_ids: list[int]) -> bool:
         """Process a batch of fragment IDs for scalar index creation."""
@@ -50,7 +56,7 @@ class FragmentIndexHandler:
             fragment_ids,
         )
 
-        self.lance_ds.create_scalar_index(
+        self._dataset().create_scalar_index(
             column=self.column,
             index_type=self.index_type,  # type: ignore[arg-type]
             name=self.name,
@@ -74,17 +80,23 @@ class SegmentedFragmentIndexHandler:
 
     def __init__(
         self,
-        lance_ds: lance.LanceDataset,
+        open_context: DatasetOpenContext,
         column: str,
         index_type: str,
         name: str,
         **kwargs: Any,
     ) -> None:
-        self.lance_ds = lance_ds
+        self.open_context = open_context
         self.column = column
         self.index_type = index_type
         self.name = name
         self.kwargs = kwargs
+        self._lance_ds: lance.LanceDataset | None = None
+
+    def _dataset(self) -> lance.LanceDataset:
+        if self._lance_ds is None:
+            self._lance_ds = self.open_context.open_pinned()
+        return self._lance_ds
 
     def __call__(self, fragment_ids: list[int], shard_id: int | None = None) -> bytes:
         """Build an independent index segment and return its pickled metadata."""
@@ -104,7 +116,7 @@ class SegmentedFragmentIndexHandler:
         # scalar index segments through this public API. Segment creation always
         # uses ``replace=False`` because replacement, if supported, must happen
         # in the final manifest commit rather than independently in each worker.
-        index_meta = self.lance_ds.create_index_uncommitted(
+        index_meta = self._dataset().create_index_uncommitted(
             column=self.column,
             index_type=self.index_type,
             name=self.name,
@@ -132,15 +144,12 @@ def _existing_index_names(lance_ds: lance.LanceDataset) -> set[str]:
 
 def create_scalar_index_internal(
     lance_ds: lance.LanceDataset,
-    uri: str | pathlib.Path,
+    open_context: DatasetOpenContext,
     *,
     column: str,
     index_type: str = "INVERTED",
     name: str | None = None,
     replace: bool = False,
-    storage_options: dict[str, Any] | None = None,
-    namespace_kwargs: dict[str, Any] | None = None,
-    namespace_commit_kwargs: dict[str, Any] | None = None,
     fragment_group_size: int | None = None,
     num_partitions: int | None = None,
     max_concurrency: int | None = None,
@@ -148,6 +157,10 @@ def create_scalar_index_internal(
     **kwargs: Any,
 ) -> None:
     """Internal implementation of distributed scalar index creation.
+
+    ``lance_ds`` is the driver's live dataset (planning, validation, commits);
+    ``open_context`` is the serializable handle workers reopen from and the
+    single source of uri, storage options and namespace kwargs.
 
     When ``segmented=True``, ``BITMAP``, ``BTREE``, and ``INVERTED`` use
     Lance's public segment-index workflow: each worker builds a fully
@@ -274,7 +287,7 @@ def create_scalar_index_internal(
 
     # Configure maximum concurrency for fragment batches
     if not fragment_data:
-        logger.info("No fragments found for dataset at %s; skipping scalar index creation.", uri)
+        logger.info("No fragments found for dataset at %s; skipping scalar index creation.", open_context.uri)
         return
 
     logger.info(
@@ -292,13 +305,10 @@ def create_scalar_index_internal(
     # older/unsupported distributed scalar index types.
     if segmented:
         _create_segmented_index(
-            lance_ds=lance_ds,
-            uri=uri,
+            open_context=open_context,
             column=column,
             index_type=index_type,
             name=name,
-            storage_options=storage_options,
-            namespace_kwargs=namespace_kwargs,
             fragment_data=fragment_data,
             fragment_ids_to_use=fragment_ids_to_use,
             num_partitions=num_partitions,
@@ -307,15 +317,11 @@ def create_scalar_index_internal(
         )
     else:
         _create_partitioned_index(
-            lance_ds=lance_ds,
-            uri=uri,
+            open_context=open_context,
             column=column,
             index_type=index_type,
             name=name,
             replace=replace,
-            storage_options=storage_options,
-            namespace_kwargs=namespace_kwargs,
-            namespace_commit_kwargs=namespace_commit_kwargs,
             fragment_data=fragment_data,
             fragment_ids_to_use=fragment_ids_to_use,
             num_partitions=num_partitions,
@@ -325,14 +331,11 @@ def create_scalar_index_internal(
 
 
 def _create_segmented_index(
-    lance_ds: lance.LanceDataset,
-    uri: str | pathlib.Path,
+    open_context: DatasetOpenContext,
     *,
     column: str,
     index_type: str,
     name: str,
-    storage_options: dict[str, Any] | None,
-    namespace_kwargs: dict[str, Any] | None,
     fragment_data: list[dict[str, list[int]]],
     fragment_ids_to_use: list[int],
     num_partitions: int | None,
@@ -351,7 +354,7 @@ def _create_segmented_index(
         max_concurrency=max_concurrency,
     )
     handler = handler_cls(
-        lance_ds=lance_ds,
+        open_context=open_context,
         column=column,
         index_type=index_type,
         name=name,
@@ -392,11 +395,7 @@ def _create_segmented_index(
 
     # Reload dataset to pick up the latest version (segment files were written
     # by workers against the version that was current at their invocation time).
-    lance_ds = lance.dataset(
-        None if namespace_kwargs else uri,
-        storage_options=storage_options,
-        **(namespace_kwargs or {}),
-    )
+    lance_ds = open_context.open_latest()
     index_metas = _prepare_index_segments_for_commit(lance_ds, index_type, index_metas)
 
     logger.info(
@@ -423,16 +422,12 @@ def _prepare_index_segments_for_commit(
 
 
 def _create_partitioned_index(
-    lance_ds: lance.LanceDataset,
-    uri: str | pathlib.Path,
+    open_context: DatasetOpenContext,
     *,
     column: str,
     index_type: str,
     name: str,
     replace: bool,
-    storage_options: dict[str, Any] | None,
-    namespace_kwargs: dict[str, Any] | None,
-    namespace_commit_kwargs: dict[str, Any] | None,
     fragment_data: list[dict[str, list[int]]],
     fragment_ids_to_use: list[int],
     num_partitions: int | None,
@@ -453,7 +448,7 @@ def _create_partitioned_index(
         max_concurrency=max_concurrency,
     )
     handler = handler_cls(
-        lance_ds=lance_ds,
+        open_context=open_context,
         column=column,
         index_type=index_type,
         name=name,
@@ -472,11 +467,7 @@ def _create_partitioned_index(
         df.collect()
 
     logger.info("Starting index metadata merging by reloading dataset to get latest state")
-    lance_ds = lance.dataset(
-        None if namespace_kwargs else uri,
-        storage_options=storage_options,
-        **(namespace_kwargs or {}),
-    )
+    lance_ds = open_context.open_latest()
     lance_ds.merge_index_metadata(index_id, index_type)
 
     logger.info("Starting atomic index creation and commit")
@@ -518,11 +509,11 @@ def _create_partitioned_index(
 
     # Commit the index operation atomically
     lance.LanceDataset.commit(
-        uri,
+        open_context.uri,
         create_index_op,
         read_version=lance_ds.version,
-        storage_options=storage_options,
-        **(namespace_commit_kwargs or namespace_kwargs or {}),
+        storage_options=open_context.storage_options,
+        **open_context.commit_kwargs,
     )
 
     logger.info("Index %s created successfully with ID %s", name, index_id)

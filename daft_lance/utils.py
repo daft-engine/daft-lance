@@ -10,6 +10,7 @@ from daft.dependencies import pa
 from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.schema import Schema as DaftSchema
 from daft_lance.namespace import (
+    DatasetOpenContext,
     get_namespace_commit_kwargs,
     get_namespace_kwargs,
     has_namespace_params,
@@ -61,6 +62,29 @@ class LanceDatasetHandle:
             self.open_kwargs.get("namespace_properties"),
             self.open_kwargs.get("table_id"),
             self.managed_versioning,
+        )
+
+    def worker_open_context(self) -> DatasetOpenContext:
+        """Derive the serializable context distributed maintenance workers reopen from.
+
+        Note this pins :attr:`dataset`'s *resolved* version rather than the
+        caller's ``version``/``asof`` request, so every worker lands on the exact
+        snapshot the driver planned against.
+        """
+        return DatasetOpenContext.from_dataset(
+            self.dataset,
+            self.uri,
+            storage_options=self.storage_options,
+            namespace_impl=self.open_kwargs.get("namespace_impl"),
+            namespace_properties=self.open_kwargs.get("namespace_properties"),
+            table_id=self.open_kwargs.get("table_id"),
+            managed_versioning=self.managed_versioning,
+            block_size=self.open_kwargs.get("block_size"),
+            index_cache_size=self.open_kwargs.get("index_cache_size"),
+            metadata_cache_size_bytes=self.open_kwargs.get("metadata_cache_size_bytes"),
+            # The stripped variant that was actually handed to pylance; the
+            # unstripped copy on this handle is for Daft planning only.
+            default_scan_options=self.open_kwargs.get("default_scan_options"),
         )
 
 

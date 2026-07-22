@@ -17,6 +17,7 @@ import pytest
 
 import daft
 from daft_lance.lance_merge_column import _can_use_fast_path, merge_columns_from_df
+from daft_lance.namespace import DatasetOpenContext
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -26,6 +27,11 @@ from daft_lance.lance_merge_column import _can_use_fast_path, merge_columns_from
 @pytest.fixture(scope="function")
 def ds_path(tmp_path_factory):
     yield str(tmp_path_factory.mktemp("fast_path"))
+
+
+def open_ctx(ds: lance.LanceDataset, path: str) -> DatasetOpenContext:
+    """Uri-only worker context pinned to the snapshot the caller opened."""
+    return DatasetOpenContext.from_dataset(ds, path)
 
 
 def create_dataset(path: str, fragments: list[dict]) -> lance.LanceDataset:
@@ -61,7 +67,7 @@ class TestBasicCorrectness:
         ds = create_dataset(ds_path, [{"id": [1, 2, 3], "val": [10, 20, 30]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("doubled", daft.col("val").cast(daft.DataType.int64()) * 2)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().to_pydict()
         assert result["doubled"] == [2 * v for v in result["val"]]
 
@@ -69,7 +75,7 @@ class TestBasicCorrectness:
         ds = create_dataset(ds_path, [{"x": [1.0, 2.0, 3.0]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("half", daft.col("x").cast(daft.DataType.float64()) / 2.0)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().to_pydict()
         for x, h in zip(result["x"], result["half"]):
             assert pytest.approx(x / 2.0, rel=1e-6) == h
@@ -78,7 +84,7 @@ class TestBasicCorrectness:
         ds = create_dataset(ds_path, [{"id": [1, 2], "name": ["alice", "bob"]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("greeting", daft.lit("hello_") + daft.col("name"))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().to_pydict()
         assert result["greeting"] == ["hello_alice", "hello_bob"]
 
@@ -88,7 +94,7 @@ class TestBasicCorrectness:
         df = df.with_column("a", daft.col("id").cast(daft.DataType.int64()) * 10)
         df = df.with_column("b", daft.col("id").cast(daft.DataType.float64()) + 0.5)
         df = df.with_column("c", daft.lit("row_") + daft.col("id").cast(daft.DataType.string()))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().to_pydict()
         assert result["a"] == [10, 20, 30]
         for i, b in zip(result["id"], result["b"]):
@@ -106,7 +112,7 @@ class TestBasicCorrectness:
         )
         df = read_with_metadata(ds_path)
         df = df.with_column("score", daft.col("val").cast(daft.DataType.float64()) * 1.5)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").to_pydict()
         for v, s in zip(result["val"], result["score"]):
             assert pytest.approx(v * 1.5, rel=1e-6) == s
@@ -122,7 +128,7 @@ class TestBasicCorrectness:
         )
         df = read_with_metadata(ds_path)
         df = df.with_column("z", daft.col("x").cast(daft.DataType.int64()) + daft.col("y").cast(daft.DataType.int64()))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("x").to_pydict()
         for x, y, z in zip(result["x"], result["y"], result["z"]):
             assert x + y == z
@@ -141,7 +147,7 @@ class TestFragmentIntegrity:
 
         df = read_with_metadata(ds_path)
         df = df.with_column("new_col", daft.lit(999))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         after = ds2.to_table().sort_by("id").to_pydict()
         assert after["id"] == before["id"]
@@ -158,7 +164,7 @@ class TestFragmentIntegrity:
         )
         df = read_with_metadata(ds_path)
         df = df.with_column("b", daft.lit(0))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         for frag in ds2.get_fragments():
             assert len(list(frag.data_files())) == 2
 
@@ -172,7 +178,7 @@ class TestFragmentIntegrity:
 
         df = read_with_metadata(ds_path)
         df = df.with_column("b", daft.lit(42))
-        merge_columns_from_df(df, ds, ds_path)
+        merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         for fname, old_hash in original_files.items():
             fpath = os.path.join(data_dir, fname)
@@ -192,7 +198,7 @@ class TestFragmentIntegrity:
 
         df = read_with_metadata(ds_path)
         df = df.with_column("w", daft.lit(0))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         assert ds2.count_rows() == original_count
         for frag, expected in zip(ds2.get_fragments(), per_frag_counts):
@@ -202,7 +208,7 @@ class TestFragmentIntegrity:
         ds = create_dataset(ds_path, [{"id": [1], "name": ["x"]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("score", daft.lit(3.14))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         schema_names = set(ds2.schema.names)
         assert "id" in schema_names
         assert "name" in schema_names
@@ -221,7 +227,7 @@ class TestRowOrdering:
         df = read_with_metadata(ds_path)
         # Daft doesn't guarantee order, but let's force a known computation
         df = df.with_column("doubled", daft.col("val").cast(daft.DataType.int64()) * 2)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").to_pydict()
         assert result["doubled"] == [20, 40, 60, 80, 100]
 
@@ -236,7 +242,7 @@ class TestRowOrdering:
         )
         df = read_with_metadata(ds_path)
         df = df.with_column("neg", daft.col("id").cast(daft.DataType.int64()) * -1)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").to_pydict()
         for i, n in zip(result["id"], result["neg"]):
             assert n == -i
@@ -310,12 +316,12 @@ class TestMultipleMerges:
         # First merge: add column A
         df = read_with_metadata(ds_path)
         df = df.with_column("a", daft.col("id").cast(daft.DataType.int64()) * 10)
-        ds = merge_columns_from_df(df, ds, ds_path)
+        ds = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         # Second merge: add column B
         df2 = read_with_metadata(ds_path)
         df2 = df2.with_column("b", daft.col("id").cast(daft.DataType.int64()) * 100)
-        ds2 = merge_columns_from_df(df2, ds, ds_path)
+        ds2 = merge_columns_from_df(df2, ds, open_ctx(ds, ds_path))
 
         result = ds2.to_table().sort_by("id").to_pydict()
         assert result["a"] == [10, 20, 30]
@@ -331,7 +337,7 @@ class TestMultipleMerges:
 
         df = read_with_metadata(ds_path)
         df = df.with_column("flag", daft.lit(True))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").to_pydict()
         assert result["flag"] == [True, True, True, True]
         assert len(result["id"]) == 4
@@ -342,14 +348,14 @@ class TestMultipleMerges:
         # Merge A
         df = read_with_metadata(ds_path)
         df = df.with_column("a", daft.col("val").cast(daft.DataType.int64()) + 1)
-        ds = merge_columns_from_df(df, ds, ds_path)
+        ds = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         check_a = ds.to_table().sort_by("id").to_pydict()
         assert check_a["a"] == [11, 21]
 
         # Merge B
         df2 = read_with_metadata(ds_path)
         df2 = df2.with_column("b", daft.col("val").cast(daft.DataType.int64()) + 2)
-        ds2 = merge_columns_from_df(df2, ds, ds_path)
+        ds2 = merge_columns_from_df(df2, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").to_pydict()
         assert result["a"] == [11, 21], "Column A corrupted by second merge"
         assert result["b"] == [12, 22]
@@ -366,7 +372,7 @@ class TestDataTypes:
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("x", daft.lit(42).cast(daft.DataType.int64()))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         assert ds2.schema.field("x").type == pa.int64()
         assert ds2.to_table().column("x").to_pylist() == [42, 42]
 
@@ -376,7 +382,7 @@ class TestDataTypes:
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("x", daft.lit(3.14).cast(daft.DataType.float32()))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         # Value is preserved even if type widens
         vals = ds2.to_table().column("x").to_pylist()
         assert all(pytest.approx(v, rel=1e-5) == 3.14 for v in vals)
@@ -385,21 +391,21 @@ class TestDataTypes:
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("x", daft.lit(2.718))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         assert ds2.schema.field("x").type == pa.float64()
 
     def test_type_string(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("label", daft.lit("hello"))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         assert ds2.to_table().column("label").to_pylist() == ["hello", "hello"]
 
     def test_type_bool(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1, 2, 3]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("flag", daft.col("id").cast(daft.DataType.int64()) > 1)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").column("flag").to_pylist()
         assert result == [False, True, True]
 
@@ -412,7 +418,7 @@ class TestDataTypes:
             (daft.col("id").cast(daft.DataType.int64()) % 2 != 0).cast(daft.DataType.int64())
             * daft.col("id").cast(daft.DataType.int64()),
         )
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").column("maybe").to_pylist()
         # id=1 → odd → 1*1=1, id=2 → even → 0*2=0, id=3 → odd → 1*3=3, id=4 → even → 0*4=0
         assert result == [1, 0, 3, 0]
@@ -428,7 +434,7 @@ class TestEdgeCases:
         ds = create_dataset(ds_path, [{"id": [1]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("x", daft.lit(99))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         assert ds2.to_table().to_pydict() == {"id": [1], "x": [99]}
 
     def test_large_fragment(self, ds_path):
@@ -436,7 +442,7 @@ class TestEdgeCases:
         ds = create_dataset(ds_path, [{"id": list(range(n))}])
         df = read_with_metadata(ds_path)
         df = df.with_column("neg", daft.col("id").cast(daft.DataType.int64()) * -1)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").to_pydict()
         assert len(result["id"]) == n
         for i, neg in zip(result["id"], result["neg"]):
@@ -449,7 +455,7 @@ class TestEdgeCases:
 
         df = read_with_metadata(ds_path)
         df = df.with_column("doubled", daft.col("id").cast(daft.DataType.int64()) * 2)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         result = ds2.to_table().sort_by("id").to_pydict()
         assert len(result["id"]) == 20
         for i, d in zip(result["id"], result["doubled"]):
@@ -460,14 +466,14 @@ class TestEdgeCases:
         df = read_with_metadata(ds_path)
         # No new columns added — only existing + metadata columns
         with pytest.raises(ValueError, match="No new columns"):
-            merge_columns_from_df(df, ds, ds_path)
+            merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
     def test_dataset_version_incremented(self, ds_path):
         ds = create_dataset(ds_path, [{"id": [1]}])
         v_before = ds.version
         df = read_with_metadata(ds_path)
         df = df.with_column("x", daft.lit(1))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
         assert ds2.version == v_before + 1
 
 
@@ -491,7 +497,7 @@ class TestFastVsSlowComparison:
         # Fast path: read with _rowaddr + fragment_id
         df_fast = read_with_metadata(fast_path)
         df_fast = df_fast.with_column("score", daft.col("val").cast(daft.DataType.float64()) * 2.5)
-        ds_fast = merge_columns_from_df(df_fast, ds_fast, fast_path)
+        ds_fast = merge_columns_from_df(df_fast, ds_fast, open_ctx(ds_fast, fast_path))
 
         # Slow path: read with fragment_id only, use business key
         df_slow = daft.read_lance(slow_path, include_fragment_id=True, default_scan_options={"with_row_address": True})
@@ -501,13 +507,12 @@ class TestFastVsSlowComparison:
         ds_slow = _merge_slow_path(
             df_slow,
             ds_slow,
-            slow_path,
+            open_ctx(ds_slow, slow_path),
             read_columns=["_rowaddr", "score"],
             left_on="_rowaddr",
             right_on="_rowaddr",
             reader_schema=None,
             batch_size=None,
-            storage_options=None,
         )
 
         fast_result = ds_fast.to_table().sort_by("id").to_pydict()
@@ -534,7 +539,7 @@ class TestReadBackIntegrity:
         )
         df = read_with_metadata(ds_path)
         df = df.with_column("score", daft.col("val").cast(daft.DataType.int64()) * 2)
-        merge_columns_from_df(df, ds, ds_path)
+        merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         ds2 = lance.dataset(ds_path)
         filtered = ds2.to_table(filter="score > 40")
@@ -546,7 +551,7 @@ class TestReadBackIntegrity:
         ds = create_dataset(ds_path, [{"id": [1, 2], "val": [10, 20]}])
         df = read_with_metadata(ds_path)
         df = df.with_column("new_col", daft.lit(42))
-        merge_columns_from_df(df, ds, ds_path)
+        merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         ds2 = lance.dataset(ds_path)
         projected = ds2.to_table(columns=["new_col"])
@@ -558,7 +563,7 @@ class TestReadBackIntegrity:
         ds = create_dataset(ds_path, [original])
         df = read_with_metadata(ds_path)
         df = df.with_column("extra", daft.lit("x"))
-        merge_columns_from_df(df, ds, ds_path)
+        merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         ds2 = lance.dataset(ds_path)
         result = ds2.to_table(columns=["id", "name"]).sort_by("id").to_pydict()
@@ -575,7 +580,7 @@ class TestReadBackIntegrity:
         )
         df = read_with_metadata(ds_path)
         df = df.with_column("doubled", daft.col("id").cast(daft.DataType.int64()) * 2)
-        merge_columns_from_df(df, ds, ds_path)
+        merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         ds2 = lance.dataset(ds_path)
         all_ids = []
@@ -634,7 +639,7 @@ class TestRegressions:
             return [np.array([float(i)] * N, dtype=np.float32) for i in ids.to_pylist()]
 
         df = df.with_column("embedding", _make_vec(daft.col("id")))
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         field = ds2.schema.field("embedding")
         # Type must be preserved: fixed_size_list<float32>[N], NOT list<float64>
@@ -676,7 +681,7 @@ class TestRegressions:
 
         df = read_with_metadata(ds_path)
         df = df.with_column("score", daft.col("id").cast(daft.DataType.int64()) * 10)
-        ds2 = merge_columns_from_df(df, ds, ds_path)
+        ds2 = merge_columns_from_df(df, ds, open_ctx(ds, ds_path))
 
         result = ds2.to_table().sort_by("id").to_pydict()
         assert result["score"] == [10, 20, 30], f"score is null or wrong (field ID collision): {result['score']}"

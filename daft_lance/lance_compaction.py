@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from lance import LanceDataset
 from lance.optimize import Compaction, CompactionMetrics, CompactionOptions, CompactionTask, RewriteResult
 
 import daft
+
+if TYPE_CHECKING:
+    from daft_lance.namespace import DatasetOpenContext
 
 logger = logging.getLogger(__name__)
 
@@ -16,23 +19,36 @@ class CompactionTaskUDF:
 
     def __init__(
         self,
-        lance_ds: LanceDataset,
+        open_context: DatasetOpenContext,
     ) -> None:
-        self.lance_ds = lance_ds
+        self.open_context = open_context
+        self._lance_ds: LanceDataset | None = None
+
+    def _dataset(self) -> LanceDataset:
+        # Opened once per UDF instance, not per task: the reopen costs a pinned
+        # manifest read, so it must not sit on the per-row path.
+        if self._lance_ds is None:
+            self._lance_ds = self.open_context.open_pinned()
+        return self._lance_ds
 
     def __call__(self, task: CompactionTask) -> RewriteResult:
-        rewrite = task.execute(self.lance_ds)
+        rewrite = task.execute(self._dataset())
         return rewrite
 
 
 def compact_files_internal(
     lance_ds: LanceDataset,
+    open_context: DatasetOpenContext,
     *,
     compaction_options: dict[str, Any] | None = None,
     partition_num: int | None = None,
     concurrency: int | None = None,
 ) -> CompactionMetrics | None:
-    """Execute Lance file compaction in distributed environment using Daft UDF style."""
+    """Execute Lance file compaction in distributed environment using Daft UDF style.
+
+    ``lance_ds`` is the driver's live dataset and stays on the driver for
+    planning and the final commit; ``open_context`` is what workers reopen from.
+    """
     logger.info("Starting UDF-style distributed compaction")
     plan = Compaction.plan(
         lance_ds,
@@ -59,7 +75,7 @@ def compact_files_internal(
         CompactionTaskUDF,
         max_concurrency=concurrency,
     )
-    df = df.select(WrappedRunner(lance_ds)(df["task"]).alias("rewrite"))
+    df = df.select(WrappedRunner(open_context)(df["task"]).alias("rewrite"))
     results = df.to_pandas()
 
     metrics = Compaction.commit(lance_ds, results["rewrite"].to_list())

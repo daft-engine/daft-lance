@@ -265,12 +265,10 @@ def merge_columns(
 
     return merge_columns_internal(
         dataset_handle.dataset,
-        dataset_handle.uri,
+        dataset_handle.worker_open_context(),
         transform=transform,
         read_columns=read_columns,
         reader_schema=reader_schema,
-        storage_options=dataset_handle.storage_options,
-        namespace_kwargs=dataset_handle.commit_kwargs,
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
     )
@@ -380,11 +378,9 @@ def merge_columns_df(
     return merge_columns_from_df(
         df,
         lance_ds=dataset_handle.dataset,
-        uri=dataset_handle.uri,
+        open_context=dataset_handle.worker_open_context(),
         read_columns=read_columns,
         reader_schema=reader_schema,
-        storage_options=dataset_handle.storage_options,
-        namespace_kwargs=dataset_handle.commit_kwargs,
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
         left_on=left_on,
@@ -530,14 +526,11 @@ def create_scalar_index(
 
     create_scalar_index_internal(
         lance_ds=dataset_handle.dataset,
-        uri=dataset_handle.uri,
+        open_context=dataset_handle.worker_open_context(),
         column=column,
         index_type=index_type,
         name=name,
         replace=replace,
-        storage_options=dataset_handle.storage_options,
-        namespace_kwargs=dataset_handle.namespace_kwargs,
-        namespace_commit_kwargs=dataset_handle.commit_kwargs,
         fragment_group_size=fragment_group_size,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
@@ -628,6 +621,7 @@ def compact_files(
 
     return compact_files_internal(
         lance_ds=dataset_handle.dataset,
+        open_context=dataset_handle.worker_open_context(),
         compaction_options=compaction_options,
         partition_num=partition_num,
         concurrency=concurrency,

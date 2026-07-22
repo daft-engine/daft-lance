@@ -10,6 +10,7 @@ import daft
 import daft_lance
 import daft_lance.namespace as namespace_mod
 from daft_lance.lance_data_sink import LanceDataSink
+from daft_lance.utils import construct_lance_dataset_handle
 
 
 def _dir_ns(tmp_path: Path) -> dict[str, Any]:
@@ -670,3 +671,178 @@ def test_namespace_requires_impl() -> None:
 def test_namespace_requires_uri_or_namespace() -> None:
     with pytest.raises(ValueError, match="Must provide either 'uri' OR"):
         daft_lance.read_lance()
+
+
+# ---------------------------------------------------------------------------
+# Distributed worker reopen (DatasetOpenContext)
+#
+# LanceDataset.__reduce__ drops _namespace_client / _table_id /
+# _namespace_client_managed_versioning, so a pickled dataset reaches a worker
+# stripped of its namespace identity. Maintenance paths therefore ship a
+# DatasetOpenContext and reopen. These tests lock that contract down.
+# ---------------------------------------------------------------------------
+
+
+def _ns_handle(tmp_path: Path, table: str = "ctx_tbl"):
+    daft_lance.write_lance(
+        daft.from_pydict({"score": [1, 2, 3, 4]}),
+        table_id=[table],
+        mode="create",
+        **_dir_ns(tmp_path),
+    ).collect()
+    return construct_lance_dataset_handle(None, table_id=[table], **_dir_ns(tmp_path))
+
+
+def test_worker_open_context_is_free_of_live_objects(tmp_path: Path) -> None:
+    """The context must survive pickling without dragging unpicklable state along."""
+    import pickle
+
+    import lance
+    from lance_namespace import LanceNamespace
+
+    context = _ns_handle(tmp_path).worker_open_context()
+    restored = pickle.loads(pickle.dumps(context))
+
+    for value in vars(restored).values():
+        assert not isinstance(value, lance.LanceDataset)
+        assert not isinstance(value, LanceNamespace)
+    assert not hasattr(restored, "serialized_manifest")
+
+    assert restored.table_id == ["ctx_tbl"]
+    assert restored.namespace_impl == "dir"
+    assert restored.version == context.version
+
+
+def test_worker_open_restores_namespace_identity(tmp_path: Path) -> None:
+    """Reopening on a worker must rebuild the wiring pickle would have dropped."""
+    context = _ns_handle(tmp_path, "identity_tbl").worker_open_context()
+
+    worker_ds = context.open_pinned()
+
+    assert worker_ds._namespace_client is not None
+    assert worker_ds._table_id == ["identity_tbl"]
+    assert worker_ds.version == context.version
+    assert worker_ds.count_rows() == 4
+
+
+def test_worker_open_propagates_managed_versioning(tmp_path: Path) -> None:
+    """A catalog-managed table must not be reopened as an unmanaged uri table."""
+    import dataclasses
+
+    context = dataclasses.replace(
+        _ns_handle(tmp_path, "managed_tbl").worker_open_context(),
+        managed_versioning=True,
+    )
+
+    assert context.commit_kwargs["namespace_client_managed_versioning"] is True
+    assert context.open_pinned()._namespace_client_managed_versioning is True
+
+
+def test_worker_open_does_not_describe_the_table_location(tmp_path: Path) -> None:
+    """Workers must not put a namespace round-trip on every task.
+
+    ``lance.dataset(None, namespace_client=..., table_id=...)`` resolves the
+    location with a describe_table on every call; the context passes the uri the
+    driver already resolved, so the worker open costs zero namespace calls.
+    """
+    import lance
+
+    metered = {
+        "namespace_impl": "dir",
+        "namespace_properties": {"root": str(tmp_path), "ops_metrics_enabled": "true"},
+    }
+    daft_lance.write_lance(
+        daft.from_pydict({"score": [1, 2, 3, 4]}), table_id=["metered_tbl"], mode="create", **metered
+    ).collect()
+    handle = construct_lance_dataset_handle(None, table_id=["metered_tbl"], **metered)
+    context = handle.worker_open_context()
+    client = namespace_mod.get_or_create_namespace(metered["namespace_impl"], metered["namespace_properties"])
+
+    client.reset_ops_metrics()
+    worker_ds = context.open_pinned()
+    worker_ds.count_rows()
+    assert client.retrieve_ops_metrics().get("describe_table", 0) == 0
+
+    # The high-level entry point is what the low-level open exists to avoid.
+    client.reset_ops_metrics()
+    lance.dataset(None, namespace_client=client, table_id=["metered_tbl"])
+    assert client.retrieve_ops_metrics().get("describe_table", 0) == 1
+
+
+def test_open_latest_sees_versions_written_after_pinning(tmp_path: Path) -> None:
+    """Workers stay on the planned snapshot; only coordinator steps move forward."""
+    handle = _ns_handle(tmp_path, "versioned_tbl")
+    context = handle.worker_open_context()
+
+    daft_lance.write_lance(
+        daft.from_pydict({"score": [5, 6]}), table_id=["versioned_tbl"], mode="append", **_dir_ns(tmp_path)
+    ).collect()
+
+    assert context.open_pinned().version == context.version
+    assert context.open_pinned().count_rows() == 4
+    assert context.open_latest().version > context.version
+    assert context.open_latest().count_rows() == 6
+
+
+def test_maintenance_udfs_hold_a_context_not_a_dataset(tmp_path: Path) -> None:
+    """No maintenance UDF may capture the driver's live dataset."""
+    import pickle
+
+    import lance
+
+    from daft_lance.lance_compaction import CompactionTaskUDF
+    from daft_lance.lance_merge_column import (
+        FastPathFragmentWriter,
+        FragmentHandler,
+        GroupFragmentMergeUDF,
+    )
+    from daft_lance.lance_scalar_index import (
+        FragmentIndexHandler,
+        SegmentedFragmentIndexHandler,
+    )
+
+    context = _ns_handle(tmp_path, "udf_tbl").worker_open_context()
+
+    plain = [
+        CompactionTaskUDF(context),
+        FragmentIndexHandler(context, "score", "BTREE", "idx", "uuid", False),
+        SegmentedFragmentIndexHandler(context, "score", "BTREE", "idx"),
+    ]
+    # daft.cls wraps these, so reach through to the instance it actually holds.
+    wrapped = [
+        FragmentHandler(context, {"doubled": "score * 2"}, ["score"]),
+        GroupFragmentMergeUDF(context),
+        FastPathFragmentWriter(context, ["doubled"]),
+    ]
+
+    instances = plain + [udf._daft_get_instance() for udf in wrapped]
+    for udf in instances:
+        state = vars(udf)
+        assert not any(isinstance(value, lance.LanceDataset) for value in state.values()), (
+            f"{type(udf).__name__} captured a live LanceDataset"
+        )
+        assert state["open_context"] is context
+
+    for udf in plain:
+        assert isinstance(pickle.loads(pickle.dumps(udf)), type(udf))
+
+
+def test_worker_udf_opens_the_dataset_once_per_instance(tmp_path: Path) -> None:
+    """The pinned-manifest read is per UDF instance, never per call."""
+    from daft_lance.lance_scalar_index import SegmentedFragmentIndexHandler
+
+    context = _ns_handle(tmp_path, "reopen_tbl").worker_open_context()
+    opens = []
+
+    class CountingContext:
+        uri = context.uri
+
+        def open_pinned(self):
+            opens.append(1)
+            return context.open_pinned()
+
+    handler = SegmentedFragmentIndexHandler(CountingContext(), "score", "BTREE", "idx")
+    handler._dataset()
+    handler._dataset()
+
+    assert len(opens) == 1
