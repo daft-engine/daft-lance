@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import lance
 import pytest
 
 import daft
@@ -140,3 +141,39 @@ def test_merge_columns_df_rowaddr(lance_dataset_path):
     for a, b in zip(out["lat"], out["double_lat"]):
         assert pytest.approx(a * 2, rel=1e-6) == b
     assert df_after.count_rows() == df_loaded.count_rows()
+
+
+def test_merge_columns_df_slow_path_preserves_untouched_fragments(lance_dataset_path):
+    for fragment_index in range(4):
+        first_id = fragment_index * 2
+        daft.from_pydict(
+            {
+                "id": [first_id, first_id + 1],
+                "value": [first_id * 10, (first_id + 1) * 10],
+            }
+        ).write_lance(lance_dataset_path, mode="create" if fragment_index == 0 else "append")
+
+    dataset_before = lance.dataset(lance_dataset_path)
+    version_before = dataset_before.version
+    fragment_count_before = len(dataset_before.get_fragments())
+
+    source = daft.read_lance(
+        lance_dataset_path,
+        default_scan_options={"with_row_address": True},
+        include_fragment_id=True,
+    ).where(daft.col("id").is_in([0, 2, 3]))
+    source = source.with_column("merged_value", daft.col("value") + 1)
+
+    daft_lance.merge_columns_df(
+        source.select("fragment_id", "_rowaddr", "merged_value"),
+        lance_dataset_path,
+    )
+
+    dataset_after = lance.dataset(lance_dataset_path)
+    result = dataset_after.to_table().sort_by("id").to_pydict()
+    assert result["id"] == list(range(8))
+    assert result["value"] == [i * 10 for i in range(8)]
+    assert result["merged_value"] == [1, None, 21, 31, None, None, None, None]
+    assert dataset_after.count_rows() == 8
+    assert len(dataset_after.get_fragments()) == fragment_count_before == 4
+    assert dataset_after.version == version_before + 1
