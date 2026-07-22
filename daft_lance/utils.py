@@ -220,12 +220,21 @@ def construct_lance_dataset_handle(
 
     effective_kwargs = {
         "storage_options": merged_storage_options,
-        "version": version,
+        # Pin the snapshot the driver resolved, not the caller's request. These
+        # kwargs cross to scan workers, and ``version=None`` there means "open
+        # latest": a compaction landing between planning and execution leaves
+        # workers looking for fragment ids that no longer exist, and an
+        # overwrite silently feeds them different data entirely.
+        "version": dataset.version,
         "namespace_impl": namespace_impl,
         "namespace_properties": namespace_properties,
         "table_id": table_id,
     }
     effective_kwargs.update(kwargs or {})
+    # ``asof``/tags are inputs to the version resolution above; carrying them
+    # further is redundant at best. (pylance lets ``version`` win when both are
+    # passed, so this is belt-and-braces.)
+    effective_kwargs.pop("asof", None)
     return LanceDatasetHandle(
         dataset=dataset,
         uri=resolved_uri,

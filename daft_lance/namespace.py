@@ -205,8 +205,9 @@ def resolve_namespace_table(
     """Resolve a namespace table to a :class:`ResolvedNamespaceTable`.
 
     ``mode="create"`` atomically declares a new table. ``mode="overwrite"``
-    declares the table only when a typed ``TableNotFoundError`` is raised;
-    other modes require the table to exist.
+    declares the table only when a typed ``TableNotFoundError`` is raised, and
+    falls back to a second describe if it loses the declare race; other modes
+    require the table to exist.
     """
     namespace = get_or_create_namespace(namespace_impl, namespace_properties)
     if namespace is None or table_id is None:
@@ -215,14 +216,21 @@ def resolve_namespace_table(
     if mode == "create":
         return _declare_table(namespace, table_id)
 
-    from lance_namespace.errors import TableNotFoundError
+    from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
 
     try:
         return _resolved_from_response(_describe_table(namespace, table_id))
     except TableNotFoundError:
-        if mode == "overwrite":
+        if mode != "overwrite":
+            raise
+        try:
             return _declare_table(namespace, table_id)
-        raise
+        except TableAlreadyExistsError:
+            # Lost a declare race: another writer declared the table between our
+            # describe and our declare. Overwrite targets whatever exists now, so
+            # re-describing is the correct recovery. ``create`` deliberately does
+            # not reach here -- for it the conflict is the answer.
+            return _resolved_from_response(_describe_table(namespace, table_id))
 
 
 def merge_storage_options(*layers: dict[str, Any] | None) -> dict[str, Any] | None:

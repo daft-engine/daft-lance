@@ -446,7 +446,8 @@ def test_construct_lance_dataset_empty_storage_options_falls_back_to_io_config(
     captured = {}
 
     class FakeDataset:
-        pass
+        # construct_lance_dataset_handle pins this into open_kwargs["version"].
+        version = 1
 
     def fake_dataset(uri: Any, storage_options: Any = None, version: Any = None, **kwargs: Any) -> Any:
         captured["storage_options"] = storage_options
@@ -535,7 +536,8 @@ def test_construct_lance_dataset_storage_options_priority(monkeypatch: pytest.Mo
     captured = {}
 
     class FakeDataset:
-        pass
+        # construct_lance_dataset_handle pins this into open_kwargs["version"].
+        version = 1
 
     def fake_dataset(uri: Any, storage_options: Any = None, version: Any = None, **kwargs: Any) -> Any:
         captured["uri"] = uri
@@ -584,7 +586,8 @@ def test_construct_lance_dataset_io_config_reaches_namespace_location(monkeypatc
     captured = {}
 
     class FakeDataset:
-        pass
+        # construct_lance_dataset_handle pins this into open_kwargs["version"].
+        version = 1
 
     def fake_dataset(uri: Any, storage_options: Any = None, version: Any = None, **kwargs: Any) -> Any:
         captured["storage_options"] = storage_options
@@ -846,3 +849,98 @@ def test_worker_udf_opens_the_dataset_once_per_instance(tmp_path: Path) -> None:
     handler._dataset()
 
     assert len(opens) == 1
+
+
+def test_scan_open_kwargs_pin_the_planned_version(tmp_path: Path) -> None:
+    """Workers must read the snapshot the driver planned against, not latest.
+
+    ``open_kwargs`` crosses to scan workers, so a ``version=None`` there means
+    each task independently opens latest. A compaction landing in between makes
+    planned fragment ids vanish; an overwrite silently substitutes the data.
+    """
+    import lance
+    import pyarrow as pa
+
+    ds_path = str(tmp_path / "pinned.lance")
+    lance.write_dataset(pa.table({"a": [1, 2, 3]}), ds_path)
+    handle = construct_lance_dataset_handle(ds_path)
+    planned_version = handle.dataset.version
+
+    assert handle.open_kwargs["version"] == planned_version
+
+    lance.write_dataset(pa.table({"a": [99]}), ds_path, mode="overwrite")
+
+    worker_ds = namespace_mod.open_dataset_from_open_kwargs(handle.uri, handle.open_kwargs)
+    assert worker_ds.version == planned_version
+    assert worker_ds.to_table().to_pydict() == {"a": [1, 2, 3]}
+
+
+def test_scan_open_kwargs_resolve_asof_into_a_numeric_version(tmp_path: Path) -> None:
+    """A tag/asof request is resolved on the driver; workers get the number."""
+    import lance
+    import pyarrow as pa
+
+    ds_path = str(tmp_path / "asof.lance")
+    lance.write_dataset(pa.table({"a": [1]}), ds_path)
+    lance.write_dataset(pa.table({"a": [2]}), ds_path, mode="append")
+
+    handle = construct_lance_dataset_handle(ds_path, asof="2030-01-01 00:00:00")
+
+    assert "asof" not in handle.open_kwargs
+    assert handle.open_kwargs["version"] == handle.dataset.version
+
+
+def test_namespace_overwrite_recovers_from_a_lost_declare_race(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Overwrite must survive another writer declaring the table first."""
+    from lance_namespace.errors import TableAlreadyExistsError, TableNotFoundError
+
+    class RacingNamespace:
+        def __init__(self) -> None:
+            self.describes = 0
+            self.declares = 0
+
+        def describe_table(self, request: Any) -> Any:
+            self.describes += 1
+            # First describe loses the race; by the second, the rival's table exists.
+            if self.describes == 1:
+                raise TableNotFoundError("not found")
+            return SimpleNamespace(location=str(tmp_path / "rival.lance"), storage_options=None)
+
+        def declare_table(self, request: Any) -> Any:
+            self.declares += 1
+            raise TableAlreadyExistsError("declared by another writer")
+
+    namespace = RacingNamespace()
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: namespace)
+
+    resolved = namespace_mod.resolve_namespace_table(
+        namespace_impl="rest",
+        namespace_properties={"uri": "http://namespace.example"},
+        table_id=["raced"],
+        mode="overwrite",
+    )
+
+    assert resolved.uri == str(tmp_path / "rival.lance")
+    assert (namespace.describes, namespace.declares) == (2, 1)
+
+
+def test_namespace_create_still_fails_on_a_lost_declare_race(monkeypatch: pytest.MonkeyPatch) -> None:
+    """For create, losing the race is the answer -- it must not be swallowed."""
+    from lance_namespace.errors import TableAlreadyExistsError
+
+    class RacingNamespace:
+        def describe_table(self, request: Any) -> Any:
+            raise AssertionError("create must not describe")
+
+        def declare_table(self, request: Any) -> Any:
+            raise TableAlreadyExistsError("declared by another writer")
+
+    monkeypatch.setattr(namespace_mod, "get_or_create_namespace", lambda *args: RacingNamespace())
+
+    with pytest.raises(TableAlreadyExistsError):
+        namespace_mod.resolve_namespace_table(
+            namespace_impl="rest",
+            namespace_properties={"uri": "http://namespace.example"},
+            table_id=["raced"],
+            mode="create",
+        )
