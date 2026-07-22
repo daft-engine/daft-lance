@@ -5,7 +5,7 @@ import pathlib
 import uuid
 import warnings
 from itertools import chain
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import lance
 from lance.fragment import FragmentMetadata
@@ -26,6 +26,15 @@ from daft_lance._blob import (
     detect_blob_v2_columns,
     resolve_storage_version,
 )
+from daft_lance.namespace import (
+    ResolvedNamespaceTable,
+    get_namespace_commit_kwargs,
+    get_namespace_kwargs,
+    get_write_fragments_kwargs,
+    merge_storage_options,
+    resolve_namespace_table,
+    validate_uri_or_namespace,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -40,11 +49,14 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
     def __init__(
         self,
-        uri: str | pathlib.Path,
+        uri: str | pathlib.Path | None,
         schema: Schema | pa.Schema,
         mode: Literal["create", "append", "overwrite"] = "create",
         io_config: IOConfig | None = None,
         *,
+        table_id: list[str] | None = None,
+        namespace_impl: str | None = None,
+        namespace_properties: dict[str, str] | None = None,
         blob_columns: list[str] | None = None,
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
@@ -57,17 +69,18 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         compact_after_write: bool = True,
     ) -> None:
         self._reject_unsupported_modes(mode, use_legacy_format)
-        if not isinstance(uri, (str, pathlib.Path)):
+        self._reject_namespace_mem_wal(namespace_impl, table_id, use_mem_wal)
+        validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
+        if uri is not None and not isinstance(uri, (str, pathlib.Path)):
             raise TypeError(f"Expected URI to be str or pathlib.Path, got {type(uri)}")
 
-        self._table_uri = str(uri)
         self._mode = mode
+        self._uri = uri
+        self._namespace_impl = namespace_impl
+        self._namespace_properties = namespace_properties
+        self._table_id = table_id
         self._io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
-        self._storage_options = (
-            storage_options
-            if storage_options is not None
-            else io_config_to_storage_options(self._io_config, self._table_uri)
-        )
+        self._user_storage_options = storage_options
         self._init_lance_knobs(
             max_rows_per_file=max_rows_per_file,
             max_rows_per_group=max_rows_per_group,
@@ -77,18 +90,48 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         )
         self._pyarrow_schema = self._normalize_schema(schema)
         self._init_blob_policy(blob_columns)
+        self._requested_storage_version = self._blob.apply_blob_v2_default(data_storage_version)
 
         self._use_mem_wal = use_mem_wal
         self._compact_after_write = compact_after_write
         self._mem_wal_total_rows: int = 0
         self._mem_wal_total_bytes: int = 0
 
+        # Resolved by start() on the driver, before the sink is serialized to workers.
+        # Construction must stay side-effect free: no namespace calls, no dataset opens.
+        self._table_uri: str | None = None
+        self._storage_options: dict[str, str] | None = None
+        self._managed_versioning = False
+        self._data_storage_version: LanceStorageVersion | None = None
+        self._effective_pyarrow_schema: pa.Schema | None = None
         self._version: int = 0
         self._table_schema: pa.Schema | None = None
+
+        self._schema = Schema._from_field_name_and_types(
+            [
+                ("num_fragments", DataType.int64()),
+                ("num_deleted_rows", DataType.int64()),
+                ("num_small_files", DataType.int64()),
+                ("version", DataType.int64()),
+            ]
+        )
+
+    def start(self) -> None:
+        """Resolve the target table and validate the requested mode against it.
+
+        Runs once on the driver before the sink is serialized to workers, so this
+        is the single place where namespace side effects (``declare_table``) and
+        dataset opens happen.
+        """
+        resolved = self._resolve_table()
+        self._table_uri = resolved.uri
+        self._storage_options = self._merged_storage_options(resolved)
+        self._managed_versioning = resolved.managed_versioning
+
         existing = self._absorb_existing_dataset()
         existing_version = getattr(existing, "data_storage_version", None) if existing is not None else None
         self._data_storage_version = resolve_storage_version(
-            self._blob.apply_blob_v2_default(data_storage_version),
+            self._requested_storage_version,
             existing_version,
             self._mode,
         )
@@ -100,14 +143,48 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         # Schema actually written to the dataset (blob columns retyped to lance.blob.v2).
         self._effective_pyarrow_schema = self._blob.build_effective_schema(self._pyarrow_schema)
-        self._schema = Schema._from_field_name_and_types(
-            [
-                ("num_fragments", DataType.int64()),
-                ("num_deleted_rows", DataType.int64()),
-                ("num_small_files", DataType.int64()),
-                ("version", DataType.int64()),
-            ]
+
+    @property
+    def _namespace_kwargs(self) -> dict[str, Any]:
+        return get_namespace_kwargs(self._namespace_impl, self._namespace_properties, self._table_id)
+
+    @property
+    def _namespace_commit_kwargs(self) -> dict[str, Any]:
+        return get_namespace_commit_kwargs(
+            self._namespace_impl,
+            self._namespace_properties,
+            self._table_id,
+            self._managed_versioning,
         )
+
+    @property
+    def _dataset_uri_arg(self) -> str | None:
+        return None if self._namespace_impl is not None and self._table_id is not None else self._table_uri
+
+    def _resolve_table(self) -> ResolvedNamespaceTable:
+        if self._uri is not None:
+            return ResolvedNamespaceTable(uri=str(self._uri))
+        mode = self._mode if self._mode in ("create", "overwrite") else "read"
+        resolved = resolve_namespace_table(
+            namespace_impl=self._namespace_impl,
+            namespace_properties=self._namespace_properties,
+            table_id=self._table_id,
+            mode=mode,
+        )
+        if resolved is None:
+            raise ValueError("Unable to resolve Lance dataset URI from namespace.")
+        return resolved
+
+    def _merged_storage_options(self, resolved: ResolvedNamespaceTable) -> dict[str, str] | None:
+        """Layer storage options: io_config-derived < user-provided < namespace-vended.
+
+        For a plain URI, explicitly provided options (including ``{}``) replace
+        the io_config-derived ones, preserving the historical sink behavior.
+        """
+        io_derived = io_config_to_storage_options(self._io_config, resolved.uri)
+        if self._uri is not None:
+            return self._user_storage_options if self._user_storage_options is not None else io_derived
+        return merge_storage_options(io_derived, self._user_storage_options, resolved.storage_options)
 
     @staticmethod
     def _reject_unsupported_modes(
@@ -128,6 +205,24 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 "use data_storage_version instead.",
                 DeprecationWarning,
                 stacklevel=3,
+            )
+
+    @staticmethod
+    def _reject_namespace_mem_wal(namespace_impl: str | None, table_id: list[str] | None, use_mem_wal: bool) -> None:
+        """Reject the namespace + mem-WAL combination instead of failing mid-write.
+
+        The namespace write path declares the table up front (a metadata-only
+        reservation), but the mem-WAL path then asks Lance for a namespace-aware
+        ``write_dataset(mode="create")``, which declares the same table a second
+        time and raises ``TableAlreadyExistsError``. Supporting this needs the
+        mem-WAL path to skip our own declare and let the native create own it;
+        until then, fail loudly at construction time.
+        """
+        if use_mem_wal and namespace_impl is not None and table_id is not None:
+            raise ValueError(
+                "use_mem_wal=True is not supported with namespace-addressed tables "
+                "('namespace_impl' + 'table_id'). Write to a 'uri' instead, or set "
+                "use_mem_wal=False."
             )
 
     def _init_lance_knobs(
@@ -167,7 +262,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         """
         dataset: lance.LanceDataset | None
         try:
-            dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            dataset = lance.dataset(
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
+            )
         except (ValueError, FileNotFoundError, OSError) as e:
             # Pinned to the Rust message format; lance has no typed exception. See test_lance_message_format_unchanged.
             if "was not found" in str(e):
@@ -179,21 +276,25 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if dataset is None:
             if self._mode == "append":
                 raise ValueError("Cannot append to non-existent Lance dataset.")
-            if self._mode == "create" and self._storage_options is None:
+            if self._mode == "create" and self._storage_options is None and self._table_uri is not None:
                 p = pathlib.Path(self._table_uri)
                 if p.is_file():
                     raise FileExistsError("Target path points to a file, cannot create a dataset here.")
             return None
 
-        self._table_schema = dataset.schema
+        table_schema = dataset.schema
+        self._table_schema = table_schema
         self._version = dataset.latest_version
 
         if self._mode == "create":
-            raise ValueError("Cannot create a Lance dataset at a location where one already exists.")
+            raise ValueError(
+                "Cannot create a Lance dataset at a location where one already exists. "
+                'Use mode="overwrite" to replace it or mode="append" to add to it.'
+            )
 
         if self._mode == "append" and not _pyarrow_schema_castable(
-            blob_aware_schema_for_validation(self._pyarrow_schema, self._table_schema),
-            blob_aware_schema_for_validation(self._table_schema, self._table_schema),
+            blob_aware_schema_for_validation(self._pyarrow_schema, table_schema),
+            blob_aware_schema_for_validation(table_schema, table_schema),
         ):
             raise ValueError(
                 "Schema of data does not match table schema\n"
@@ -218,6 +319,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         return pa.Table.from_batches(input_table.to_batches(), target_schema)
 
     def _write_arrow_table(self, table: pa.Table) -> WriteResult[list[FragmentMetadata]]:
+        assert self._table_uri is not None, "LanceDataSink.start() must run before writes"
         wrapped = self._blob.wrap_table(table)
         fragments = lance.fragment.write_fragments(
             wrapped,
@@ -230,6 +332,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             data_storage_version=self._data_storage_version,
             use_legacy_format=self._use_legacy_format,
             enable_stable_row_ids=self._enable_stable_row_ids,
+            **get_write_fragments_kwargs(self._namespace_impl, self._namespace_properties, self._table_id),
         )
         # Sum on-disk sizes from fragment metadata. Lance Blob V2 sidecar .blob
         # files are not tracked in FragmentMetadata.files (out of scope here).
@@ -239,8 +342,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         return WriteResult(result=fragments, bytes_written=bytes_written, rows_written=wrapped.num_rows)
 
     def _ensure_mem_wal_dataset(self) -> lance.LanceDataset:
+        assert self._effective_pyarrow_schema is not None, "LanceDataSink.start() must run before writes"
         try:
-            ds = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            ds = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
         except (ValueError, FileNotFoundError, OSError):
             ds = None
 
@@ -250,11 +354,12 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                     {f.name: pa.array([], type=f.type) for f in self._effective_pyarrow_schema},
                     schema=self._effective_pyarrow_schema,
                 ),
-                self._table_uri,
+                self._dataset_uri_arg,
                 mode="create",
                 storage_options=self._storage_options,
                 data_storage_version=self._data_storage_version,
                 use_legacy_format=self._use_legacy_format,
+                **self._namespace_kwargs,
             )
 
         details = ds.mem_wal_index_details()
@@ -324,17 +429,22 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _finalize_cow(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
         fragments = list(chain.from_iterable(write_result.result for write_result in write_results))
 
+        assert self._effective_pyarrow_schema is not None, "LanceDataSink.start() must run before finalize"
         operation: lance.LanceOperation.BaseOperation
         if self._mode == "create" or self._mode == "overwrite":
             operation = lance.LanceOperation.Overwrite(self._effective_pyarrow_schema, fragments)
         elif self._mode == "append":
             operation = lance.LanceOperation.Append(fragments)
 
+        assert self._table_uri is not None, "LanceDataSink.start() must run before finalize"
+        # Unlike lance.dataset(), commit() requires a str base_uri even when a
+        # namespace client is passed; the namespace kwargs only register the commit.
         dataset = lance.LanceDataset.commit(
             self._table_uri,
             operation,
             read_version=self._version,
             storage_options=self._storage_options,
+            **self._namespace_commit_kwargs,
         )
         stats = dataset.stats.dataset_stats()
         stats_dict = MicroPartition.from_pydict(
@@ -348,7 +458,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         return stats_dict
 
     def _finalize_mem_wal(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
-        dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
 
         if self._compact_after_write:
             logger.info(
@@ -357,9 +467,21 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 self._mem_wal_total_bytes,
             )
             from daft_lance.lance_compaction import compact_files_internal
+            from daft_lance.namespace import DatasetOpenContext
 
-            compact_files_internal(dataset)
-            dataset = lance.dataset(self._table_uri, storage_options=self._storage_options)
+            # Mem-WAL rejects namespace addressing up front (issue #54), so this
+            # is always a uri-only table and the context carries no triple.
+            compact_files_internal(
+                dataset,
+                DatasetOpenContext.from_dataset(
+                    dataset,
+                    str(self._dataset_uri_arg),
+                    storage_options=self._storage_options,
+                ),
+            )
+            dataset = lance.dataset(
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
+            )
 
         stats = dataset.stats.dataset_stats()
         return MicroPartition.from_pydict(

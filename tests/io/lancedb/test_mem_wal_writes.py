@@ -205,6 +205,7 @@ class TestMemWalEnsureDataset:
         target = os.path.join(lance_dataset_path, "new_ds")
         schema = pa.schema([("a", pa.int64())])
         sink = LanceDataSink(uri=target, schema=schema, mode="create", use_mem_wal=True)
+        sink.start()
         ds = sink._ensure_mem_wal_dataset()
         assert ds is not None
         assert ds.mem_wal_index_details() is not None
@@ -214,6 +215,7 @@ class TestMemWalEnsureDataset:
         lance.write_dataset(pa.table({"a": [1]}, schema=schema), lance_dataset_path)
 
         sink = LanceDataSink(uri=lance_dataset_path, schema=schema, mode="append", use_mem_wal=True)
+        sink.start()
         ds = sink._ensure_mem_wal_dataset()
         assert ds is not None
         assert ds.mem_wal_index_details() is not None
@@ -226,6 +228,7 @@ class TestMemWalEnsureDataset:
         ds.initialize_mem_wal(unsharded=True)
 
         sink = LanceDataSink(uri=lance_dataset_path, schema=schema, mode="append", use_mem_wal=True)
+        sink.start()
         ds2 = sink._ensure_mem_wal_dataset()
         assert ds2.mem_wal_index_details() is not None
 
@@ -236,6 +239,7 @@ class TestMemWalWriteResult:
 
         schema = pa.schema([("a", pa.int64())])
         sink = LanceDataSink(uri=lance_dataset_path, schema=schema, mode="create", use_mem_wal=True)
+        sink.start()
         mp = MicroPartition.from_pydict({"a": [1, 2, 3]})
         results = list(sink.write(iter([mp])))
         assert len(results) == 1
@@ -254,6 +258,7 @@ class TestMemWalWriteResult:
             use_mem_wal=True,
             compact_after_write=False,
         )
+        sink.start()
         mp = MicroPartition.from_pydict({"a": [1, 2, 3]})
         results = list(sink.write(iter([mp])))
         stats_mp = sink.finalize(results)

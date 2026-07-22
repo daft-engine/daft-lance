@@ -15,10 +15,10 @@ from daft.udf import cls as daft_cls
 from daft.udf import method
 
 if TYPE_CHECKING:
-    import pathlib
     from collections.abc import Callable
 
     from daft.dependencies import pa
+    from daft_lance.namespace import DatasetOpenContext
 
 
 _FRAGMENT_HANDLER_RETURN_DTYPE = DataType.struct({"fragment_meta": DataType.binary(), "schema": DataType.binary()})
@@ -28,21 +28,28 @@ _FRAGMENT_HANDLER_RETURN_DTYPE = DataType.struct({"fragment_meta": DataType.bina
 class FragmentHandler:
     def __init__(
         self,
-        lance_ds: lance.LanceDataset,
+        open_context: DatasetOpenContext,
         transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.lib.RecordBatch], pa.lib.RecordBatch],
         read_columns: list[str] | None,
         reader_schema: pa.Schema | None = None,
     ):
-        self.lance_ds = lance_ds
+        self.open_context = open_context
         self.transform = transform
         self.read_columns = read_columns
         self.reader_schema = reader_schema
+        self._lance_ds: lance.LanceDataset | None = None
+
+    def _dataset(self) -> lance.LanceDataset:
+        if self._lance_ds is None:
+            self._lance_ds = self.open_context.open_pinned()
+        return self._lance_ds
 
     @method.batch(return_dtype=_FRAGMENT_HANDLER_RETURN_DTYPE)
     def __call__(self, fragment_ids: Any) -> list[dict[str, bytes]]:
         results = []
+        lance_ds = self._dataset()
         for fragment_id in fragment_ids:
-            fragment = self.lance_ds.get_fragment(fragment_id)
+            fragment = lance_ds.get_fragment(fragment_id)
             if fragment is None:
                 raise ValueError(f"Fragment {fragment_id} not found in dataset")
             fragment_meta, schema = fragment.merge_columns(self.transform, self.read_columns, None, self.reader_schema)
@@ -52,12 +59,11 @@ class FragmentHandler:
 
 def merge_columns_internal(
     lance_ds: lance.LanceDataset,
-    url: str | pathlib.Path,
+    open_context: DatasetOpenContext,
     *,
     transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
     read_columns: list[str] | None = None,
     reader_schema: pa.Schema | None = None,
-    storage_options: dict[str, Any] | None = None,
     daft_remote_args: dict[str, Any] | None = None,
     concurrency: int | None = None,
 ) -> lance.LanceDataset:
@@ -72,7 +78,7 @@ def merge_columns_internal(
 
     # Instantiate the Daft class with Lance-specific state and apply the
     # batch method over the fragment_id column.
-    handler = FragmentHandler(lance_ds, transform, read_columns, reader_schema)
+    handler = FragmentHandler(open_context, transform, read_columns, reader_schema)
     df = df.with_column("commit_message", handler(df["fragment_id"]))  # type: ignore[arg-type]
 
     commit_messages = df.collect().to_pydict()["commit_message"]
@@ -89,10 +95,11 @@ def merge_columns_internal(
         raise ValueError("No schema for new fragment found")
     op = lance.LanceOperation.Merge(fragment_metas, new_schema)
     return lance_ds.commit(
-        url,
+        open_context.uri,
         op,
         read_version=lance_ds.version,
-        storage_options=storage_options,
+        storage_options=open_context.storage_options,
+        **open_context.commit_kwargs,
     )
 
 
@@ -100,7 +107,7 @@ def merge_columns_internal(
 class GroupFragmentMergeUDF:
     def __init__(
         self,
-        lance_ds: lance.LanceDataset,
+        open_context: DatasetOpenContext,
         left_on: str | None = "_rowaddr",
         right_on: str | None = None,
         read_columns: list[str] | None = None,
@@ -110,19 +117,25 @@ class GroupFragmentMergeUDF:
         """Per-group merge handler that directly invokes Lance fragment.merge with keyed join.
 
         Args:
-            lance_ds: Target Lance dataset.
+            open_context: Serializable handle the worker reopens the target dataset from.
             left_on: Key column on the Lance fragment (default "_rowaddr").
             right_on: Key column name present in the provided reader data (defaults to left_on).
             read_columns: Names for columns provided to the handler via map_groups (must include right_on).
             reader_schema: Optional Arrow schema for the reader.
             batch_size: Optional batch size when building RecordBatchReader from the provided data.
         """
-        self.lance_ds = lance_ds
+        self.open_context = open_context
         self.left_on = left_on or "_rowaddr"
         self.right_on = right_on or self.left_on
         self.read_columns = read_columns or []
         self.reader_schema = reader_schema
         self.batch_size = batch_size
+        self._lance_ds: lance.LanceDataset | None = None
+
+    def _dataset(self) -> lance.LanceDataset:
+        if self._lance_ds is None:
+            self._lance_ds = self.open_context.open_pinned()
+        return self._lance_ds
 
     @method.batch(return_dtype=_FRAGMENT_HANDLER_RETURN_DTYPE)
     def __call__(self, *cols: Any) -> list[dict[str, bytes]]:
@@ -192,16 +205,17 @@ class GroupFragmentMergeUDF:
 
         # Enforce that reader stream contains only join key + new columns (exclude existing dataset fields)
         df_schema = tbl.schema
+        lance_ds = self._dataset()
         existing_fields: set[str] = set()
         try:
-            existing_fields = {getattr(f, "name", str(f)) for f in self.lance_ds.schema}
+            existing_fields = {getattr(f, "name", str(f)) for f in lance_ds.schema}
         except Exception:
             names = []
             try:
-                names = list(getattr(self.lance_ds.schema, "names", []))
+                names = list(getattr(lance_ds.schema, "names", []))
             except Exception:
                 try:
-                    names = [getattr(f, "name", str(f)) for f in getattr(self.lance_ds.schema, "fields", [])]
+                    names = [getattr(f, "name", str(f)) for f in getattr(lance_ds.schema, "fields", [])]
                 except Exception:
                     names = []
             existing_fields = set(names)
@@ -219,7 +233,7 @@ class GroupFragmentMergeUDF:
         batches = tbl.to_batches(max_chunksize=self.batch_size) if self.batch_size is not None else tbl.to_batches()
         reader = _pa.RecordBatchReader.from_batches(tbl.schema, batches)
 
-        fragment = self.lance_ds.get_fragment(frag_id)
+        fragment = lance_ds.get_fragment(frag_id)
         if fragment is None:
             raise ValueError(f"Fragment {frag_id} not found in dataset")
         # Build schema argument: use the table's schema (including join key and new columns) unless an explicit reader_schema is provided
@@ -239,15 +253,17 @@ class FastPathFragmentWriter:
 
     def __init__(
         self,
-        lance_ds: lance.LanceDataset,
-        uri: str,
+        open_context: DatasetOpenContext,
         new_column_names: list[str],
-        storage_options: dict[str, str] | None = None,
     ):
-        self.lance_ds = lance_ds
-        self.uri = str(uri)
+        self.open_context = open_context
         self.new_column_names = new_column_names
-        self.storage_options = storage_options
+        self._lance_ds: lance.LanceDataset | None = None
+
+    def _dataset(self) -> lance.LanceDataset:
+        if self._lance_ds is None:
+            self._lance_ds = self.open_context.open_pinned()
+        return self._lance_ds
 
     @method.batch(return_dtype=_FRAGMENT_HANDLER_RETURN_DTYPE)
     def __call__(self, *cols: Any) -> list[dict[str, bytes]]:
@@ -291,7 +307,8 @@ class FastPathFragmentWriter:
 
         # Determine the existing file format version so the new file matches.
         # Lance commit rejects fragments whose files mix major/minor versions.
-        fragment = self.lance_ds.get_fragment(frag_id)
+        lance_ds = self._dataset()
+        fragment = lance_ds.get_fragment(frag_id)
         if fragment is None:
             raise ValueError(f"Fragment {frag_id} not found in dataset")
         meta = dict(fragment.metadata.to_json())
@@ -303,12 +320,12 @@ class FastPathFragmentWriter:
 
         # Write raw .lance file with only new columns
         filename = uuid.uuid4().hex + ".lance"
-        filepath = os.path.join(self.uri, "data", filename)
+        filepath = os.path.join(self.open_context.uri, "data", filename)
         with LanceFileWriter(
             filepath,
             tbl.schema,
             version=f"{file_major}.{file_minor}",
-            storage_options=self.storage_options,
+            storage_options=self.open_context.storage_options,
         ) as writer:
             for b in tbl.to_batches():
                 writer.write_batch(b)
@@ -317,7 +334,7 @@ class FastPathFragmentWriter:
         # Determine field IDs for the new columns. Lance's manifest-level
         # max_field_id includes nested child fields and field IDs from dropped
         # columns, so it is the correct high-water mark for dataset evolution.
-        next_fid = self.lance_ds.max_field_id + 1
+        next_fid = lance_ds.max_field_id + 1
 
         # Stitch new data file into fragment metadata
         new_file_entry = {
@@ -333,7 +350,7 @@ class FastPathFragmentWriter:
         new_frag_meta = FragmentMetadata.from_json(json.dumps(meta))
 
         # Build new schema (original + new columns)
-        new_schema = self.lance_ds.schema
+        new_schema = lance_ds.schema
         for col_name in self.new_column_names:
             col_idx = tbl.schema.get_field_index(col_name)
             new_schema = new_schema.append(_pa.field(col_name, tbl.schema.field(col_idx).type))
@@ -364,11 +381,10 @@ def _can_use_fast_path(
 def merge_columns_from_df(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
-    uri: str | pathlib.Path,
+    open_context: DatasetOpenContext,
     *,
     read_columns: list[str] | None = None,
     reader_schema: pa.Schema | None = None,
-    storage_options: dict[str, Any] | None = None,
     daft_remote_args: dict[str, Any] | None = None,
     concurrency: int | None = None,
     left_on: str | None = "_rowaddr",
@@ -413,30 +429,33 @@ def merge_columns_from_df(
     use_fast_path = _can_use_fast_path(df, lance_ds, join_key)
 
     if use_fast_path:
-        return _merge_fast_path(df, lance_ds, uri, new_cols, storage_options=storage_options)
+        return _merge_fast_path(
+            df,
+            lance_ds,
+            open_context,
+            new_cols,
+        )
     else:
         return _merge_slow_path(
             df,
             lance_ds,
-            uri,
+            open_context,
             read_columns,
             left_on,
             right_on,
             reader_schema,
             batch_size,
-            storage_options=storage_options,
         )
 
 
 def _merge_fast_path(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
-    uri: str | pathlib.Path,
+    open_context: DatasetOpenContext,
     new_column_names: list[str],
-    storage_options: dict[str, Any] | None = None,
 ) -> lance.LanceDataset:
     """Metadata-only add_columns: write raw .lance files and stitch into fragment metadata."""
-    handler = FastPathFragmentWriter(lance_ds, str(uri), new_column_names, storage_options=storage_options)
+    handler = FastPathFragmentWriter(open_context, new_column_names)
 
     grouped = df.groupby("fragment_id").map_groups(
         handler(*(df[c] for c in new_column_names), df["_rowaddr"], df["fragment_id"]).alias("commit_message")  # type: ignore[attr-defined]
@@ -469,27 +488,27 @@ def _merge_fast_path(
 
     op = lance.LanceOperation.Merge(fragment_metas, LanceSchema.from_pyarrow(new_schema))
     return lance.LanceDataset.commit(
-        str(uri),
+        open_context.uri,
         op,
         read_version=lance_ds.version,
-        storage_options=storage_options,
+        storage_options=open_context.storage_options,
+        **open_context.commit_kwargs,
     )
 
 
 def _merge_slow_path(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
-    uri: str | pathlib.Path,
+    open_context: DatasetOpenContext,
     read_columns: list[str],
     left_on: str | None,
     right_on: str | None,
     reader_schema: pa.Schema | None,
     batch_size: int | None,
-    storage_options: dict[str, Any] | None = None,
 ) -> lance.LanceDataset:
     """Original keyed-join merge path: rewrites fragment data."""
     handler_udf = GroupFragmentMergeUDF(
-        lance_ds,
+        open_context,
         left_on,
         right_on,
         read_columns,
@@ -517,8 +536,9 @@ def _merge_slow_path(
         return lance_ds
     op = lance.LanceOperation.Merge(fragment_metas, new_schema)
     return lance_ds.commit(
-        uri,
+        open_context.uri,
         op,
         read_version=lance_ds.version,
-        storage_options=storage_options,
+        storage_options=open_context.storage_options,
+        **open_context.commit_kwargs,
     )

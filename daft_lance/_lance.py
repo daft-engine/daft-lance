@@ -2,46 +2,50 @@ from __future__ import annotations
 
 import pathlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
-
-import lance
+from typing import TYPE_CHECKING, Any, Literal
 
 from daft import context
 from daft.api_annotations import PublicAPI
 from daft.daft import IOConfig, ScanOperatorHandle
 from daft.dataframe import DataFrame
+from daft.dependencies import pa
 from daft.io._checkpoint import attach_checkpoint
-from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.builder import LogicalPlanBuilder
+from daft.schema import Schema
 
 from .lance_compaction import compact_files_internal
+from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
 from .lance_scan import LanceDBScanOperator
-from .utils import construct_lance_dataset
+from .namespace import validate_uri_or_namespace
+from .utils import construct_lance_dataset_handle
 
 if TYPE_CHECKING:
     from lance.dataset import LanceDataset
     from lance.udf import BatchUDF
 
     from daft.checkpoint import CheckpointConfig
-    from daft.dependencies import pa
 
 
 @PublicAPI
 def read_lance(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     version: str | int | None = None,
     asof: str | None = None,
     block_size: int | None = None,
     commit_lock: object | None = None,
     index_cache_size: int | None = None,
-    default_scan_options: dict[str, str] | None = None,
+    default_scan_options: dict[str, Any] | None = None,
     metadata_cache_size_bytes: int | None = None,
     fragment_group_size: int | None = None,
     include_fragment_id: bool | None = None,
     checkpoint: CheckpointConfig | None = None,
+    *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
 ) -> DataFrame:
     """Create a DataFrame from a LanceDB table.
 
@@ -49,6 +53,11 @@ def read_lance(
         uri: The URI of the Lance table to read from. Accepts a local path or an
             object-store URI like "s3://bucket/path".
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         version : optional, int | str
             If specified, load a specific version of the Lance dataset. Else, loads the
             latest version. A version number (`int`) or a tag (`str`) can be provided.
@@ -93,7 +102,7 @@ def read_lance(
             each fragment will be processed individually (default behavior).
         include_fragment_id : Optional, bool
             Whether to display fragment_id.
-            if you have the behavior of 'merge_columns_df' or 'write_lance(mode = 'merge')', the `include_fragment_id` must be set to True
+            Set this to True when preparing input for ``merge_columns_df``.
         checkpoint: Optional :class:`daft.CheckpointConfig` for progress tracking across runs. Bundles the
             checkpoint store, the source key column (``on=``), and optional anti-join tuning. Rows whose key
             already exists in the store are skipped on re-run. Requires the Ray runner.
@@ -123,21 +132,25 @@ def read_lance(
         >>> df = daft.read_lance("s3://daft-oss-public-data/lance/words-test-dataset", io_config=io_config)
         >>> df.show()
     """
-    uri_str = str(uri)
-    if uri_str.startswith("rest://"):
+    uri_str = str(uri) if uri is not None else None
+    if uri_str is not None and uri_str.startswith("rest://"):
         raise ValueError(
-            "rest:// Lance URIs are no longer supported by daft.read_lance. "
-            "The previous REST-namespace integration did not match the real "
-            "lance-namespace API and has been removed. Use a local path or "
-            "object-store URI, or the daft-lance package."
+            "rest:// Lance URIs are not supported. To read a table through a REST "
+            "Lance Namespace, use the namespace parameters instead of a uri: "
+            'read_lance(namespace_impl="rest", '
+            'namespace_properties={"uri": "http://host:port"}, '
+            'table_id=["catalog", "schema", "table"]). '
+            "Otherwise pass a local path or object-store URI."
         )
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = io_config_to_storage_options(io_config, uri_str)
 
-    ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri_str,
-        storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -148,9 +161,11 @@ def read_lance(
     )
 
     lance_operator = LanceDBScanOperator(
-        ds,
+        dataset_handle.dataset,
         fragment_group_size=fragment_group_size,
         include_fragment_id=include_fragment_id,
+        open_kwargs=dataset_handle.open_kwargs,
+        default_scan_options=dataset_handle.default_scan_options,
     )
 
     handle = ScanOperatorHandle.from_python_scan_operator(lance_operator)
@@ -161,9 +176,12 @@ def read_lance(
 
 @PublicAPI
 def merge_columns(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
     transform: dict[str, str] | BatchUDF | Callable[[pa.lib.RecordBatch], pa.lib.RecordBatch] | None = None,
     read_columns: list[str] | None = None,
     reader_schema: pa.Schema | None = None,
@@ -186,6 +204,11 @@ def merge_columns(
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         transform: A transformation function or UDF to apply to the data.
         read_columns: List of column names to read for the transformation.
         reader_schema: Schema for the reader.
@@ -222,12 +245,15 @@ def merge_columns(
         )
 
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = storage_options or io_config_to_storage_options(io_config, uri)
 
     # Build Lance dataset handle for committing
-    lance_ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri,
         storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -238,12 +264,11 @@ def merge_columns(
     )
 
     return merge_columns_internal(
-        lance_ds,
-        uri,
+        dataset_handle.dataset,
+        dataset_handle.worker_open_context(),
         transform=transform,
         read_columns=read_columns,
         reader_schema=reader_schema,
-        storage_options=storage_options,
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
     )
@@ -252,9 +277,12 @@ def merge_columns(
 @PublicAPI
 def merge_columns_df(
     df: DataFrame,
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
     read_columns: list[str] | None = None,
     reader_schema: pa.Schema | None = None,
     storage_options: dict[str, Any] | None = None,
@@ -280,6 +308,11 @@ def merge_columns_df(
         df: DataFrame containing the new columns to merge along with fragment_id and join key columns
         uri: URL to the LanceDB table (supports remote URLs to object stores such as `s3://` or `gs://`)
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         read_columns: List of column names to read for the transformation.
         reader_schema: Schema for the reader.
         storage_options: Extra options for storage connection.
@@ -318,12 +351,15 @@ def merge_columns_df(
         >>> daft_lance.merge_columns_df(df, "s3://my-lancedb-bucket/data/")
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = storage_options or io_config_to_storage_options(io_config, uri)
 
     # Build Lance dataset handle for committing
-    lance_ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri,
         storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -341,11 +377,10 @@ def merge_columns_df(
 
     return merge_columns_from_df(
         df,
-        lance_ds=lance_ds,
-        uri=uri,
+        lance_ds=dataset_handle.dataset,
+        open_context=dataset_handle.worker_open_context(),
         read_columns=read_columns,
         reader_schema=reader_schema,
-        storage_options=storage_options,
         daft_remote_args=daft_remote_args,
         concurrency=concurrency,
         left_on=left_on,
@@ -356,9 +391,12 @@ def merge_columns_df(
 
 @PublicAPI
 def create_scalar_index(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
     column: str,
     index_type: str = "INVERTED",
     name: str | None = None,
@@ -386,6 +424,11 @@ def create_scalar_index(
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         column: Column name to index
         index_type: Type of index to build.
             For distributed segmented execution this supports "BITMAP", "BTREE", "INVERTED", and "FTS".
@@ -464,11 +507,14 @@ def create_scalar_index(
         >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="title", replace=False)
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = storage_options or io_config_to_storage_options(io_config, str(uri))
 
-    lance_ds = construct_lance_dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri,
         storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -479,13 +525,12 @@ def create_scalar_index(
     )
 
     create_scalar_index_internal(
-        lance_ds=lance_ds,
-        uri=uri,
+        lance_ds=dataset_handle.dataset,
+        open_context=dataset_handle.worker_open_context(),
         column=column,
         index_type=index_type,
         name=name,
         replace=replace,
-        storage_options=storage_options,
         fragment_group_size=fragment_group_size,
         num_partitions=num_partitions,
         max_concurrency=max_concurrency,
@@ -496,9 +541,12 @@ def create_scalar_index(
 
 @PublicAPI
 def compact_files(
-    uri: str | pathlib.Path,
+    uri: str | pathlib.Path | None = None,
     io_config: IOConfig | None = None,
     *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
     storage_options: dict[str, Any] | None = None,
     version: int | str | None = None,
     asof: str | None = None,
@@ -519,6 +567,11 @@ def compact_files(
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
         io_config: A custom IOConfig to use when accessing LanceDB data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         storage_options: Extra options for storage connection.
         version: If specified, load a specific version of the Lance dataset.
         asof: If specified, find the latest version created on or earlier than the given argument value.
@@ -549,13 +602,14 @@ def compact_files(
         RuntimeError: When compaction fails or no successful results
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    storage_options = storage_options or io_config_to_storage_options(
-        io_config, str(uri) if isinstance(uri, pathlib.Path) else uri
-    )
 
-    lance_ds = lance.dataset(
+    dataset_handle = construct_lance_dataset_handle(
         uri,
         storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
         version=version,
         asof=asof,
         block_size=block_size,
@@ -566,8 +620,70 @@ def compact_files(
     )
 
     return compact_files_internal(
-        lance_ds=lance_ds,
+        lance_ds=dataset_handle.dataset,
+        open_context=dataset_handle.worker_open_context(),
         compaction_options=compaction_options,
         partition_num=partition_num,
         concurrency=concurrency,
     )
+
+
+@PublicAPI
+def write_lance(
+    df: DataFrame,
+    uri: str | pathlib.Path | None = None,
+    mode: Literal["create", "append", "overwrite"] = "create",
+    io_config: IOConfig | None = None,
+    schema: Schema | pa.Schema | None = None,
+    *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    **kwargs: Any,
+) -> DataFrame:
+    """Write a DataFrame to a Lance table, addressed by URI or by Lance Namespace.
+
+    Args:
+        df: The DataFrame to write.
+        uri: The URI of the Lance table. Mutually exclusive with the namespace parameters.
+        mode: One of "create", "append", or "overwrite".
+        io_config: A custom IOConfig to use when accessing Lance data.
+        schema: Desired schema to enforce during write; defaults to the DataFrame schema.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
+        **kwargs: Additional arguments forwarded to the Lance writer.
+
+    Returns:
+        DataFrame: write statistics (num_fragments, num_deleted_rows, num_small_files, version).
+
+    Note:
+        Target-dependent validation is performed when the returned DataFrame is
+        executed (for example, by ``collect()``), not while the logical write
+        plan is constructed. This includes missing/duplicate targets, append
+        schema compatibility, and storage-version conflicts.
+
+    Examples:
+        >>> import daft, daft_lance
+        >>> df = daft.from_pydict({"id": [1, 2]})
+        >>> daft_lance.write_lance(
+        ...     df, namespace_impl="dir", namespace_properties={"root": "/tmp/tables"}, table_id=["t"]
+        ... ).collect()  # doctest: +SKIP
+    """
+    validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
+
+    if schema is None:
+        schema = df.schema()
+
+    sink = LanceDataSink(
+        uri,
+        schema,
+        mode,
+        io_config,
+        table_id=table_id,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        **kwargs,
+    )
+    return df.write_sink(sink)

@@ -9,6 +9,7 @@ import pytest
 
 import daft
 from daft import col
+from daft_lance.lance_scan import LanceDBScanOperator
 
 
 def build_single_fragment_dataset(tmp_path_factory) -> str:
@@ -113,6 +114,16 @@ def test_nearest_global_single_scan_task(tmp_path_factory) -> None:
     explain_output = string_io.getvalue()
 
     assert "Num Scan Tasks = 1" in explain_output
+
+
+def test_direct_scan_operator_uses_lance_default_nearest(tmp_path_factory) -> None:
+    dataset_path = build_multi_fragment_dataset(tmp_path_factory)
+    nearest = {"column": "vector", "q": pa.array([0.0, 0.0], type=pa.float32()), "k": 1}
+    dataset = lance.dataset(dataset_path, default_scan_options={"nearest": nearest})
+
+    scan = LanceDBScanOperator(dataset)
+
+    assert scan._nearest_default_option() == nearest
 
 
 def test_nearest_metric_cosine_k1(tmp_path_factory) -> None:

@@ -1,17 +1,91 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import lance
 
 from daft.dependencies import pa
+from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.schema import Schema as DaftSchema
+from daft_lance.namespace import (
+    DatasetOpenContext,
+    get_namespace_commit_kwargs,
+    get_namespace_kwargs,
+    has_namespace_params,
+    merge_storage_options,
+    resolve_namespace_table,
+    validate_uri_or_namespace,
+)
 
 if TYPE_CHECKING:
     import pathlib
 
+    from daft.daft import IOConfig
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LanceDatasetHandle:
+    """An opened Lance dataset together with the context needed to reuse it.
+
+    ``lance.LanceDataset`` does not expose all arguments used to open it.  Keep
+    those arguments in this Daft-owned value object instead of attaching
+    private attributes to the third-party dataset instance.
+    """
+
+    dataset: lance.LanceDataset
+    uri: str
+    open_kwargs: dict[str, Any] = field(repr=False)
+    managed_versioning: bool = False
+    default_scan_options: dict[str, Any] | None = field(default=None, repr=False)
+
+    @property
+    def storage_options(self) -> dict[str, Any] | None:
+        options = self.open_kwargs.get("storage_options")
+        return options if isinstance(options, dict) else None
+
+    @property
+    def namespace_kwargs(self) -> dict[str, Any]:
+        return get_namespace_kwargs(
+            self.open_kwargs.get("namespace_impl"),
+            self.open_kwargs.get("namespace_properties"),
+            self.open_kwargs.get("table_id"),
+        )
+
+    @property
+    def commit_kwargs(self) -> dict[str, Any]:
+        return get_namespace_commit_kwargs(
+            self.open_kwargs.get("namespace_impl"),
+            self.open_kwargs.get("namespace_properties"),
+            self.open_kwargs.get("table_id"),
+            self.managed_versioning,
+        )
+
+    def worker_open_context(self) -> DatasetOpenContext:
+        """Derive the serializable context distributed maintenance workers reopen from.
+
+        Note this pins :attr:`dataset`'s *resolved* version rather than the
+        caller's ``version``/``asof`` request, so every worker lands on the exact
+        snapshot the driver planned against.
+        """
+        return DatasetOpenContext.from_dataset(
+            self.dataset,
+            self.uri,
+            storage_options=self.storage_options,
+            namespace_impl=self.open_kwargs.get("namespace_impl"),
+            namespace_properties=self.open_kwargs.get("namespace_properties"),
+            table_id=self.open_kwargs.get("table_id"),
+            managed_versioning=self.managed_versioning,
+            block_size=self.open_kwargs.get("block_size"),
+            index_cache_size=self.open_kwargs.get("index_cache_size"),
+            metadata_cache_size_bytes=self.open_kwargs.get("metadata_cache_size_bytes"),
+            # The stripped variant that was actually handed to pylance; the
+            # unstripped copy on this handle is for Daft planning only.
+            default_scan_options=self.open_kwargs.get("default_scan_options"),
+        )
 
 
 def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int) -> list[dict[str, list[int]]]:
@@ -81,13 +155,50 @@ def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int
     return non_empty_batches
 
 
-def construct_lance_dataset(
-    uri: str | pathlib.Path,
+def construct_lance_dataset_handle(
+    uri: str | pathlib.Path | None,
     version: int | str | None = None,
     storage_options: dict[str, Any] | None = None,
+    io_config: IOConfig | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    table_id: list[str] | None = None,
     **kwargs: Any,
-) -> lance.LanceDataset:
-    """Construct a Lance dataset with common options."""
+) -> LanceDatasetHandle:
+    """Construct a Lance dataset and retain its reusable open context.
+
+    Storage options are layered from lowest to highest priority:
+    io_config-derived < user-provided ``storage_options`` < namespace-vended.
+    For a plain ``uri``, user-provided ``storage_options`` replace the
+    io_config-derived ones entirely (historical behavior).
+    """
+    validate_uri_or_namespace(uri, namespace_impl, table_id, namespace_properties)
+    resolved_uri = str(uri) if uri is not None else None
+    namespace_storage_options = None
+    managed_versioning = False
+    if resolved_uri is None:
+        resolved = resolve_namespace_table(
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+            table_id=table_id,
+            mode="read",
+        )
+        if resolved is not None:
+            resolved_uri = resolved.uri
+            namespace_storage_options = resolved.storage_options
+            managed_versioning = resolved.managed_versioning
+    if resolved_uri is None:
+        raise ValueError("Unable to resolve Lance dataset URI.")
+
+    io_derived_options = io_config_to_storage_options(io_config, resolved_uri) if io_config is not None else None
+    if uri is not None:
+        # Falsy check on purpose: entry points historically treated an empty dict
+        # like None and fell through to the io_config-derived options.
+        base_options = storage_options or io_derived_options
+        merged_storage_options = merge_storage_options(base_options, namespace_storage_options)
+    else:
+        merged_storage_options = merge_storage_options(io_derived_options, storage_options, namespace_storage_options)
+
     original_default_scan_options = kwargs.pop("default_scan_options", None)
     safe_default_scan_options = None
     if isinstance(original_default_scan_options, dict):
@@ -98,26 +209,41 @@ def construct_lance_dataset(
         # Non-dict defaults are forwarded as-is.
         kwargs["default_scan_options"] = original_default_scan_options
 
-    ds = lance.dataset(uri, storage_options=storage_options, version=version, **kwargs)
+    dataset_uri = None if has_namespace_params(namespace_impl, table_id) else resolved_uri
+    dataset = lance.dataset(
+        dataset_uri,
+        storage_options=merged_storage_options,
+        version=version,
+        **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
+        **kwargs,
+    )
 
     effective_kwargs = {
-        "storage_options": storage_options,
-        "version": version,
+        "storage_options": merged_storage_options,
+        # Pin the snapshot the driver resolved, not the caller's request. These
+        # kwargs cross to scan workers, and ``version=None`` there means "open
+        # latest": a compaction landing between planning and execution leaves
+        # workers looking for fragment ids that no longer exist, and an
+        # overwrite silently feeds them different data entirely.
+        "version": dataset.version,
+        "namespace_impl": namespace_impl,
+        "namespace_properties": namespace_properties,
+        "table_id": table_id,
     }
     effective_kwargs.update(kwargs or {})
-    try:
-        ds._lance_open_kwargs = effective_kwargs  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    # Preserve the full user-provided defaults (including nearest) for Daft's planning
-    # even if we stripped keys out before calling `lance.dataset`.
-    try:
-        ds._daft_default_scan_options = original_default_scan_options  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    return ds
+    # ``asof``/tags are inputs to the version resolution above; carrying them
+    # further is redundant at best. (pylance lets ``version`` win when both are
+    # passed, so this is belt-and-braces.)
+    effective_kwargs.pop("asof", None)
+    return LanceDatasetHandle(
+        dataset=dataset,
+        uri=resolved_uri,
+        open_kwargs=effective_kwargs,
+        managed_versioning=managed_versioning,
+        # Preserve the full user-provided defaults (including nearest) for
+        # Daft's planning even if keys were stripped before calling Lance.
+        default_scan_options=original_default_scan_options if isinstance(original_default_scan_options, dict) else None,
+    )
 
 
 def combine_filters_to_arrow(predicates: list[Any] | None) -> pa.compute.Expression | None:

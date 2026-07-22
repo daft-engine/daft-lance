@@ -38,6 +38,63 @@ from daft_lance import merge_columns_df
 merge_columns_df(df, "s3://bucket/my_dataset")
 ```
 
+### Namespace Tables
+
+Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance-namespace/)
+(catalog) instead of a raw URI. Pass `namespace_impl` + `namespace_properties` + `table_id`
+in place of `uri` — the namespace resolves the table's storage location and vends any storage
+credentials. This works across `read_lance`, `write_lance`, `merge_columns_df`,
+`create_scalar_index`, and `compact_files`.
+
+```python
+import daft
+import daft_lance
+
+table_id = ["my_table"]
+namespace = {"namespace_impl": "dir", "namespace_properties": {"root": "/tmp/lance_tables"}}
+
+daft_lance.write_lance(
+    daft.from_pydict({"id": [1, 2, 3]}),
+    table_id=table_id,
+    mode="create",
+    **namespace,
+).collect()
+
+df = daft_lance.read_lance(table_id=table_id, **namespace)
+```
+
+`uri` and the namespace parameters are mutually exclusive: provide exactly one of `uri` or
+(`namespace_impl` + `table_id`).
+
+#### Using a REST namespace (e.g. Gravitino Lance REST server)
+
+```python
+namespace = {
+    "namespace_impl": "rest",
+    "namespace_properties": {"uri": "http://127.0.0.1:9101/lance"},
+}
+table_id = ["lance_catalog", "sales", "orders"]
+
+daft_lance.write_lance(df, table_id=table_id, mode="create", **namespace).collect()
+daft_lance.read_lance(table_id=table_id, **namespace).show()
+```
+
+When the catalog holds the storage configuration (bucket, endpoint, credentials), the
+`describe_table` response vends `storage_options` to the client, so you do not need to pass
+object-store credentials yourself. If the namespace does not vend credentials, your
+`io_config` (or explicit `storage_options`) is applied to the resolved location; when both
+are present, namespace-vended options take precedence.
+
+Namespace clients are cached per (implementation, properties) pair. The cache size defaults
+to 16 and can be tuned with the `DAFT_LANCE_NAMESPACE_CACHE_SIZE` environment variable
+(read once at import time).
+
+#### Daft's own entry points
+
+Native namespace support in `daft.read_lance` / `DataFrame.write_lance` is tracked in
+[Eventual-Inc/Daft#7282](https://github.com/Eventual-Inc/Daft/issues/7282); until that lands,
+use the `daft_lance` entry points shown above for namespace-addressed tables.
+
 ## Migration
 
 The migration only requires replacing `daft.io.lance` with `daft_lance`.

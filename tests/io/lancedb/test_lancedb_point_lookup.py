@@ -104,7 +104,7 @@ def test_scanner_without_fragments(lance_dataset, idx_type):
     # Invoke factory with fragment_ids=None to exercise index-driven fragment selection
     gen = lance_scan._lancedb_table_factory_function(
         ds.uri,
-        getattr(ds, "_lance_open_kwargs", None),
+        {},
         None,
         ["id", "value"],
         arrow_filter,

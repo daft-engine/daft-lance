@@ -10,6 +10,7 @@ from ._lance import (
     merge_columns,
     merge_columns_df,
     read_lance,
+    write_lance,
 )
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "merge_columns_df",
     "read_lance",
     "take_blobs",
+    "write_lance",
 ]

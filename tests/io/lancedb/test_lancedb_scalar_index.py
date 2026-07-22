@@ -17,6 +17,27 @@ from daft_lance.lance_scalar_index import (
     _prepare_index_segments_for_commit,
     create_scalar_index_internal,
 )
+from daft_lance.namespace import DatasetOpenContext
+
+
+class FakeOpenContext:
+    """Stands in for DatasetOpenContext so handlers can be driven against a fake dataset.
+
+    Also counts opens, which is what proves a handler reopens once per instance
+    rather than once per call.
+    """
+
+    def __init__(self, dataset, uri="memory://fake"):
+        self.dataset = dataset
+        self.uri = uri
+        self.opens = 0
+
+    def open_pinned(self):
+        self.opens += 1
+        return self.dataset
+
+    def open_latest(self):
+        return self.open_pinned()
 
 
 @pytest.fixture
@@ -621,7 +642,7 @@ class TestSegmentedBTreeIndex:
 
         fake_ds = FakeLanceDataset()
         handler = SegmentedFragmentIndexHandler(
-            lance_ds=fake_ds,
+            open_context=FakeOpenContext(fake_ds),
             column="price",
             index_type="BTREE",
             name="price_idx",
@@ -704,7 +725,7 @@ class TestSegmentedBTreeIndex:
 
         fake_ds = FakeLanceDataset()
         handler = SegmentedFragmentIndexHandler(
-            lance_ds=fake_ds,
+            open_context=FakeOpenContext(fake_ds),
             column="flag",
             index_type="BITMAP",
             name="flag_idx",
@@ -772,7 +793,7 @@ class TestSegmentedBTreeIndex:
 
         create_scalar_index_internal(
             lance_ds=FakeLanceDataset(),
-            uri="memory://bitmap",
+            open_context=DatasetOpenContext(uri="memory://bitmap", version=1),
             column="flag",
             index_type="BITMAP",
             name="flag_bitmap_idx",
@@ -804,7 +825,7 @@ class TestSegmentedBTreeIndex:
 
         create_scalar_index_internal(
             lance_ds=fake_ds,
-            uri="memory://bitmap",
+            open_context=DatasetOpenContext(uri="memory://bitmap", version=1),
             column="flag",
             index_type="BITMAP",
             name="flag_bitmap_idx",
@@ -1067,7 +1088,7 @@ class TestSegmentedBTreeIndex:
 
         create_scalar_index_internal(
             lance_ds=FakeLanceDataset(),
-            uri="memory://btree",
+            open_context=DatasetOpenContext(uri="memory://btree", version=1),
             column="price",
             index_type="BTREE",
             name="price_btree_idx",
