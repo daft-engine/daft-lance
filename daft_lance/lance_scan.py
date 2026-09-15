@@ -282,15 +282,9 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
         fields = pushdowns.aggregation_required_column_names()
         new_schema = Schema.from_pyarrow_schema(pa.schema([pa.field(fields[0], pa.uint64())]))
         yield ScanTask.python_factory_func_scan_task(
-<<<<<<< HEAD
             module=_lancedb_count_result_function.__module__,
             func_name=_lancedb_count_result_function.__name__,
             func_args=(self._ds.uri, self._open_kwargs, fields[0], self._combine_filters_to_arrow()),
-=======
-            module=_lance_count_result_function.__module__,
-            func_name=_lance_count_result_function.__name__,
-            func_args=(self._ds.uri, open_kwargs, fields[0], self._combine_filters_to_arrow()),
->>>>>>> e9aedf4 (Remove misleading LanceDB naming)
             schema=new_schema._schema,
             num_rows=1,
             size_bytes=None,
