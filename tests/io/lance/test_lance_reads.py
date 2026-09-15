@@ -271,7 +271,7 @@ class TestLanceCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [b], aggregation: count(col(b), All)}" in actual.out
-        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out or "_lancedb_count_result_function" in actual.out
 
         result = df.to_pydict()
         assert result == {"count": [6]}
@@ -284,7 +284,7 @@ class TestLanceCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [a], aggregation: count(col(a), All)}" not in actual.out
-        assert "_lance_count_result_function" not in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" not in actual.out and "_lancedb_count_result_function" not in actual.out
 
         result = df.to_pydict()
         assert result == {"a": [5]}
@@ -297,7 +297,7 @@ class TestLanceCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [b], aggregation: count(col(b), All)}" in actual.out
-        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out or "_lancedb_count_result_function" in actual.out
 
         result = df.to_pydict()
         assert result == {"count": [6]}
@@ -310,7 +310,7 @@ class TestLanceCountPushdown:
         _ = capsys.readouterr()
         df.explain(True)
         actual = capsys.readouterr()
-        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out or "_lancedb_count_result_function" in actual.out
         assert "Filter pushdown = is_null(col(b))" in actual.out
         assert "Aggregation pushdown = count(col(b), All)" in actual.out
 
@@ -325,7 +325,7 @@ class TestLanceCountPushdown:
         _ = capsys.readouterr()
         df.explain(True)
         actual = capsys.readouterr()
-        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out or "_lancedb_count_result_function" in actual.out
         assert "Filter pushdown = is_null(col(b)) | is_null(col(c))" in actual.out
         assert "Aggregation pushdown = count(col(b), All)" in actual.out
 
@@ -341,7 +341,7 @@ class TestLanceCountPushdown:
         _ = capsys.readouterr()
         df.explain(True)
         actual = capsys.readouterr()
-        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out or "_lancedb_count_result_function" in actual.out
         assert "Aggregation pushdown" in actual.out
         assert "Filter pushdown" in actual.out
 
@@ -356,7 +356,7 @@ class TestLanceCountPushdown:
         _ = capsys.readouterr()
         df.explain(True)
         actual = capsys.readouterr()
-        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out or "_lancedb_count_result_function" in actual.out
 
         result = df.to_pydict()
         assert result == {"count": [4]}
@@ -373,7 +373,7 @@ class TestLanceCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [a], aggregation: count(col(a), All)}" in actual.out
-        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out or "_lancedb_count_result_function" in actual.out
 
         result = df.to_pydict()
         assert result == {"count": [0]}
@@ -386,7 +386,7 @@ class TestLanceCountPushdown:
         df.explain(True)
         actual = capsys.readouterr()
         assert "Pushdowns: {projection: [b], aggregation: count(col(b), All)}" in actual.out
-        assert "_lance_count_result_function" in actual.out  # Accept daft or daft_lance module path
+        assert "_lance_count_result_function" in actual.out or "_lancedb_count_result_function" in actual.out
 
         result = df.to_pydict()
         assert result == {"count": [6]}
