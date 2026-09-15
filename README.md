@@ -63,13 +63,44 @@ later re-run, so callers should filter the input first when they need idempotent
 > `overwrite_where`, without any error. Make sure no other writer touches the table during a
 > conditional overwrite.
 
+### Column Updates
+
+Use a prepared Daft DataFrame to overwrite existing Lance columns while
+preserving row addresses and untouched column files:
+
+```python
+import daft
+from daft_lance import read_lance, update_columns_df
+
+source = read_lance(
+    "s3://bucket/my_dataset",
+    default_scan_options={"with_row_address": True},
+    include_fragment_id=True,
+)
+source = source.where(daft.col("date") >= "2026-07-01")
+source = source.with_column("label", recompute_label(source["value"]))
+
+result = update_columns_df(
+    source.select("_rowaddr", "fragment_id", "label"),
+    "s3://bucket/my_dataset",
+    columns=["label"],
+)
+print(result.version, result.rows_updated)
+```
+
+The source `_rowaddr` values must all be unique live rows in the pinned target
+snapshot. The update is committed atomically using Lance `RewriteColumns`.
+Stable-row-ID datasets are rejected before any fragments are written because
+current pylance bindings cannot propagate the offsets required to advance
+`_row_last_updated_at_version` and keep CDF metadata correct.
+
 ### Namespace Tables
 
 Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance-namespace/)
 (catalog) instead of a raw URI. Pass `namespace_impl` + `namespace_properties` + `table_id`
 in place of `uri` — the namespace resolves the table's storage location and vends any storage
 credentials. This works across `read_lance`, `write_lance`, `merge_columns_df`,
-`create_scalar_index`, and `compact_files`.
+`update_columns_df`, `create_scalar_index`, and `compact_files`.
 
 ```python
 import daft

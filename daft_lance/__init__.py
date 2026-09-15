@@ -10,15 +10,19 @@ from ._lance import (
     merge_columns,
     merge_columns_df,
     read_lance,
+    update_columns_df,
     write_lance,
 )
+from .lance_update_column import UpdateColumnsResult
 
 __all__ = [
+    "UpdateColumnsResult",
     "compact_files",
     "create_scalar_index",
     "merge_columns",
     "merge_columns_df",
     "read_lance",
     "take_blobs",
+    "update_columns_df",
     "write_lance",
 ]
