@@ -139,6 +139,24 @@ def test_lancedb_with_version(lance_dataset_path):
             )
 
 
+def test_lancedb_reads_appended_versions(tmp_path):
+    dataset_path = str(tmp_path / "appended_versions.lance")
+    initial_data = {"id": [1, 2], "value": ["a", "b"]}
+    appended_data = {"id": [3, 4], "value": ["c", "d"]}
+
+    lance.write_dataset(pa.Table.from_pydict(initial_data), dataset_path)
+    lance.write_dataset(pa.Table.from_pydict(appended_data), dataset_path, mode="append")
+
+    df_v1 = daft.read_lance(uri=dataset_path, version=1)
+    assert df_v1.to_pydict() == initial_data
+
+    df_v2 = daft.read_lance(uri=dataset_path, version=2)
+    assert df_v2.to_pydict() == {
+        "id": initial_data["id"] + appended_data["id"],
+        "value": initial_data["value"] + appended_data["value"],
+    }
+
+
 def test_lancedb_read_parallelism_fragment_merging(large_lance_dataset_path):
     """Test parallelism parameter reduces scan tasks by merging fragments."""
     df = daft.read_lance(uri=large_lance_dataset_path, fragment_group_size=3)
