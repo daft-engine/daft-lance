@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import lance
@@ -23,6 +23,47 @@ from .utils import combine_filters_to_arrow
 logger = logging.getLogger(__name__)
 
 
+class _LanceBatchIterator(Iterator[PyRecordBatch]):
+    """Iterator over ``PyRecordBatch`` that also exposes cumulative I/O statistics.
+
+    Daft's executor duck-types the object returned by a ``python_factory_func_scan_task``
+    factory: if it has a callable ``stats`` attribute, Daft calls it after every batch and
+    once more when the iterator is exhausted, and folds the *delta* since the previous call
+    into the scan task's IOStats. ``stats()`` therefore returns cumulative counters for the
+    lifetime of this iterator, and the counters only ever increase.
+
+    Every ``ds.scanner(...)`` created by the wrapped generator must be given
+    ``scan_stats_callback=self.record_scan_stats`` so that Lance's per-scanner
+    ``ScanStatistics`` are added into the running totals.
+    """
+
+    __slots__ = ("_batches", "_bytes_read", "_requests")
+
+    def __init__(
+        self, make_batches: Callable[[Callable[[lance.ScanStatistics], None]], Iterator[PyRecordBatch]]
+    ) -> None:
+        self._bytes_read = 0
+        self._requests = 0
+        # ``make_batches`` receives this wrapper's callback and must pass it as
+        # ``scan_stats_callback`` to every scanner it creates.
+        self._batches = make_batches(self.record_scan_stats)
+
+    def record_scan_stats(self, scan_stats: lance.ScanStatistics) -> None:
+        """Lance ``scan_stats_callback``; fires once per scanner when it finishes."""
+        self._bytes_read += int(getattr(scan_stats, "bytes_read", 0) or 0)
+        self._requests += int(getattr(scan_stats, "requests", 0) or 0)
+
+    def stats(self) -> dict[str, int]:
+        """Cumulative I/O counters for this iterator, in the keys Daft recognizes."""
+        return {"bytes.read": self._bytes_read, "requests": self._requests}
+
+    def __iter__(self) -> _LanceBatchIterator:
+        return self
+
+    def __next__(self) -> PyRecordBatch:
+        return next(self._batches)
+
+
 # TODO support fts and fast_search
 def _lancedb_table_factory_function(
     ds_uri: str,
@@ -33,7 +74,7 @@ def _lancedb_table_factory_function(
     limit: int | None = None,
     include_fragment_id: bool | None = False,
     nearest: dict[str, Any] | None = None,
-) -> Iterator[PyRecordBatch]:
+) -> _LanceBatchIterator:
     if fragment_ids is not None and nearest is not None:
         raise ValueError(
             "fragment_ids and nearest options are mutually exclusive. "
@@ -43,7 +84,9 @@ def _lancedb_table_factory_function(
 
     ds = open_dataset_from_open_kwargs(ds_uri, open_kwargs)
 
-    def _iter_batches() -> Iterator[PyRecordBatch]:
+    def _iter_batches(
+        fragments: list[lance.LanceFragment], record_scan_stats: Callable[[lance.ScanStatistics], None]
+    ) -> Iterator[PyRecordBatch]:
         # Iterate fragments individually; append a fragment_id column only when requested
         # Handle limit correctly by tracking how many rows we've yielded so far
         rows_yielded = 0
@@ -66,6 +109,7 @@ def _lancedb_table_factory_function(
                 filter=filter,
                 limit=fragment_limit,
                 blob_handling="blobs_descriptions",
+                scan_stats_callback=record_scan_stats,
             )
 
             for rb in scanner.to_batches():
@@ -88,14 +132,16 @@ def _lancedb_table_factory_function(
                     yield RecordBatch.from_arrow_record_batches([rb], rb.schema)._recordbatch
                 rows_yielded += len(rb)
 
-    # If fragment_ids is None, let Lance choose fragments via index; omit the fragments parameter.
-    if fragment_ids is None:
+    def _index_driven_batches(record_scan_stats: Callable[[lance.ScanStatistics], None]) -> Iterator[PyRecordBatch]:
+        # Let Lance choose fragments via index; omit the fragments parameter.
+        # The scanner is built eagerly (as before) so construction errors surface at factory-call time.
         scanner = ds.scanner(
             columns=required_columns,
             filter=filter,
             limit=limit,
             nearest=nearest,
             blob_handling="blobs_descriptions",
+            scan_stats_callback=record_scan_stats,
         )
 
         def _batches() -> Iterator[PyRecordBatch]:
@@ -103,12 +149,15 @@ def _lancedb_table_factory_function(
                 yield RecordBatch.from_arrow_record_batches([rb], rb.schema)._recordbatch
 
         return _batches()
+
+    if fragment_ids is None:
+        return _LanceBatchIterator(_index_driven_batches)
     else:
         fragments_raw = [ds.get_fragment(id) for id in (fragment_ids or [])]
         fragments = [f for f in fragments_raw if f is not None]
         if not fragments:
             raise RuntimeError(f"Unable to find lance fragments {fragment_ids}")
-        return _iter_batches()
+        return _LanceBatchIterator(lambda record_scan_stats: _iter_batches(fragments, record_scan_stats))
 
 
 def _lancedb_count_result_function(
