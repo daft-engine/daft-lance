@@ -36,9 +36,12 @@ from daft_lance.namespace import (
     validate_uri_or_namespace,
 )
 
+DAFT_IDEMPOTENCE_KEY = "daft.idempotence-key"
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from daft.checkpoint import IdempotentCommit
     from daft.daft import IOConfig
 
 logger = logging.getLogger(__name__)
@@ -89,6 +92,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         storage_options: dict[str, str] | None = None,
         use_mem_wal: bool = False,
         compact_after_write: bool = True,
+        checkpoint: IdempotentCommit | None = None,
     ) -> None:
         self._reject_unsupported_modes(mode, use_legacy_format)
         self._reject_namespace_mem_wal(namespace_impl, table_id, use_mem_wal)
@@ -107,6 +111,12 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         self._table_id = table_id
         self._io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
         self._user_storage_options = storage_options
+        if checkpoint is not None and mode != "append":
+            raise NotImplementedError("Lance checkpoint writes currently support mode='append' only.")
+        if checkpoint is not None and use_mem_wal:
+            raise NotImplementedError("Lance checkpoint writes currently do not support use_mem_wal=True.")
+        self._checkpoint = checkpoint
+        self._checkpoint_enabled = checkpoint is not None
         self._init_lance_knobs(
             max_rows_per_file=max_rows_per_file,
             max_rows_per_group=max_rows_per_group,
@@ -173,6 +183,11 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         # Schema actually written to the dataset (blob columns retyped to lance.blob.v2).
         self._effective_pyarrow_schema = self._blob.build_effective_schema(self._pyarrow_schema)
+
+    def _ensure_started(self) -> None:
+        """Resolve the table if this checkpoint path runs before write_sink().start()."""
+        if self._table_uri is None:
+            self.start()
 
     def _validate_overwrite_where_against_table(self, dataset: lance.LanceDataset) -> None:
         """Fail on the driver, before any data is written, if the filter is unusable.
@@ -378,6 +393,28 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def schema(self) -> Schema:
         return self._schema
 
+    def checkpoint_file_format(self) -> str | None:
+        """Return the checkpoint metadata format for this sink.
+
+        Daft core calls this while building the DataSink pipeline. Returning
+        "lance" means Daft should stage this sink's per-input write_results as
+        Lance checkpoint metadata. Returning None keeps the normal DataSink path.
+        """
+        return "lance" if self._checkpoint_enabled else None
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Customize how this sink is pickled for Ray workers.
+
+        Ray workers call write(), but they do not call finalize(). They only
+        need _checkpoint_enabled so Daft still stages write_results. The
+        checkpoint store stays on the driver because it cannot be pickled and
+        is only needed later by finalize().
+        """
+        state = self.__dict__.copy()
+        if self._checkpoint_enabled:
+            state["_checkpoint"] = None
+        return state
+
     def _prepare_arrow_table(self, input_table: pa.Table) -> pa.Table:
         target_schema = self._table_schema if self._table_schema is not None else self._pyarrow_schema
         target_schema = self._blob.cast_target_schema(target_schema)
@@ -489,7 +526,115 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             self._mem_wal_total_bytes += result.bytes_written
             yield result
 
-    def finalize(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
+    @staticmethod
+    def _enum_name(value: Any) -> str:
+        """Return the name for checkpoint enum values."""
+        if isinstance(value, str):
+            return value
+        name = getattr(value, "name", None)
+        if isinstance(name, str):
+            return name
+        text = str(value)
+        if "." in text:
+            return text.rsplit(".", 1)[-1]
+        raise TypeError(f"expected checkpoint enum or string, got {value!r}")
+
+    def _pending_checkpoint_ids(self) -> list[str]:
+        """Return checkpoint ids that are sealed but not marked committed.
+
+        These ids point to staged Lance write_results. After the Lance append
+        transaction lands, we mark these ids committed so the store stops
+        returning their write_results as pending work.
+        """
+        assert self._checkpoint is not None
+        return [
+            checkpoint.id
+            for checkpoint in self._checkpoint.store.list_checkpoints()
+            if self._enum_name(checkpoint.status) == "Checkpointed"
+        ]
+
+    def _checkpointed_write_results(self) -> list[WriteResult[list[FragmentMetadata]]]:
+        """Read staged Lance write_results from the checkpoint store.
+
+        Daft core stores DataSink output as Arrow IPC MicroPartitions. This
+        decodes those blobs and returns the original WriteResult objects, whose
+        result fields contain Lance fragments.
+        """
+        assert self._checkpoint is not None
+
+        write_results: list[WriteResult[list[FragmentMetadata]]] = []
+        for file_metadata in self._checkpoint.store.get_checkpointed_files():
+            if self._enum_name(file_metadata.format) != "Lance":
+                raise RuntimeError(
+                    "unexpected checkpoint metadata format for Lance write; "
+                    f"expected Lance, got {file_metadata.format!r}"
+                )
+
+            try:
+                micropartition = MicroPartition.from_ipc_stream(file_metadata.data)
+                payload = micropartition.to_pydict()
+                write_results.extend(payload["write_results"])
+            except Exception as e:
+                raise RuntimeError(
+                    "failed to decode Lance write_results from checkpoint store; "
+                    "expected an Arrow IPC MicroPartition with a python `write_results` column"
+                ) from e
+        return write_results
+
+    @staticmethod
+    def _dataset_version(dataset: Any) -> int:
+        """Return the current Lance dataset version number."""
+        return int(getattr(dataset, "version", getattr(dataset, "latest_version", 0)))
+
+    def _dataset_stats_result(self, dataset: Any) -> MicroPartition:
+        """Build the MicroPartition returned by write_lance."""
+        stats = dataset.stats.dataset_stats()
+        return MicroPartition.from_pydict(
+            {
+                "num_fragments": pa.array([stats["num_fragments"]], type=pa.int64()),
+                "num_deleted_rows": pa.array([stats["num_deleted_rows"]], type=pa.int64()),
+                "num_small_files": pa.array([stats["num_small_files"]], type=pa.int64()),
+                "version": pa.array([self._dataset_version(dataset)], type=pa.int64()),
+            }
+        )
+
+    def _idempotence_key_exists(self, dataset: Any) -> bool:
+        """Return True if Lance already has a transaction for this commit key.
+
+        Checkpointed Lance commits write DAFT_IDEMPOTENCE_KEY into transaction
+        properties. Retries scan the history for the same value to avoid
+        appending the same fragments twice.
+        """
+        assert self._checkpoint is not None
+
+        version = max(self._dataset_version(dataset), 1)
+        for transaction in dataset.get_transactions(version):
+            if transaction is None:
+                continue
+            properties = getattr(transaction, "transaction_properties", None) or {}
+            if properties.get(DAFT_IDEMPOTENCE_KEY) == self._checkpoint.idempotence_key:
+                return True
+        return False
+
+    def checkpoint_commit_exists(self) -> bool:
+        """Driver-side pre-check used before running the write pipeline.
+
+        DataFrame.write_lance calls this before write_sink(). If the Lance
+        transaction history already has this idempotence key, the logical commit
+        has already landed. In that case, this retry does not run the pipeline,
+        so there are no current-run write_results. DataFrame.write_lance still
+        calls finalize([]), which lets the sink mark pending checkpoint ids from
+        the previous attempt committed.
+        """
+        if not self._checkpoint_enabled:
+            return False
+        if self._checkpoint is None:
+            raise RuntimeError("checking a Lance checkpoint commit requires the driver-side CheckpointStore")
+        self._ensure_started()
+        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+        return self._idempotence_key_exists(dataset)
+
+    def _finalize_uncheckpointed(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
         """Commits the fragments to the Lance dataset. Returns a DataFrame with the stats of the dataset."""
         if self._use_mem_wal:
             return self._finalize_mem_wal(write_results)
@@ -587,6 +732,81 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             )
 
         return _dataset_stats(dataset)
+
+    def _finalize_checkpointed(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
+        """Finalize a checkpointed append using write_results from the store.
+
+        The current run's write_results are not the source of truth. A retry may
+        skip inputs that were already checkpointed, so pending fragments must be
+        recovered from the checkpoint store.
+        """
+        assert self._checkpoint is not None
+        self._ensure_started()
+
+        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+        pending_ids = self._pending_checkpoint_ids()
+
+        # Check the Lance history again at finalize time. The pre-check in
+        # DataFrame.write_lance runs before the pipeline starts, so it can miss:
+        # 1. A concurrent retry that commits the same idempotence key while this
+        #    retry is still running.
+        # 2. A previous attempt that passed the pre-check, committed to Lance,
+        #    and then crashed before mark_committed().
+        if self._idempotence_key_exists(dataset):
+            if pending_ids:
+                self._checkpoint.store.mark_committed(pending_ids)
+            return self._dataset_stats_result(dataset)
+
+        checkpointed_write_results = self._checkpointed_write_results()
+        if not checkpointed_write_results:
+            if write_results:
+                raise RuntimeError(
+                    "write_lance checkpoint did not stage any Lance write_results. "
+                    "Read the source with daft.CheckpointConfig using the same CheckpointStore."
+                )
+            return self._dataset_stats_result(dataset)
+
+        fragments = list(chain.from_iterable(write_result.result for write_result in checkpointed_write_results))
+        # It is possible to recover WriteResult objects whose result lists contain no
+        # Lance fragments. For example, an input can reach the sink after all
+        # rows were filtered out, so Daft still has a completed checkpoint
+        # boundary but Lance did not create any physical fragment files.
+        #
+        # In that case there is no data change to append. We avoid creating a
+        # no-op Lance transaction because it would add a new table version only
+        # to record that nothing was appended. The useful recovery action is to
+        # mark the sealed checkpoint ids committed so these inputs are not
+        # returned as pending work again.
+        if not fragments:
+            if pending_ids:
+                self._checkpoint.store.mark_committed(pending_ids)
+            return self._dataset_stats_result(dataset)
+
+        operation = lance.LanceOperation.Append(fragments)
+        transaction = lance.Transaction(
+            self._dataset_version(dataset),
+            operation,
+            transaction_properties={DAFT_IDEMPOTENCE_KEY: self._checkpoint.idempotence_key},
+        )
+        assert self._table_uri is not None, "LanceDataSink.start() must run before finalize"
+        committed_dataset = lance.LanceDataset.commit(
+            self._table_uri,
+            transaction,
+            storage_options=self._storage_options,
+            **self._namespace_commit_kwargs,
+        )
+
+        if pending_ids:
+            self._checkpoint.store.mark_committed(pending_ids)
+        return self._dataset_stats_result(committed_dataset)
+
+    def finalize(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
+        """Commits the fragments to the Lance dataset. Returns a DataFrame with the stats of the dataset."""
+        if self._checkpoint_enabled:
+            if self._checkpoint is None:
+                raise RuntimeError("checkpointed Lance finalization requires the driver-side CheckpointStore")
+            return self._finalize_checkpointed(write_results)
+        return self._finalize_uncheckpointed(write_results)
 
 
 class _LanceFragmentBuffer:
