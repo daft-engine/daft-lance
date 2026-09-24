@@ -42,3 +42,14 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Run tests
         run: uv run --python ${{ matrix.python-version }} pytest tests/ -v
+
+  test-ray:
+    runs-on: ubuntu-latest
+    env:
+      DAFT_RUNNER: ray
+      DAFT_PROGRESS_BAR: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Run blob tests on Ray
+        run: uv run --python 3.12 --group ray pytest tests/io/lance/test_lance_blob_v2_read.py -v
