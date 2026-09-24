@@ -384,6 +384,7 @@ def test_checkpoint_finalize_marks_empty_fragment_results_committed(tmp_path):
 
 
 @pytest.mark.skipif(os.environ.get("DAFT_RUNNER") != "ray", reason="checkpoint source filtering requires Ray")
+@pytest.mark.xfail(strict=False, reason="needs Daft core to stage write_results (Eventual-Inc/Daft#7035)")
 def test_write_lance_checkpoint_append_retry_e2e(tmp_path):
     """A normal append retry with the same idempotence key is a no-op.
 
@@ -457,6 +458,7 @@ def test_write_lance_checkpoint_requires_source_checkpoint_e2e(tmp_path):
 
 
 @pytest.mark.skipif(os.environ.get("DAFT_RUNNER") != "ray", reason="checkpoint source filtering requires Ray")
+@pytest.mark.xfail(strict=False, reason="needs Daft core to stage write_results (Eventual-Inc/Daft#7035)")
 def test_write_lance_checkpoint_recovers_after_commit_before_mark_committed(tmp_path):
     """End-to-end recovery for commit succeeded, mark_committed failed.
 
@@ -516,6 +518,7 @@ def test_write_lance_checkpoint_recovers_after_commit_before_mark_committed(tmp_
 
 
 @pytest.mark.skipif(os.environ.get("DAFT_RUNNER") != "ray", reason="checkpoint source filtering requires Ray")
+@pytest.mark.xfail(strict=False, reason="needs Daft core to stage write_results (Eventual-Inc/Daft#7035)")
 def test_write_lance_checkpoint_recovers_after_stage_before_commit(tmp_path):
     """End-to-end recovery for stage/seal succeeded, Lance commit failed.
 
