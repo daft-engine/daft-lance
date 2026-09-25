@@ -309,6 +309,7 @@ For large blobs where you only need part of each one on the native runner, use
 ```python
 from daft_lance import take_blobs
 
+df = daft.read_lance(ds.uri, version=ds.version, default_scan_options={"with_row_id": True})
 df = take_blobs(df, ds, "blob_column")
 blob = df.select("blob_column").to_pydict()["blob_column"][0]
 header = blob.read(1024)

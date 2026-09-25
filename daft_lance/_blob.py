@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import lance
@@ -273,6 +274,19 @@ def _validate_blob_column(df: DataFrame, column: str) -> None:
         raise ValueError(f"Column {column} is not a Lance blob column")
 
 
+def _runner_is_ray() -> bool:
+    """Best-effort check for whether Daft will execute on Ray.
+
+    Daft picks an explicitly set runner first, then ``DAFT_RUNNER``, then Ray if
+    it is initialized. ``get_or_infer_runner_type`` skips the env var step, so it
+    reports "ray" under ``DAFT_RUNNER=native`` whenever Ray is initialized even
+    though Daft runs natively. Honor an explicit native env var first.
+    """
+    if os.environ.get("DAFT_RUNNER", "").strip().lower() == "native":
+        return False
+    return daft.runners.get_or_infer_runner_type() == "ray"
+
+
 def take_blobs(df: DataFrame, ds: lance.LanceDataset, column: str) -> DataFrame:
     """Replace the blob descriptor column with lazy ``lance.BlobFile`` handles.
 
@@ -283,7 +297,7 @@ def take_blobs(df: DataFrame, ds: lance.LanceDataset, column: str) -> DataFrame:
     """
     # (1) Validate that we can actually materialize the blobs. The runner check is
     #     best-effort: a runner set to Ray after this call is not detected.
-    if daft.runners.get_or_infer_runner_type() == "ray":
+    if _runner_is_ray():
         raise ValueError(
             "take_blobs returns lance.BlobFile objects, which cannot be sent between Ray workers. "
             "Use daft_lance.read_blobs to materialize blobs as binary instead."

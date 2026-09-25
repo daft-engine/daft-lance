@@ -211,10 +211,22 @@ def test_take_blobs_rejects_inferred_ray_runner(
     lance_dataset: lance.LanceDataset, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """take_blobs fails fast, pointing at read_blobs, when the runner is (inferred to be) Ray."""
+    monkeypatch.delenv("DAFT_RUNNER", raising=False)
     monkeypatch.setattr(daft.runners, "get_or_infer_runner_type", lambda: "ray")
     df = daft.read_lance(lance_dataset.uri, default_scan_options={"with_row_id": True})
     with pytest.raises(ValueError, match="read_blobs"):
         take_blobs(df, lance_dataset, "blob")
+
+
+def test_take_blobs_allows_explicit_native_runner(
+    lance_dataset: lance.LanceDataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DAFT_RUNNER=native wins over an initialized Ray, matching how Daft picks the runner."""
+    monkeypatch.setenv("DAFT_RUNNER", "native")
+    monkeypatch.setattr(daft.runners, "get_or_infer_runner_type", lambda: "ray")
+    df = daft.read_lance(lance_dataset.uri, default_scan_options={"with_row_id": True})
+    df = take_blobs(df, lance_dataset, "blob")
+    assert df.schema()["blob"].dtype == daft.DataType.python()
 
 
 @pytest.mark.skipif(not ON_RAY, reason="needs the Ray runner")
@@ -299,6 +311,37 @@ def test_read_blobs_duplicate_rowids(lance_dataset: lance.LanceDataset) -> None:
     rows = df.sort("id").to_pydict()
     assert rows["id"] == [1, 2, 2]
     assert rows["blob"] == [b"tiny-inline-data", b"x" * 100_000, b"x" * 100_000]
+
+
+@pytest.mark.parametrize("stable_row_ids", [False, True])
+def test_read_blobs_after_delete_and_compaction(tmp_path: Path, stable_row_ids: bool) -> None:
+    """read_blobs maps _rowid to the right blob across fragments, deletions and compaction."""
+    values = {i: f"blob-{i}".encode() * (i + 1) for i in range(12)}
+    table = pa.table(
+        {
+            "id": pa.array(list(values), type=pa.int64()),
+            "blob": lance.blob_array(list(values.values())),
+        }
+    )
+    ds = lance.write_dataset(
+        table,
+        str(tmp_path),
+        data_storage_version="2.2",
+        max_rows_per_file=4,
+        enable_stable_row_ids=stable_row_ids,
+    )
+    assert len(ds.get_fragments()) == 3
+    ds.delete("id IN (1, 5, 6, 10)")
+    ds.optimize.compact_files()
+    ds = lance.dataset(ds.uri)
+
+    df = daft.read_lance(ds.uri, version=ds.version, default_scan_options={"with_row_id": True})
+    df = read_blobs(df, ds, "blob", batch_size=3)
+    rows = df.to_pydict()
+
+    expected = {i: v for i, v in values.items() if i not in (1, 5, 6, 10)}
+    assert dict(zip(rows["id"], rows["blob"])) == expected
+    assert len(rows["id"]) == len(expected)
 
 
 @pytest.mark.parametrize("batch_size", [0, -1])
