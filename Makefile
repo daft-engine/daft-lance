@@ -18,7 +18,7 @@ build: sync  ## Build sdist and wheel packages
 
 .PHONY: test
 test: sync  ## Run tests
-	uv run pytest tests/ -v $(EXTRA_ARGS)
+	DAFT_ANALYTICS_ENABLED=0 uv run pytest tests/ -v $(EXTRA_ARGS)
 
 .PHONY: format
 format: sync  ## Format Python code

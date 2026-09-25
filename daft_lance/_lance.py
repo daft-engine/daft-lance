@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pathlib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from daft import context
@@ -18,6 +18,7 @@ from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal
 from .lance_scan import LanceScanOperator
+from .lance_update_column import UpdateColumnsResult, update_columns_from_df, validate_update_arguments
 from .namespace import validate_uri_or_namespace
 from .utils import construct_lance_dataset_handle
 
@@ -386,6 +387,135 @@ def merge_columns_df(
         left_on=left_on,
         right_on=effective_right_on,
         batch_size=effective_batch_size,
+    )
+
+
+@PublicAPI
+def update_columns_df(
+    df: DataFrame,
+    uri: str | pathlib.Path | None = None,
+    io_config: IOConfig | None = None,
+    *,
+    columns: Sequence[str],
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    storage_options: dict[str, Any] | None = None,
+    version: int | str | None = None,
+    asof: str | None = None,
+    block_size: int | None = None,
+    commit_lock: Any | None = None,
+    index_cache_size: int | None = None,
+    default_scan_options: dict[str, Any] | None = None,
+    metadata_cache_size_bytes: int | None = None,
+    max_concurrency: int | None = None,
+) -> UpdateColumnsResult:
+    """Overwrite existing Lance columns using values from a Daft DataFrame.
+
+    The source DataFrame must contain ``_rowaddr``, ``fragment_id``, and every
+    column named in ``columns``. It is grouped by fragment and rewritten in
+    parallel, then all fragment metadata is committed in one atomic Lance
+    ``RewriteColumns`` transaction.
+
+    Args:
+        df: Prepared update values with ``_rowaddr`` and ``fragment_id`` from the
+            target Lance snapshot. Extra columns are ignored.
+        uri: URI of the target Lance dataset. Mutually exclusive with namespace
+            parameters.
+        io_config: Daft object-store configuration.
+        columns: Existing top-level columns to overwrite. Values are cast to
+            the target Arrow types with ``safe=True``. Arrow does not detect
+            every lossy float narrowing conversion, so produce the target float
+            type explicitly when precision matters. Struct columns are rejected:
+            casting a source struct to the target type fills any field the
+            source omits with nulls, which would silently drop data the caller
+            did not intend to overwrite.
+        table_id: Namespace table identifier.
+        namespace_impl: Lance Namespace implementation.
+        namespace_properties: Properties used to connect to the namespace.
+        storage_options: Additional object-store options.
+        version: Dataset version or tag to read and commit against. Defaults to
+            the current version. It must be the snapshot the source ``_rowaddr``
+            values were read from. Lance rebases the commit over concurrent
+            transactions that touch other fragments; a concurrent write to a
+            fragment this update rewrites raises ``CommitConflictError``.
+        asof: If specified, find the latest version created on or earlier than the given argument value.
+        block_size: Block size in bytes. Provide a hint for the size of the minimal I/O request.
+        commit_lock: Custom Lance commit lock.
+        index_cache_size: Index cache size.
+        default_scan_options: Default scan options.
+        metadata_cache_size_bytes: Size of the metadata cache in bytes.
+        max_concurrency: Maximum number of concurrent fragment-update workers.
+
+    Returns:
+        The committed dataset version, and the number of rows the source
+        submitted. Row addresses are not checked against the target: the
+        rewrite is a left-outer join, so a ``_rowaddr`` that is not a live row
+        of the pinned snapshot updates nothing, and a ``_rowaddr`` repeated in
+        the source updates its row once with an unspecified one of the
+        submitted values. Both are silent and both are still counted. Keep the
+        source aligned with ``version``, and unique, to keep the count
+        meaningful.
+
+    Note:
+        Fragments are rewritten in parallel, so a failure raised by one
+        fragment can leave data files other fragments already wrote behind.
+        Nothing is committed and the dataset version does not change; the
+        unreferenced files stay until Lance cleans them up (see
+        ``LanceDataset.cleanup_old_versions``).
+
+    Raises:
+        NotImplementedError: If the target dataset uses stable row IDs. The
+            current pylance transaction binding cannot propagate the updated
+            fragment offsets required for correct CDF metadata.
+
+    Examples:
+        >>> import daft
+        >>> import daft_lance
+        >>> source = daft_lance.read_lance(  # doctest: +SKIP
+        ...     "/tmp/events.lance",
+        ...     default_scan_options={"with_row_address": True},
+        ...     include_fragment_id=True,
+        ... )
+        >>> source = source.where(daft.col("date") >= "2026-07-01")  # doctest: +SKIP
+        >>> source = source.with_column("label", daft.col("value") * 2)  # doctest: +SKIP
+        >>> result = daft_lance.update_columns_df(  # doctest: +SKIP
+        ...     source.select("_rowaddr", "fragment_id", "label"),
+        ...     "/tmp/events.lance",
+        ...     columns=["label"],
+        ... )
+    """
+    resolved_columns = validate_update_arguments(columns, max_concurrency)
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    dataset_handle = construct_lance_dataset_handle(
+        uri,
+        storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
+        version=version,
+        asof=asof,
+        block_size=block_size,
+        commit_lock=commit_lock,
+        index_cache_size=index_cache_size,
+        default_scan_options=default_scan_options,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
+    )
+    if dataset_handle.dataset.has_stable_row_ids:
+        raise NotImplementedError(
+            "update_columns_df does not support datasets with stable row IDs: "
+            "pylance does not yet expose updated fragment offsets, so "
+            "_row_last_updated_at_version and CDF metadata cannot be updated correctly."
+        )
+
+    return update_columns_from_df(
+        df,
+        dataset_handle.dataset,
+        dataset_handle.worker_open_context(),
+        columns=resolved_columns,
+        commit_lock=commit_lock,
+        max_concurrency=max_concurrency,
     )
 
 

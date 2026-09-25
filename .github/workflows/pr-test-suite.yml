@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Daft reads its telemetry opt-out at import time, so it has to be set before
+# the test process starts rather than from a conftest.
+env:
+  DAFT_ANALYTICS_ENABLED: "0"
+
 jobs:
   style:
     runs-on: ubuntu-latest
