@@ -659,7 +659,7 @@ class TestRegressions:
         """Bug: the candidate check called df.collect(), which sets df._result_cache.
 
         Daft caches collect() results in _result_cache. One-shot Python objects
-        in that cache (e.g. a lance.BlobFile returned by a UDF) are exhausted; when the
+        in that cache (e.g. BlobFile from take_blobs()) are exhausted; when the
         fast-path merge re-executes the pipeline via groupby().map_groups(), the
         same stale objects are returned and downstream UDFs produce null/wrong output.
 

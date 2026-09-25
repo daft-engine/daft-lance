@@ -258,26 +258,8 @@ class BlobV2WritePolicy:
         return pa.schema(new_fields, metadata=metadata)
 
 
-def take_blobs(
-    df: DataFrame,
-    ds: lance.LanceDataset,
-    column: str,
-    *,
-    batch_size: int = 16,
-    io_buffer_size: int | None = None,
-) -> DataFrame:
-    """Materialize blobs from the Lance dataset into the dataframe as binary.
-
-    The descriptor column is replaced in-place by a binary column holding the
-    full blob payload for each row. Null blobs (and rows with a null ``_rowid``)
-    become None; valid empty blobs become ``b""``.
-
-    Each UDF call reads up to ``batch_size`` rows and holds all of their blobs in
-    memory at once. The small default keeps memory bounded for large blobs such as
-    videos; raise it for small blobs. ``io_buffer_size`` is forwarded to Lance's
-    blob reader.
-    """
-    # (1) Validate that we can actually materialize the blobs
+def _validate_blob_column(df: DataFrame, column: str) -> None:
+    """Check that `column` is a Lance blob descriptor column and `_rowid` is present."""
     schema = df.schema()
     columns = set(schema.column_names())
     if column not in columns:
@@ -289,13 +271,63 @@ def take_blobs(
         )
     if schema[column].dtype != LANCE_BLOB_DESCRIPTOR_TYPE:
         raise ValueError(f"Column {column} is not a Lance blob column")
+
+
+def take_blobs(df: DataFrame, ds: lance.LanceDataset, column: str) -> DataFrame:
+    """Replace the blob descriptor column with lazy ``lance.BlobFile`` handles.
+
+    Mirrors ``LanceDataset.take_blobs``: each value is a file-like handle that
+    reads the blob on demand and supports range reads. ``BlobFile`` cannot be
+    pickled, so this only works on the native runner; use :func:`read_blobs`
+    on Ray.
+    """
+    # (1) Validate that we can actually materialize the blobs. The runner check is
+    #     best-effort: a runner set to Ray after this call is not detected.
+    if daft.runners.get_or_infer_runner_type() == "ray":
+        raise ValueError(
+            "take_blobs returns lance.BlobFile objects, which cannot be sent between Ray workers. "
+            "Use daft_lance.read_blobs to materialize blobs as binary instead."
+        )
+    _validate_blob_column(df, column)
+
+    # 2. Create a UDF closure over the lance dataset so we can take the blobs.
+    @daft.func.batch(return_dtype=daft.DataType.python())
+    def take_blobs_udf(row_ids: Series):  # type: ignore[no-untyped-def]
+        blobs = ds.take_blobs(column, ids=row_ids.to_pylist())
+        return Series.from_pylist(blobs, name=column, dtype=DataType.python(), pyobj="force")
+
+    # 3. Return the new DataFrame with the column replaced by the logical lance blob type (python objects).
+    return df.with_column(column, take_blobs_udf(df["_rowid"]))
+
+
+def read_blobs(
+    df: DataFrame,
+    ds: lance.LanceDataset,
+    column: str,
+    *,
+    batch_size: int = 16,
+    io_buffer_size: int | None = None,
+) -> DataFrame:
+    """Replace the blob descriptor column with the full blob payloads as binary.
+
+    Mirrors ``LanceDataset.read_blobs`` and works on any runner, including Ray.
+    Null blobs (and rows with a null ``_rowid``) become None; valid empty blobs
+    become ``b""``.
+
+    Each UDF call reads up to ``batch_size`` rows and holds all of their blobs in
+    memory at once. The small default keeps memory bounded for large blobs such as
+    videos; raise it for small blobs. ``io_buffer_size`` is forwarded to Lance's
+    blob reader.
+    """
+    # (1) Validate that we can actually materialize the blobs
+    _validate_blob_column(df, column)
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
 
     # 2. Create a UDF closure over the lance dataset so we can read the blobs. The dataset
     #    pickles with its version and manifest, so workers read the same snapshot.
     @daft.func.batch(return_dtype=DataType.binary(), batch_size=batch_size)
-    def take_blobs_udf(row_ids: Series) -> Series:
+    def read_blobs_udf(row_ids: Series) -> Series:
         ids = row_ids.to_pylist()
         valid = [i for i, row_id in enumerate(ids) if row_id is not None]
         blobs = ds.read_blobs(
@@ -312,4 +344,4 @@ def take_blobs(
         return Series.from_arrow(pa.array(payloads, type=pa.large_binary()), name=column)
 
     # 3. Return the new DataFrame with the descriptor column replaced by the blob bytes.
-    return df.with_column(column, take_blobs_udf(df["_rowid"]))
+    return df.with_column(column, read_blobs_udf(df["_rowid"]))
