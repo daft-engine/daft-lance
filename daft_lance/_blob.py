@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import lance
 import lance.blob  # registers lance.blob.v2 extension type
-import pyarrow.compute as pc
 
 import daft
 from daft.dataframe import DataFrame
@@ -40,7 +39,10 @@ def binary_to_blob_v2_array(col: pa.ChunkedArray[Any] | pa.Array[Any]) -> pa.Ext
     """Promote an Arrow binary / large_binary column to a logical lance.blob.v2 ExtensionArray.
 
     Builds the storage struct directly from the Arrow buffer to avoid the
-    list[bytes] round-trip that ``lance.blob.blob_array`` requires.
+    list[bytes] round-trip that ``lance.blob.blob_array`` requires. Every row is
+    inline: only ``data`` is set, while ``uri``/``position``/``size`` stay null
+    (Lance rejects a range without a ``uri``). Null inputs become null structs
+    so that ``None`` stays distinct from ``b""``.
     """
     combined: pa.Array[Any] = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
     if not pa.types.is_large_binary(combined.type):
@@ -49,7 +51,6 @@ def binary_to_blob_v2_array(col: pa.ChunkedArray[Any] | pa.Array[Any]) -> pa.Ext
         combined = combined.cast(pa.large_binary())
     arr = cast(pa.LargeBinaryArray, combined)
     n = len(arr)
-    sizes = pc.binary_length(arr).cast(pa.uint64())
     storage_fields: list[pa.Field[Any]] = [
         pa.field("data", pa.large_binary()),
         pa.field("uri", pa.string()),
@@ -60,10 +61,11 @@ def binary_to_blob_v2_array(col: pa.ChunkedArray[Any] | pa.Array[Any]) -> pa.Ext
         [
             arr,
             pa.nulls(n, type=pa.string()),
-            pa.array([0] * n, type=pa.uint64()),
-            sizes,
+            pa.nulls(n, type=pa.uint64()),
+            pa.nulls(n, type=pa.uint64()),
         ],
         fields=storage_fields,
+        mask=arr.is_null() if arr.null_count else None,
     )
     return pa.ExtensionArray.from_storage(lance.blob.BlobType(), storage)
 

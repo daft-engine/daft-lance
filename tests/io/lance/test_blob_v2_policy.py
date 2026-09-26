@@ -235,16 +235,43 @@ def test_binary_to_blob_v2_array_single_row() -> None:
     assert len(arr) == 1
     storage = arr.storage  # type: ignore[attr-defined]
     assert storage.field("data").to_pylist() == [b"abc"]
-    assert storage.field("size").to_pylist() == [3]
+
+
+def test_binary_to_blob_v2_array_inline_rows_only_set_data() -> None:
+    # Lance rejects position/size without a uri, so inline rows leave them null.
+    arr = binary_to_blob_v2_array(pa.array([b"abc", b"de"], type=pa.binary()))
+    storage = arr.storage  # type: ignore[attr-defined]
+    assert storage.field("uri").null_count == 2
+    assert storage.field("position").null_count == 2
+    assert storage.field("size").null_count == 2
+
+
+def test_binary_to_blob_v2_array_preserves_null_vs_empty() -> None:
+    arr = binary_to_blob_v2_array(pa.array([b"a", None, b""], type=pa.binary()))
+    storage = arr.storage  # type: ignore[attr-defined]
+    assert storage.is_null().to_pylist() == [False, True, False]
+    assert storage.to_pylist() == [
+        {"data": b"a", "uri": None, "position": None, "size": None},
+        None,
+        {"data": b"", "uri": None, "position": None, "size": None},
+    ]
+
+
+def test_binary_to_blob_v2_array_sliced_input_keeps_null_positions() -> None:
+    base = pa.array([b"skip", None, b"x", b"", None], type=pa.binary())
+    arr = binary_to_blob_v2_array(base.slice(1, 3))
+    storage = arr.storage  # type: ignore[attr-defined]
+    assert storage.is_null().to_pylist() == [True, False, False]
+    assert storage.field("data").to_pylist() == [None, b"x", b""]
 
 
 def test_binary_to_blob_v2_array_multi_chunk_via_chunked_array() -> None:
-    chunked = pa.chunked_array([pa.array([b"a"], type=pa.binary()), pa.array([b"bb", b"ccc"], type=pa.binary())])
+    chunked = pa.chunked_array([pa.array([b"a"], type=pa.binary()), pa.array([None, b"ccc"], type=pa.binary())])
     arr = binary_to_blob_v2_array(chunked)
     assert len(arr) == 3
     storage = arr.storage  # type: ignore[attr-defined]
-    assert storage.field("data").to_pylist() == [b"a", b"bb", b"ccc"]
-    assert storage.field("size").to_pylist() == [1, 2, 3]
+    assert storage.field("data").to_pylist() == [b"a", None, b"ccc"]
+    assert storage.is_null().to_pylist() == [False, True, False]
 
 
 def test_binary_to_blob_v2_array_rejects_int64() -> None:

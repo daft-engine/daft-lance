@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import pickle
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import daft
 from daft import execution_config_ctx, from_pylist
@@ -89,40 +89,20 @@ class SegmentedFragmentIndexHandler:
         return pickle.dumps(index_meta)
 
 
-def _existing_index_names(lance_ds: lance.LanceDataset) -> set[str]:
-    """Return existing index names, falling back for legacy indexes with bad details."""
-    try:
-        return {idx.name for idx in lance_ds.describe_indices()}
-    except Exception:
-        pass
-
-    try:
-        return {cast(dict[str, Any], idx)["name"] for idx in lance_ds.list_indices()}
-    except Exception:
-        return set()
-
-
 def _existing_index_coverage(lance_ds: lance.LanceDataset, name: str) -> set[int] | None:
     """Return the fragment IDs covered by an existing index, or None if absent.
 
     The coverage is the union of the fragment IDs covered by the index's
-    committed segments. Returns ``None`` when no index with that name exists.
-    When the manifest cannot be described but the name is visible through the
-    deprecated ``list_indices``, returns an empty set so callers still treat
-    the index as existing. Column/type compatibility is not checked here:
-    Lance's build and commit APIs reject incompatible combinations, and
-    duplicating those rules in string space has caused false rejections
-    before (e.g. 'LabelList' vs 'LABEL_LIST').
+    committed segments. Returns ``None`` when no index with that name exists
+    or when the indices cannot be described. Column/type compatibility is not
+    checked here: Lance's build and commit APIs reject incompatible
+    combinations, and duplicating those rules in string space has caused false
+    rejections before (e.g. 'LabelList' vs 'LABEL_LIST').
     """
     try:
         descriptions = lance_ds.describe_indices()
     except Exception:
-        logger.warning("describe_indices() failed; checking '%s' via list_indices", name, exc_info=True)
-        try:
-            if any(cast(dict[str, Any], idx).get("name") == name for idx in lance_ds.list_indices()):
-                return set()
-        except Exception:
-            pass
+        logger.warning("describe_indices() failed; treating index '%s' as absent", name, exc_info=True)
         return None
 
     for desc in descriptions:

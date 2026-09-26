@@ -14,7 +14,7 @@ from daft.dependencies import pa, pd
 from daft_lance import create_scalar_index, lance_scalar_index
 from daft_lance.lance_scalar_index import (
     SegmentedFragmentIndexHandler,
-    _existing_index_names,
+    _existing_index_coverage,
     create_scalar_index_internal,
 )
 from daft_lance.namespace import DatasetOpenContext
@@ -133,10 +133,9 @@ class TestDistributedIndexing:
         )
         updated_dataset = lance.dataset(dataset_uri)
 
-        # Verify the index was created. The default non-segmented path does not
-        # populate Lance index details, so use list_indices() here.
-        indices = updated_dataset.list_indices()
-        index_names = [idx["name"] for idx in indices]
+        # Verify the index was created.
+        indices = updated_dataset.describe_indices()
+        index_names = [idx.name for idx in indices]
         assert "text_idx" in index_names, f"Text index not found in {index_names}"
 
         # Test full-text search functionality
@@ -167,8 +166,8 @@ class TestDistributedIndexing:
         updated_dataset = lance.dataset(dataset_uri)
 
         # Verify the index was created with correct name
-        indices = updated_dataset.list_indices()
-        index_names = [idx["name"] for idx in indices]
+        indices = updated_dataset.describe_indices()
+        index_names = [idx.name for idx in indices]
         assert custom_name in index_names, f"Custom index name '{custom_name}' not found in {index_names}"
 
     def test_build_distributed_index_large_dataset(self, temp_dir):
@@ -186,7 +185,7 @@ class TestDistributedIndexing:
         updated_dataset = lance.dataset(dataset_uri)
 
         # Verify the index was created
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "No indices found after building"
 
         # Test search functionality
@@ -269,7 +268,7 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "No indices found after building"
 
     def test_build_distributed_index_with_kwargs(self, multi_fragment_lance_dataset):
@@ -285,7 +284,7 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "No indices found after building"
 
     def test_build_distributed_index_replace_false_existing_index(self, multi_fragment_lance_dataset):
@@ -302,7 +301,7 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "Initial index creation failed"
 
         # Now try to create another index with the same name but replace=False
@@ -334,11 +333,11 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        initial_indices = updated_dataset.list_indices()
+        initial_indices = updated_dataset.describe_indices()
         assert len(initial_indices) > 0, "Initial index creation failed"
 
         # Find our initial index
-        initial_index = next((idx for idx in initial_indices if idx["name"] == index_name), None)
+        initial_index = next((idx for idx in initial_indices if idx.name == index_name), None)
         assert initial_index is not None, "Initial index not found"
 
         create_scalar_index(
@@ -350,8 +349,8 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        final_indices = updated_dataset.list_indices()
-        final_index = next((idx for idx in final_indices if idx["name"] == index_name), None)
+        final_indices = updated_dataset.describe_indices()
+        final_index = next((idx for idx in final_indices if idx.name == index_name), None)
 
         assert final_index is not None, "Index should still exist after replacement"
 
@@ -385,7 +384,7 @@ class TestDistributedIndexing:
 
         # Should still work and create the index
         updated_dataset = lance.dataset(path)
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "No indices found after building"
 
     def test_build_distributed_index_fragment_group_size(self, multi_fragment_lance_dataset):
@@ -404,8 +403,8 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        indices = updated_dataset.list_indices()
-        index_names = [idx["name"] for idx in indices]
+        indices = updated_dataset.describe_indices()
+        index_names = [idx.name for idx in indices]
         assert index_name in index_names, f"Index {index_name!r} not found in {index_names}"
 
         results = updated_dataset.scanner(
@@ -428,7 +427,7 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "No indices found after building"
 
     def test_build_distributed_index_fts_type(self, multi_fragment_lance_dataset):
@@ -446,8 +445,8 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(dataset_uri)
-        indices = updated_dataset.list_indices()
-        index_names = [idx["name"] for idx in indices]
+        indices = updated_dataset.describe_indices()
+        index_names = [idx.name for idx in indices]
         assert index_name in index_names, f"FTS index not found in {index_names}"
 
         # Test search functionality
@@ -481,9 +480,9 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(path)
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "No indices found after building"
-        index_names = [idx["name"] for idx in indices]
+        index_names = [idx.name for idx in indices]
         assert "price_btree_index" in index_names, f"BTREE index not found in {index_names}"
 
         # Test that we can query using the index
@@ -519,7 +518,7 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(path)
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "No indices found after building"
 
         # Verify the index works
@@ -573,9 +572,9 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(path)
-        indices = updated_dataset.list_indices()
+        indices = updated_dataset.describe_indices()
         assert len(indices) > 0, "No indices found after building"
-        index_names = [idx["name"] for idx in indices]
+        index_names = [idx.name for idx in indices]
         assert "price_zonemap_index" in index_names, f"ZONEMAP index not found in {index_names}"
 
         # Test that we can query using the index
@@ -603,8 +602,8 @@ class TestDistributedIndexing:
         )
 
         updated_dataset = lance.dataset(path)
-        indices = updated_dataset.list_indices()
-        index_names = [idx["name"] for idx in indices]
+        indices = updated_dataset.describe_indices()
+        index_names = [idx.name for idx in indices]
         assert "score_zonemap_index" in index_names, f"ZONEMAP index not found in {index_names}"
 
     def test_build_distributed_index_zonemap_string_column(self, temp_dir):
@@ -625,7 +624,7 @@ class TestDistributedIndexing:
             name="text_zonemap_index",
         )
 
-        index_names = [idx["name"] for idx in lance.dataset(path).list_indices()]
+        index_names = [idx.name for idx in lance.dataset(path).describe_indices()]
         assert "text_zonemap_index" in index_names, f"ZONEMAP index not found in {index_names}"
 
 
@@ -682,17 +681,16 @@ class TestSegmentedBTreeIndex:
         assert not hasattr(lance_scalar_index, "_prepare_index_segments_for_commit")
         assert not hasattr(lance_scalar_index, "MERGED_SEGMENTED_INDEX_TYPES")
 
-    def test_existing_index_names_falls_back_to_list_indices(self):
-        """Test that existing-name checks still work for legacy indexes with bad details."""
+    def test_existing_index_coverage_when_describe_indices_fails(self, caplog):
+        """A describe_indices() failure reads as "no existing index"."""
 
         class FakeLanceDataset:
             def describe_indices(self):
                 raise RuntimeError("missing index_details")
 
-            def list_indices(self):
-                return [{"name": "legacy_idx"}]
-
-        assert _existing_index_names(FakeLanceDataset()) == {"legacy_idx"}
+        with caplog.at_level("WARNING", logger="daft_lance.lance_scalar_index"):
+            assert _existing_index_coverage(FakeLanceDataset(), "idx") is None
+        assert "describe_indices() failed" in caplog.text
 
     def test_segmented_bitmap_handler_builds_without_shard_id(self):
         """BITMAP segment creation needs no shard id; segments commit as-is."""

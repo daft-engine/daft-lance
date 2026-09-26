@@ -244,8 +244,8 @@ def test_namespace_create_scalar_index(tmp_path: Path) -> None:
 
     namespace = ln.connect("dir", {"root": str(tmp_path)})
     location = namespace.describe_table(DescribeTableRequest(id=table_id)).location
-    indices = lance.dataset(location).list_indices()
-    assert any(idx["fields"] == ["price"] for idx in indices)
+    indices = lance.dataset(location).describe_indices()
+    assert any(idx.field_names == ["price"] for idx in indices)
 
 
 def test_namespace_create_distributed_inverted_index(tmp_path: Path) -> None:
@@ -272,8 +272,8 @@ def test_namespace_create_distributed_inverted_index(tmp_path: Path) -> None:
     from lance_namespace import DescribeTableRequest
 
     location = ln.connect("dir", {"root": str(tmp_path)}).describe_table(DescribeTableRequest(id=table_id)).location
-    indices = lance.dataset(location).list_indices()
-    assert any(idx["name"] == "text_idx" and idx["fields"] == ["text"] for idx in indices)
+    indices = lance.dataset(location).describe_indices()
+    assert any(idx.name == "text_idx" and idx.field_names == ["text"] for idx in indices)
 
 
 def test_namespace_compact_files(tmp_path: Path) -> None:
