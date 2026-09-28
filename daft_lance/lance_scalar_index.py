@@ -475,9 +475,8 @@ def optimize_indices_internal(
 ) -> lance.LanceDataset:
     """Incrementally maintain existing indexes.
 
-    Delegates to pylance's ``DatasetOptimizer.optimize_indices`` — the same
-    choice lance-ray makes — because Lance core owns the delta-index
-    semantics. One run indexes newly appended fragments, merges small
+    Delegates to pylance's ``DatasetOptimizer.optimize_indices`` because
+    Lance core owns the delta-index semantics. One run indexes newly appended fragments, merges small
     segments (``num_indices_to_merge``), and heals stale fragment IDs left
     inside mixed segments as part of a commit that indexes or merges new
     data; with no new data to index it commits nothing. Heavier changes
@@ -488,8 +487,7 @@ def optimize_indices_internal(
     and unknown names raise listing the available indexes. Everything else
     belongs to Lance.
 
-    Returns the updated dataset (its latest version after the call), the
-    same shape lance-ray returns.
+    Returns the updated dataset (its latest version after the call).
     """
     if indices is not None:
         if len(indices) == 0:

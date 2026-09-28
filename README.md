@@ -97,7 +97,7 @@ updated = optimize_indices("s3://bucket/my_dataset")
 updated = optimize_indices("s3://bucket/my_dataset", indices=["name_idx"], num_indices_to_merge=4)
 ```
 
-Like lance-ray, `optimize_indices` delegates to pylance's
+`optimize_indices` delegates to pylance's
 `DatasetOptimizer.optimize_indices`, runs in the coordinator process, and
 returns the updated dataset; for a distributed rebuild use
 `create_scalar_index(..., replace=True)`. Unknown or empty `indices` raise

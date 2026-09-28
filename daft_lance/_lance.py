@@ -578,9 +578,9 @@ def optimize_indices(
     or merges new data. It commits no new version when there is no new
     data to index and no segments to merge.
 
-    Delegates to pylance's ``DatasetOptimizer.optimize_indices`` — the same
-    choice lance-ray makes — so it runs in the coordinator process (Lance
-    core parallelizes the underlying scans). A full distributed rebuild is
+    Delegates to pylance's ``DatasetOptimizer.optimize_indices`` — Lance
+    core owns the delta-index semantics and parallelizes the underlying
+    scans in the coordinator process. A full distributed rebuild is
     ``create_scalar_index(..., replace=True)``.
 
     Args:
@@ -605,9 +605,8 @@ def optimize_indices(
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
 
     Returns:
-        The updated dataset (its latest version after the call), the same
-        shape lance-ray returns. Read ``.version``, ``describe_indices()``
-        etc. from it if needed.
+        The updated dataset (its latest version after the call). Read
+        ``.version``, ``describe_indices()`` etc. from it if needed.
 
     Raises:
         ValueError: If ``indices`` is empty or names indexes that do not
