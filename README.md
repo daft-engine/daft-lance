@@ -98,12 +98,10 @@ stats = optimize_indices("s3://bucket/my_dataset", indices=["name_idx"], num_ind
 ```
 
 Like lance-ray, `optimize_indices` delegates to pylance's
-`DatasetOptimizer.optimize_indices` and runs in the coordinator process; for
-a distributed rebuild use `create_scalar_index(..., replace=True)`. It
-returns `OptimizeIndicesStats` with the dataset versions immediately before
-and after the call, the duration, and per-index segment/coverage counts
-(coverage counts only fragments still live in the manifest); unknown or
-empty `indices` raise `ValueError`, and duplicates are ignored.
+`DatasetOptimizer.optimize_indices`, runs in the coordinator process, and
+returns the updated dataset; for a distributed rebuild use
+`create_scalar_index(..., replace=True)`. Unknown or empty `indices` raise
+`ValueError`.
 
 
 ### Column Merging

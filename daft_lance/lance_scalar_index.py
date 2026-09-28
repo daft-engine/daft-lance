@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import dataclasses
 import logging
 import pickle
-import time
 from typing import TYPE_CHECKING, Any, cast
 
 import daft
@@ -468,118 +466,38 @@ def _validate_segments_against_manifest(
             )
 
 
-@dataclasses.dataclass(frozen=True)
-class OptimizedIndexStats:
-    """Per-index outcome of an ``optimize_indices`` run.
-
-    ``fragments_covered_*`` count only fragments that still exist in the
-    manifest: stale IDs left inside a segment by deletes do not count as
-    coverage. ``*_after`` fields are zero when the index is absent from the
-    after-snapshot (e.g. a concurrent writer dropped it).
-    """
-
-    name: str
-    segments_before: int
-    segments_after: int
-    fragments_covered_before: int
-    fragments_covered_after: int
-
-
-@dataclasses.dataclass(frozen=True)
-class OptimizeIndicesStats:
-    """Outcome of an ``optimize_indices`` run over one dataset.
-
-    The versions are sampled from the dataset's latest version immediately
-    before and after the optimize call, so they describe the same lineage a
-    single writer sees.
-    """
-
-    version_before: int
-    version_after: int
-    duration_seconds: float
-    indices: list[OptimizedIndexStats]
-
-    @property
-    def changed(self) -> bool:
-        """Whether a new dataset version became visible during the run.
-
-        With no concurrent writers this is exactly whether this run
-        committed a version; a concurrent commit during the call also makes
-        it ``True``.
-        """
-        return self.version_after != self.version_before
-
-
-def _index_snapshot(lance_ds: lance.LanceDataset) -> dict[str, tuple[int, int]]:
-    """Map index name to ``(segment count, live covered-fragment count)``.
-
-    Coverage counts only fragment IDs that still exist in the manifest, so
-    stale IDs left by deletes do not masquerade as coverage. Datasets with
-    legacy manifests that ``describe_indices`` cannot parse fall back to
-    ``list_indices`` names with unknown counts, the same degradation
-    ``create_scalar_index`` uses (``_existing_index_names``).
-    """
-    live_fragments = {fragment.fragment_id for fragment in lance_ds.get_fragments()}
-    try:
-        descriptions = lance_ds.describe_indices()
-    except Exception:
-        logger.warning("describe_indices() failed; reporting index names only", exc_info=True)
-        try:
-            return {cast(dict[str, Any], idx)["name"]: (0, 0) for idx in lance_ds.list_indices()}
-        except Exception:
-            return {}
-
-    snapshot: dict[str, tuple[int, int]] = {}
-    for desc in descriptions:
-        segments = desc.segments or []
-        covered = {fid for segment in segments for fid in (segment.fragment_ids or ())}
-        snapshot[desc.name] = (len(segments), len(covered & live_fragments))
-    return snapshot
-
-
 def optimize_indices_internal(
     lance_ds: lance.LanceDataset,
     open_context: DatasetOpenContext,
     *,
     indices: list[str] | None = None,
     num_indices_to_merge: int | None = None,
-) -> OptimizeIndicesStats:
+) -> lance.LanceDataset:
     """Incrementally maintain existing indexes.
 
     Delegates to pylance's ``DatasetOptimizer.optimize_indices`` — the same
     choice lance-ray makes — because Lance core owns the delta-index
     semantics. One run indexes newly appended fragments, merges small
-    segments (``num_indices_to_merge``) when there are deltas to merge, and
-    heals stale fragment IDs left inside mixed segments **as part of a
-    commit that indexes or merges new data**; with no new data to index it
-    commits nothing and stale-only coverage is left as-is. Heavier changes
+    segments (``num_indices_to_merge``), and heals stale fragment IDs left
+    inside mixed segments as part of a commit that indexes or merges new
+    data; with no new data to index it commits nothing. Heavier changes
     are a distributed rebuild: ``create_scalar_index(..., replace=True)``.
 
     ``indices`` is our parameter and gets deterministic semantics here
     because pylance silently ignores unknown names: an empty list raises,
-    unknown names raise listing the available indexes, and duplicates are
-    ignored (each index is optimized and reported once). Merge-count
-    validation and everything about index internals belong to Lance.
+    and unknown names raise listing the available indexes. Everything else
+    belongs to Lance.
 
-    Both stat snapshots are sampled from the dataset's latest version, so
-    they are never mixed across snapshots even if the caller pinned the
-    handle's version.
+    Returns the updated dataset (its latest version after the call), the
+    same shape lance-ray returns.
     """
     if indices is not None:
         if len(indices) == 0:
             raise ValueError("indices must be a non-empty list of index names; pass None to optimize all indexes.")
-        unique_indices = list(dict.fromkeys(indices))
-        duplicates = sorted({name for name in unique_indices if indices.count(name) > 1})
-        if duplicates:
-            logger.warning("Duplicate index names %s were given; each index is optimized once.", duplicates)
-        indices = unique_indices
-
-    base = open_context.open_latest()
-    before = _index_snapshot(base)
-    if indices is not None:
-        unknown = sorted(set(indices) - before.keys())
+        known = _existing_index_names(lance_ds)
+        unknown = sorted(set(indices) - known)
         if unknown:
-            raise ValueError(f"indices {unknown} do not exist on the dataset. Available index names: {sorted(before)}")
+            raise ValueError(f"indices {unknown} do not exist on the dataset. Available index names: {sorted(known)}")
 
     call_kwargs: dict[str, Any] = {}
     if indices is not None:
@@ -593,36 +511,5 @@ def optimize_indices_internal(
         indices if indices is not None else "(all)",
         num_indices_to_merge,
     )
-    version_before = base.version
-    start = time.monotonic()
     lance_ds.optimize.optimize_indices(**call_kwargs)  # type: ignore[no-untyped-call]
-    duration = time.monotonic() - start
-
-    latest = open_context.open_latest()
-    after = _index_snapshot(latest)
-
-    selected = indices if indices is not None else sorted(before)
-    per_index = [
-        OptimizedIndexStats(
-            name=name,
-            segments_before=before.get(name, (0, 0))[0],
-            segments_after=after.get(name, (0, 0))[0],
-            fragments_covered_before=before.get(name, (0, 0))[1],
-            fragments_covered_after=after.get(name, (0, 0))[1],
-        )
-        for name in selected
-    ]
-
-    logger.info(
-        "Optimized %d indices in %.2fs: version %d -> %d",
-        len(per_index),
-        duration,
-        version_before,
-        latest.version,
-    )
-    return OptimizeIndicesStats(
-        version_before=version_before,
-        version_after=latest.version,
-        duration_seconds=duration,
-        indices=per_index,
-    )
+    return open_context.open_latest()

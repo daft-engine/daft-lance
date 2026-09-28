@@ -16,7 +16,7 @@ from daft.schema import Schema
 from .lance_compaction import compact_files_internal
 from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
-from .lance_scalar_index import OptimizeIndicesStats, create_scalar_index_internal, optimize_indices_internal
+from .lance_scalar_index import create_scalar_index_internal, optimize_indices_internal
 from .lance_scan import LanceScanOperator
 from .namespace import validate_uri_or_namespace
 from .utils import construct_lance_dataset_handle
@@ -566,7 +566,7 @@ def optimize_indices(
     index_cache_size: int | None = None,
     default_scan_options: dict[str, Any] | None = None,
     metadata_cache_size_bytes: int | None = None,
-) -> OptimizeIndicesStats:
+) -> LanceDataset:
     """Incrementally optimize existing indexes.
 
     As data is appended it is not added to existing indexes automatically:
@@ -593,7 +593,7 @@ def optimize_indices(
             {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         indices: Names of the indexes to optimize. ``None`` (the default)
             optimizes every index on the dataset. Unknown names and an empty
-            list raise ``ValueError``; duplicates are ignored.
+            list raise ``ValueError``.
         num_indices_to_merge: How many segments to merge when compacting an
             index (passed to pylance). ``0`` indexes the new data into a new
             segment instead of merging; ``None`` uses pylance's default.
@@ -605,12 +605,9 @@ def optimize_indices(
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
 
     Returns:
-        OptimizeIndicesStats: versions of the dataset's latest snapshot
-        immediately before and after the call, wall-clock duration, and
-        per-index segment/coverage counts (coverage counts only fragments
-        still live in the manifest). ``changed`` is ``True`` when a new
-        version became visible during the call — with no concurrent
-        writers, exactly when this run committed one.
+        The updated dataset (its latest version after the call), the same
+        shape lance-ray returns. Read ``.version``, ``describe_indices()``
+        etc. from it if needed.
 
     Raises:
         ValueError: If ``indices`` is empty or names indexes that do not
