@@ -746,16 +746,27 @@ def create_vector_index(
             overlapped old segments, so readers see either the old or the new index.
         metric: Distance metric ("L2", "cosine", or "dot").
         num_partitions: Number of IVF partitions. If None, Lance derives it from
-            the number of rows during training.
+            the number of rows during training. Note this is the IVF partition
+            count of the trained model — unlike ``create_scalar_index``, where
+            ``num_partitions`` controls Daft's fragment repartitioning; build
+            parallelism here comes from ``fragment_group_size``/``max_concurrency``.
         num_sub_vectors: Number of PQ sub-vectors (PQ variants only). If None,
-            Lance derives it from the vector dimension during training.
+            Lance derives it from the vector dimension during training, or from
+            the supplied ``pq_codebook`` when one is given.
         sample_rate: Rows sampled per IVF partition (and per PQ centroid) during
             training. Training requires at least ``num_partitions * sample_rate``
-            rows (256 * sample_rate for the 8-bit PQ codebook).
+            rows (256 * sample_rate for the 8-bit PQ codebook); the value is
+            automatically clamped down (with a warning) to what the dataset
+            size supports, so the default works on datasets of any size, at the
+            cost of a smaller training sample on small datasets.
         ivf_centroids: Pre-trained IVF centroids (a pyarrow array); skips IVF
             training. Supplying the same centroids to every build is how
-            independently built segments share one model.
-        pq_codebook: Pre-trained PQ codebook (PQ variants only); skips PQ training.
+            independently built segments share one model. Required when
+            appending to an existing index (``fragment_ids`` backfill): all
+            segments of a logical vector index must share one IVF model.
+        pq_codebook: Pre-trained PQ codebook (PQ variants only); skips PQ
+            training. Required when appending to an existing PQ index, for the
+            same shared-model reason as ``ivf_centroids``.
         storage_options: Storage options for the dataset.
         version: Version of the dataset to use.
         asof: Timestamp to use for time travel queries.
@@ -771,19 +782,28 @@ def create_vector_index(
         fragment_ids: Optional list of fragment IDs to index. Fragments already
             covered by committed segments of the same index are skipped and the
             remaining ones appended (incremental backfill); pass ``replace=True``
-            without ``fragment_ids`` for a full rebuild.
+            without ``fragment_ids`` for a full rebuild. Appending requires the
+            same ``ivf_centroids`` (and ``pq_codebook`` for PQ variants) the
+            existing segments were built with — retraining would produce a
+            divergent model that Lance cannot merge, so a backfill without the
+            original model raises ``ValueError``.
         **kwargs: Additional keyword arguments forwarded to Lance's index segment
-            creation API (e.g. ``target_partition_size``).
+            creation API (e.g. ``target_partition_size``). Unknown arguments are
+            rejected with ``TypeError`` — Lance's segment build silently ignores
+            them, so misspellings must not pass silently here.
 
     Returns:
         None
 
     Raises:
         ValueError: If input parameters are invalid (e.g. empty column name,
-            non-existent column, unsupported index type, or an existing index
-            name with ``replace=False``)
-        RuntimeError: If index building fails (e.g. training sample too small,
-            commit failures)
+            non-existent column, unsupported index type, an existing index
+            name with ``replace=False``, a backfill without the original
+            shared model, or a dataset too small to train an IVF model even
+            at ``sample_rate=1`` — Lance raises its training ``ValueError``)
+        TypeError: If column type is incompatible with the chosen ``index_type``,
+            or an unknown keyword argument is passed
+        RuntimeError: If index building fails (e.g. version compatibility issues, commit failures)
 
     Note:
         This function writes Lance datasets via the Lance Python package.
