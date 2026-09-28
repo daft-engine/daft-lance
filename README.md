@@ -104,6 +104,34 @@ returns the updated dataset; for a distributed rebuild use
 `ValueError`.
 
 
+### Vector Indexing
+
+Vector indexes (`IVF_FLAT`, `IVF_PQ`, `IVF_SQ`, `IVF_HNSW_FLAT`,
+`IVF_HNSW_PQ`, `IVF_HNSW_SQ`) are built distributed in three phases: the
+driver trains the global model once — IVF centroids (and the PQ codebook for
+PQ variants) via pylance's `IndicesBuilder`, unless pre-trained
+`ivf_centroids`/`pq_codebook` are supplied — then Daft workers each build one
+uncommitted index segment for their fragment batch with the shared model, and
+the coordinator commits all segments atomically. Segments built against the
+same centroids and codebook commit as one logical index.
+
+```python
+from daft_lance import create_vector_index
+
+create_vector_index("s3://bucket/my_dataset", column="vector", index_type="IVF_PQ", num_partitions=16)
+create_vector_index("s3://bucket/my_dataset", column="embedding", index_type="IVF_FLAT", metric="cosine")
+```
+
+`replace` defaults to `False`, matching pylance's `create_index`: an existing
+index name is refused unless `replace=True`, which rebuilds atomically (one
+manifest transaction retires the old segments and lands the new ones).
+`fragment_ids` partial builds and incremental backfill work the same way as
+for scalar indexes. Training samples `sample_rate` rows per IVF partition
+(and per PQ centroid), so the dataset needs at least
+`num_partitions * sample_rate` rows (`256 * sample_rate` for the 8-bit PQ
+codebook).
+
+
 ### Column Merging
 
 ```python
