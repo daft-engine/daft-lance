@@ -615,11 +615,9 @@ def optimize_indices(
 
     Examples:
         >>> import daft_lance
-        >>> stats = daft_lance.optimize_indices("s3://my-bucket/dataset/")  # doctest: +SKIP
-        >>> stats.changed  # doctest: +SKIP
-        True
-        >>> [i.name for i in stats.indices]  # doctest: +SKIP
-        ['name_idx']
+        >>> updated = daft_lance.optimize_indices("s3://my-bucket/dataset/")  # doctest: +SKIP
+        >>> updated.version  # doctest: +SKIP
+        4
 
         Optimize one index and merge its small segments:
 

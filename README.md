@@ -93,8 +93,8 @@ data to index and no segments to merge.
 ```python
 from daft_lance import optimize_indices
 
-stats = optimize_indices("s3://bucket/my_dataset")
-stats = optimize_indices("s3://bucket/my_dataset", indices=["name_idx"], num_indices_to_merge=4)
+updated = optimize_indices("s3://bucket/my_dataset")
+updated = optimize_indices("s3://bucket/my_dataset", indices=["name_idx"], num_indices_to_merge=4)
 ```
 
 Like lance-ray, `optimize_indices` delegates to pylance's
