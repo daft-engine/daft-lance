@@ -122,13 +122,24 @@ create_vector_index("s3://bucket/my_dataset", column="vector", index_type="IVF_P
 create_vector_index("s3://bucket/my_dataset", column="embedding", index_type="IVF_FLAT", metric="cosine")
 ```
 
-`replace` defaults to `False`, matching pylance's `create_index`: an existing
-index name is refused unless `replace=True`, which rebuilds atomically (one
-manifest transaction retires the old segments and lands the new ones).
-`fragment_ids` partial builds and incremental backfill work the same way as
-for scalar indexes. Training samples `sample_rate` rows per IVF partition
-(and per PQ centroid), so the dataset needs at least
-`num_partitions * sample_rate` rows (`256 * sample_rate` for the 8-bit PQ
+`replace` defaults to `False`, matching pylance's `create_index` — which,
+unlike its scalar counterpart `create_scalar_index` (default `True` above),
+defaults `replace` to `False`. An existing index name is refused unless
+`replace=True`, which rebuilds atomically (one manifest transaction retires
+the old segments and lands the new ones).
+
+`fragment_ids` partial builds and incremental backfill work like the scalar
+workflow, with one vector-specific requirement: appending segments requires
+the same `ivf_centroids` (and `pq_codebook` for PQ variants) the existing
+segments were built with, since every segment of a logical vector index must
+share one IVF model — a backfill without the original model raises instead of
+silently training a divergent one.
+
+Training samples `sample_rate` rows per IVF partition (and per PQ centroid)
+and runs in the coordinator process, so its memory footprint grows with
+`num_partitions * sample_rate * dimension`; `sample_rate` is clamped down
+automatically (with a warning) to what the dataset size supports
+(`num_partitions * sample_rate` rows, `256 * sample_rate` for the 8-bit PQ
 codebook).
 
 

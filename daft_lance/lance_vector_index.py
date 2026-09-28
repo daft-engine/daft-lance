@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import logging
+import math
 import pickle
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import daft
@@ -27,6 +30,65 @@ VECTOR_INDEX_TYPES = frozenset({"IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT",
 
 # PQ variants need a codebook trained alongside the IVF centroids.
 _PQ_INDEX_TYPES = frozenset({"IVF_PQ", "IVF_HNSW_PQ"})
+
+# The 8-bit PQ codebook trains one centroid per 2^8 codes, so its sample
+# requirement is 256 rows per sampled codebook entry.
+_PQ_CODEBOOK_SIZE = 256
+
+# Keyword arguments this workflow sets explicitly on the worker's
+# ``create_index_uncommitted`` call; they are not valid user kwargs here.
+_HANDLER_MANAGED_KWARGS = frozenset(
+    {
+        "column",
+        "index_type",
+        "name",
+        "replace",
+        "train",
+        "fragment_ids",
+        "metric",
+        "num_partitions",
+        "num_sub_vectors",
+        "ivf_centroids",
+        "pq_codebook",
+        "storage_options",
+    }
+)
+
+
+@lru_cache(maxsize=1)
+def _accepted_worker_kwargs() -> frozenset[str]:
+    """Keyword arguments Lance's segment-build API actually understands.
+
+    ``create_index_uncommitted`` ends in ``**kwargs`` and silently drops
+    unknown keys (verified: a misspelled or unsupported parameter builds an
+    index with the wrong configuration and no warning), so the driver
+    validates user kwargs against its signature instead of forwarding blind.
+    """
+    params = inspect.signature(lance.LanceDataset.create_index_uncommitted).parameters
+    return frozenset(params) - _HANDLER_MANAGED_KWARGS
+
+
+def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
+    """Reject kwargs Lance's segment build would silently ignore."""
+    if "segmented" in kwargs:
+        raise TypeError(
+            "The 'segmented' parameter was removed: the distributed segment-index "
+            "workflow is the only code path. Remove the argument."
+        )
+    unknown = sorted(set(kwargs) - _accepted_worker_kwargs())
+    if not unknown:
+        return
+    hints = {
+        "distance_type": " (create_vector_index uses 'metric'; pylance's training "
+        "API calls it distance_type, but this API does not accept that spelling)",
+        "train": " (the distributed workflow always trains segment builds)",
+    }
+    detail = "; ".join(f"'{name}'{hints.get(name, '')}" for name in unknown)
+    raise TypeError(
+        f"Unknown keyword argument(s) for create_vector_index: {detail}. Lance's "
+        f"index segment build silently ignores unknown arguments, so they are "
+        f"rejected here. Accepted: {sorted(_accepted_worker_kwargs())}."
+    )
 
 
 class VectorFragmentIndexHandler:
@@ -121,9 +183,14 @@ def create_vector_index_internal(
        ``IndicesBuilder.train_pq`` — unless the caller supplies pre-trained
        ``ivf_centroids`` / ``pq_codebook``. One shared model across segments is
        what lets independently built segments commit as one logical index.
-    2. Fragment batches are distributed across Daft workers; each worker calls
-       ``create_index_uncommitted`` with the shared model for its fragments and
-       pickles the segment metadata back.
+       ``sample_rate`` is clamped down to what the dataset size supports
+       (training needs ``num_partitions * sample_rate`` rows, and the 8-bit PQ
+       codebook needs ``256 * sample_rate``); ``num_sub_vectors`` and
+       ``num_partitions`` are derived from a supplied codebook / centroids when
+       not given explicitly.
+    2. Fragment batches are distributed across Daft workers, one partition per
+       batch; each worker calls ``create_index_uncommitted`` with the shared
+       model for its fragments and pickles the segment metadata back.
     3. The coordinator validates the collected segments against the live
        manifest (dead/overlapping/missing coverage) and commits them all in one
        ``commit_existing_index_segments`` transaction, which retires overlapped
@@ -133,9 +200,12 @@ def create_vector_index_internal(
     an existing index name is refused unless ``replace=True``. Column type
     compatibility is validated by Lance's training and build APIs, not
     duplicated here. ``fragment_ids`` restricts the build to a subset of
-    fragments; already-covered fragments are skipped, so a partial build
-    followed by a backfill is the incremental path (same semantics as the
-    scalar index workflow).
+    fragments; already-covered fragments are skipped and the remainder
+    appended. Appending requires the same ``ivf_centroids`` (and
+    ``pq_codebook`` for PQ variants) the existing segments were built with:
+    every segment of a logical vector index must share one IVF model, or
+    Lance cannot merge the segments later, so a backfill without the original
+    model raises instead of silently training a divergent one.
     """
     if not column:
         raise ValueError("Column name cannot be empty")
@@ -151,10 +221,14 @@ def create_vector_index_internal(
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
 
+    # Reject kwargs Lance's segment build would silently swallow (misspelled
+    # or unsupported parameters must not build a misconfigured index).
+    _validate_worker_kwargs(kwargs)
+
     # Validate column exists; whether it is a vector column is Lance's rule,
     # enforced by the training and build APIs with clear errors.
     try:
-        lance_ds.schema.field(column)
+        field = lance_ds.schema.field(column)
     except KeyError as e:
         available_columns = [field.name for field in lance_ds.schema]
         raise ValueError(f"Column '{column}' not found. Available: {available_columns}") from e
@@ -202,13 +276,36 @@ def create_vector_index_internal(
         to_build = requested_fragment_ids - covered
         if already_covered:
             logger.info(
-                "Fragments %s are already covered by index '%s'; skipping them.",
+                "Fragments %s are already covered by index '%s'; skipping them%s",
                 sorted(already_covered),
                 name,
+                " (replace does not rebuild covered fragments; use replace=True without "
+                "fragment_ids for a full rebuild)"
+                if replace
+                else "",
             )
         if not to_build:
             logger.info("All requested fragments are already covered by index '%s'; nothing to build.", name)
             return
+        # Appended segments join a live logical index, and every segment of a
+        # logical vector index must share the same IVF model: Lance's segment
+        # merge refuses segments trained on different centroids (the error
+        # ``optimize_indices`` would later raise). Training here would sample
+        # non-deterministically and silently produce a divergent model, so the
+        # original model must be supplied.
+        if ivf_centroids is None:
+            raise ValueError(
+                f"Cannot append to index '{name}': all segments of a vector index must share "
+                "one IVF model, and retraining would produce a divergent one. Pass the same "
+                "ivf_centroids (and pq_codebook, for PQ variants) the existing segments were "
+                "built with, or rebuild the whole index with replace=True and no fragment_ids."
+            )
+        if index_type in _PQ_INDEX_TYPES and pq_codebook is None:
+            raise ValueError(
+                f"Cannot append to PQ index '{name}' without the original pq_codebook: all "
+                "segments must share one model. Pass the codebook the existing segments were "
+                "built with, or rebuild the whole index with replace=True and no fragment_ids."
+            )
         requested_fragment_ids = to_build
 
     if requested_fragment_ids is not None:
@@ -219,29 +316,60 @@ def create_vector_index_internal(
     if not fragment_ids_to_use:
         raise ValueError(f"Dataset at {open_context.uri} contains no fragments")
 
+    # Validate grouping before any training work so argument errors surface first.
+    if fragment_group_size is None:
+        fragment_group_size = 10
+    elif fragment_group_size <= 0:
+        raise ValueError("fragment_group_size must be positive")
+
     # Phase 1: train the global model once on the driver so all segments
     # share the same centroids (and codebook) and commit as one logical index.
+    num_rows = lance_ds.count_rows()
+    effective_sample_rate = sample_rate
+    needs_ivf_training = ivf_centroids is None
+    needs_pq_training = index_type in _PQ_INDEX_TYPES and pq_codebook is None
+    if needs_ivf_training or needs_pq_training:
+        # Clamp the sample rate to what this dataset can support, mirroring
+        # Lance's own training requirements: num_partitions * sample_rate rows
+        # for IVF (Lance derives num_partitions as sqrt(num_rows) when None)
+        # and 256 * sample_rate rows for the 8-bit PQ codebook.
+        effective_partitions = num_partitions if num_partitions is not None else max(1, round(math.sqrt(num_rows)))
+        caps = [max(1, num_rows // effective_partitions)]
+        if needs_pq_training:
+            caps.append(max(1, num_rows // _PQ_CODEBOOK_SIZE))
+        clamped = min([sample_rate, *caps])
+        if clamped < sample_rate:
+            logger.warning(
+                "sample_rate %d exceeds what the dataset supports (%d rows); clamping to %d",
+                sample_rate,
+                num_rows,
+                clamped,
+            )
+            effective_sample_rate = clamped
+
     builder = lance.indices.IndicesBuilder(lance_ds, column)
     ivf_model: lance.indices.IvfModel | None = None
-    if ivf_centroids is None:
+    if needs_ivf_training:
         logger.info(
-            "Phase 1: training IVF centroids (index_type=%s, metric=%s, num_partitions=%s, sample_rate=%s)",
+            "Phase 1: training IVF centroids (index_type=%s, metric=%s, num_partitions=%s, sample_rate=%d)",
             index_type,
             metric,
             num_partitions,
-            sample_rate,
+            effective_sample_rate,
         )
         ivf_model = builder.train_ivf(
             num_partitions=num_partitions,
             distance_type=metric.lower(),
-            sample_rate=sample_rate,
+            sample_rate=effective_sample_rate,
         )
         ivf_centroids = ivf_model.centroids
         num_partitions = ivf_model.num_partitions
         logger.info("IVF training completed: num_partitions=%d", num_partitions)
 
-    if index_type in _PQ_INDEX_TYPES and pq_codebook is None:
-        logger.info("Phase 1: training PQ codebook (num_sub_vectors=%s, sample_rate=%s)", num_sub_vectors, sample_rate)
+    if needs_pq_training:
+        logger.info(
+            "Phase 1: training PQ codebook (num_sub_vectors=%s, sample_rate=%d)", num_sub_vectors, effective_sample_rate
+        )
         if ivf_model is None:
             # Caller-supplied centroids: wrap them so train_pq can partition
             # its samples with the same model the segments will be built with.
@@ -249,34 +377,40 @@ def create_vector_index_internal(
         pq_model = builder.train_pq(
             ivf_model,
             num_subvectors=num_sub_vectors,
-            sample_rate=sample_rate,
+            sample_rate=effective_sample_rate,
         )
         pq_codebook = pq_model.codebook
         num_sub_vectors = pq_model.num_subvectors
         logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
 
-    if ivf_centroids is None:
-        raise ValueError("ivf_centroids must be provided or trainable for IVF-based distributed vector indices")
-    if index_type in _PQ_INDEX_TYPES and pq_codebook is None:
-        raise ValueError("pq_codebook must be provided or trainable for PQ-based distributed vector indices")
+    # Derive the model shape from supplied artifacts when not given: the
+    # partition count is the number of centroids, and the sub-vector count
+    # follows from the codebook's entry size versus the column dimension.
+    if num_partitions is None and ivf_centroids is not None:
+        num_partitions = len(ivf_centroids)
+    if num_sub_vectors is None and pq_codebook is not None:
+        dimension = getattr(field.type, "list_size", None)
+        subvector_size = getattr(pq_codebook.type, "list_size", None)
+        if dimension and subvector_size and dimension % subvector_size == 0:
+            num_sub_vectors = dimension // subvector_size
+        else:
+            raise ValueError(
+                f"Cannot derive num_sub_vectors from the supplied pq_codebook "
+                f"(column dimension {dimension}, codebook entry size {subvector_size}); "
+                "pass num_sub_vectors explicitly."
+            )
 
-    model_kwargs: dict[str, Any] = {"metric": metric}
-    if num_partitions is not None:
-        model_kwargs["num_partitions"] = num_partitions
-    if num_sub_vectors is not None:
-        model_kwargs["num_sub_vectors"] = num_sub_vectors
-    if ivf_centroids is not None:
-        model_kwargs["ivf_centroids"] = ivf_centroids
-    if pq_codebook is not None:
-        model_kwargs["pq_codebook"] = pq_codebook
+    model_kwargs: dict[str, Any] = {
+        "metric": metric,
+        "ivf_centroids": ivf_centroids,
+        "num_partitions": num_partitions,
+        "num_sub_vectors": num_sub_vectors,
+        "pq_codebook": pq_codebook,
+    }
 
-    # Phase 2: distribute fragment batches across Daft workers.
-    if fragment_group_size is None:
-        fragment_group_size = 10
-    elif fragment_group_size <= 0:
-        raise ValueError("fragment_group_size must be positive")
-
-    if fragment_group_size > len(fragment_ids_to_use) and fragment_ids_to_use:
+    # Phase 2: distribute fragment batches across Daft workers, one partition
+    # per batch so distributed runners build the segments in parallel.
+    if fragment_group_size > len(fragment_ids_to_use):
         fragment_group_size = len(fragment_ids_to_use)
         logger.info("Adjusted fragment_group_size to %d to match fragment count", fragment_group_size)
 
@@ -308,7 +442,7 @@ def create_vector_index_internal(
     )
 
     with execution_config_ctx(maintain_order=False):
-        df = from_pylist(fragment_data)
+        df = from_pylist(fragment_data).into_partitions(len(fragment_data))
         df = df.select(handler(df["fragment_ids"]).alias("index_meta"))
         collected = df.collect()
 
