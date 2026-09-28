@@ -74,11 +74,35 @@ no `fragment_ids` instead).
 
 
 > **Breaking change (from 0.5.0):** the `segmented` parameter was removed —
-> the distributed segment-index workflow is now the only code path, and the
-> single-node fallbacks are gone. `replace` now defaults to `True` (matching
+> the distributed segment-index workflow is now the only code path, and
+> the single-node fallbacks are gone. `replace` now defaults to `True` (matching
 > pylance). Indexes created by older versions of
 > `create_scalar_index` on `INVERTED` columns may carry empty index metadata
 > (see #69); rebuilding them with `replace=True` records full metadata.
+
+#### Index Maintenance
+
+Appended data is not indexed automatically — queries stay correct (uncovered
+fragments fall back to scans) but slow down as the unindexed share grows.
+`optimize_indices` restores index health on the dataset's latest version:
+it indexes newly appended fragments, merges small segments, and heals stale
+fragment IDs left inside mixed segments by deletes as part of a commit that
+indexes or merges new data. It commits no new version when there is no new
+data to index and no segments to merge.
+
+```python
+from daft_lance import optimize_indices
+
+updated = optimize_indices("s3://bucket/my_dataset")
+updated = optimize_indices("s3://bucket/my_dataset", indices=["name_idx"], num_indices_to_merge=4)
+```
+
+`optimize_indices` delegates to pylance's
+`DatasetOptimizer.optimize_indices`, runs in the coordinator process, and
+returns the updated dataset; for a distributed rebuild use
+`create_scalar_index(..., replace=True)`. Unknown or empty `indices` raise
+`ValueError`.
+
 
 ### Column Merging
 

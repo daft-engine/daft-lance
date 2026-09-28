@@ -464,3 +464,50 @@ def _validate_segments_against_manifest(
                 "not covered by any built segment (a worker result was likely lost). Re-run the "
                 "index build."
             )
+
+
+def optimize_indices_internal(
+    lance_ds: lance.LanceDataset,
+    open_context: DatasetOpenContext,
+    *,
+    indices: list[str] | None = None,
+    num_indices_to_merge: int | None = None,
+) -> lance.LanceDataset:
+    """Incrementally maintain existing indexes.
+
+    Delegates to pylance's ``DatasetOptimizer.optimize_indices`` because
+    Lance core owns the delta-index semantics. One run indexes newly appended fragments, merges small
+    segments (``num_indices_to_merge``), and heals stale fragment IDs left
+    inside mixed segments as part of a commit that indexes or merges new
+    data; with no new data to index it commits nothing. Heavier changes
+    are a distributed rebuild: ``create_scalar_index(..., replace=True)``.
+
+    ``indices`` is our parameter and gets deterministic semantics here
+    because pylance silently ignores unknown names: an empty list raises,
+    and unknown names raise listing the available indexes. Everything else
+    belongs to Lance.
+
+    Returns the updated dataset (its latest version after the call).
+    """
+    if indices is not None:
+        if len(indices) == 0:
+            raise ValueError("indices must be a non-empty list of index names; pass None to optimize all indexes.")
+        known = _existing_index_names(lance_ds)
+        unknown = sorted(set(indices) - known)
+        if unknown:
+            raise ValueError(f"indices {unknown} do not exist on the dataset. Available index names: {sorted(known)}")
+
+    call_kwargs: dict[str, Any] = {}
+    if indices is not None:
+        call_kwargs["index_names"] = list(indices)
+    if num_indices_to_merge is not None:
+        call_kwargs["num_indices_to_merge"] = num_indices_to_merge
+
+    logger.info(
+        "Optimizing indices: uri=%s, indices=%s, num_indices_to_merge=%s",
+        open_context.uri,
+        indices if indices is not None else "(all)",
+        num_indices_to_merge,
+    )
+    lance_ds.optimize.optimize_indices(**call_kwargs)  # type: ignore[no-untyped-call]
+    return open_context.open_latest()

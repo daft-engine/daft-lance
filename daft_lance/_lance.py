@@ -16,7 +16,7 @@ from daft.schema import Schema
 from .lance_compaction import compact_files_internal
 from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
-from .lance_scalar_index import create_scalar_index_internal
+from .lance_scalar_index import create_scalar_index_internal, optimize_indices_internal
 from .lance_scan import LanceScanOperator
 from .lance_update_column import UpdateColumnsResult, update_columns_from_df, validate_update_arguments
 from .namespace import validate_uri_or_namespace
@@ -677,6 +677,104 @@ def create_scalar_index(
         max_concurrency=max_concurrency,
         fragment_ids=fragment_ids,
         **kwargs,
+    )
+
+
+@PublicAPI
+def optimize_indices(
+    uri: str | pathlib.Path | None = None,
+    io_config: IOConfig | None = None,
+    *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    indices: list[str] | None = None,
+    num_indices_to_merge: int | None = None,
+    storage_options: dict[str, Any] | None = None,
+    block_size: int | None = None,
+    commit_lock: Any | None = None,
+    index_cache_size: int | None = None,
+    default_scan_options: dict[str, Any] | None = None,
+    metadata_cache_size_bytes: int | None = None,
+) -> LanceDataset:
+    """Incrementally optimize existing indexes.
+
+    As data is appended it is not added to existing indexes automatically:
+    queries keep working (uncovered fragments fall back to scans) but they
+    get slower as the unindexed share grows. This function restores index
+    health on the dataset's latest version: newly appended fragments are
+    indexed, small segments are merged, and stale fragment IDs left inside
+    mixed segments by deletes are healed as part of a commit that indexes
+    or merges new data. It commits no new version when there is no new
+    data to index and no segments to merge.
+
+    Delegates to pylance's ``DatasetOptimizer.optimize_indices`` — Lance
+    core owns the delta-index semantics and parallelizes the underlying
+    scans in the coordinator process. A full distributed rebuild is
+    ``create_scalar_index(..., replace=True)``.
+
+    Args:
+        uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
+        io_config: A custom IOConfig to use when accessing Lance data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
+        indices: Names of the indexes to optimize. ``None`` (the default)
+            optimizes every index on the dataset. Unknown names and an empty
+            list raise ``ValueError``.
+        num_indices_to_merge: How many segments to merge when compacting an
+            index (passed to pylance). ``0`` indexes the new data into a new
+            segment instead of merging; ``None`` uses pylance's default.
+        storage_options: Storage options for the dataset.
+        block_size: Block size for the dataset.
+        commit_lock: Commit lock for the dataset.
+        index_cache_size: Size of the index cache.
+        default_scan_options: Default scan options for the dataset.
+        metadata_cache_size_bytes: Size of the metadata cache in bytes.
+
+    Returns:
+        The updated dataset (its latest version after the call). Read
+        ``.version``, ``describe_indices()`` etc. from it if needed.
+
+    Raises:
+        ValueError: If ``indices`` is empty or names indexes that do not
+            exist on the dataset.
+
+    Examples:
+        >>> import daft_lance
+        >>> updated = daft_lance.optimize_indices("s3://my-bucket/dataset/")  # doctest: +SKIP
+        >>> updated.version  # doctest: +SKIP
+        4
+
+        Optimize one index and merge its small segments:
+
+        >>> daft_lance.optimize_indices(  # doctest: +SKIP
+        ...     "s3://my-bucket/dataset/", indices=["name_idx"], num_indices_to_merge=4
+        ... )
+    """
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+
+    dataset_handle = construct_lance_dataset_handle(
+        uri,
+        storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
+        block_size=block_size,
+        commit_lock=commit_lock,
+        index_cache_size=index_cache_size,
+        default_scan_options=default_scan_options,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
+    )
+
+    return optimize_indices_internal(
+        dataset_handle.dataset,
+        dataset_handle.worker_open_context(),
+        indices=indices,
+        num_indices_to_merge=num_indices_to_merge,
     )
 
 
