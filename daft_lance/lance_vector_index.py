@@ -163,8 +163,8 @@ def create_vector_index_internal(
     num_partitions: int | None = None,
     num_sub_vectors: int | None = None,
     sample_rate: int = 256,
-    ivf_centroids: pa.Array | None = None,
-    pq_codebook: pa.Array | None = None,
+    ivf_centroids: pa.Array[Any] | None = None,
+    pq_codebook: pa.Array[Any] | None = None,
     fragment_group_size: int | None = None,
     max_concurrency: int | None = None,
     fragment_ids: list[int] | None = None,
@@ -373,6 +373,10 @@ def create_vector_index_internal(
         if ivf_model is None:
             # Caller-supplied centroids: wrap them so train_pq can partition
             # its samples with the same model the segments will be built with.
+            # needs_ivf_training is False exactly when ivf_centroids was
+            # supplied, so the None case cannot occur in practice.
+            if ivf_centroids is None:
+                raise ValueError("PQ codebook training requires IVF centroids")
             ivf_model = lance.indices.IvfModel(ivf_centroids, metric.lower())
         pq_model = builder.train_pq(
             ivf_model,
