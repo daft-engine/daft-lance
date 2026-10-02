@@ -47,7 +47,7 @@ def _drain_and_snapshot(it: _LanceBatchIterator) -> tuple[int, list[dict[str, in
 def _assert_monotonic(snapshots: list[dict[str, int]]) -> None:
     for prev, cur in zip(snapshots, snapshots[1:]):
         assert cur["bytes.read"] >= prev["bytes.read"]
-        assert cur["requests"] >= prev["requests"]
+        assert cur["io.requests"] >= prev["io.requests"]
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ def test_factory_returns_iterator_with_stats(lance_dataset_path: str) -> None:
     assert iter(it) is it
     assert callable(it.stats)
     # Nothing has been read yet.
-    assert it.stats() == {"bytes.read": 0, "requests": 0}
+    assert it.stats() == {"bytes.read": 0, "io.requests": 0}
 
 
 def test_factory_stats_per_fragment_path(lance_dataset_path: str) -> None:
@@ -72,9 +72,9 @@ def test_factory_stats_per_fragment_path(lance_dataset_path: str) -> None:
 
     assert rows == NUM_FRAGMENTS * ROWS_PER_FRAGMENT
     final = snapshots[-1]
-    assert set(final) == {"bytes.read", "requests"}
+    assert set(final) == {"bytes.read", "io.requests"}
     assert final["bytes.read"] > 0
-    assert final["requests"] > 0
+    assert final["io.requests"] > 0
     _assert_monotonic(snapshots)
     # Cumulative: repeated polling after exhaustion does not grow the counters.
     assert it.stats() == final
@@ -88,7 +88,7 @@ def test_factory_stats_index_driven_path(lance_dataset_path: str) -> None:
     assert rows == NUM_FRAGMENTS * ROWS_PER_FRAGMENT
     final = snapshots[-1]
     assert final["bytes.read"] > 0
-    assert final["requests"] > 0
+    assert final["io.requests"] > 0
     _assert_monotonic(snapshots)
     assert it.stats() == final
 
@@ -121,7 +121,7 @@ def test_factory_stats_per_fragment_with_limit_stops_early(lance_dataset_path: s
     full = _lancedb_table_factory_function(ds_uri=lance_dataset_path, fragment_ids=frag_ids)
     _, full_snapshots = _drain_and_snapshot(full)
     assert full_snapshots[-1]["bytes.read"] > limited_final["bytes.read"]
-    assert full_snapshots[-1]["requests"] > limited_final["requests"]
+    assert full_snapshots[-1]["io.requests"] > limited_final["io.requests"]
 
 
 def test_factory_stats_include_fragment_id(lance_dataset_path: str) -> None:
@@ -148,15 +148,15 @@ def test_batch_iterator_accumulates_callback_values() -> None:
         record(_FakeScanStatistics(0, 0))
 
     it: Any = _LanceBatchIterator(_make_batches)
-    assert it.stats() == {"bytes.read": 0, "requests": 0}
+    assert it.stats() == {"bytes.read": 0, "io.requests": 0}
     assert next(it) == "batch-1"
-    assert it.stats() == {"bytes.read": 100, "requests": 2}
+    assert it.stats() == {"bytes.read": 100, "io.requests": 2}
     assert next(it) == "batch-2"
-    assert it.stats() == {"bytes.read": 150, "requests": 3}
+    assert it.stats() == {"bytes.read": 150, "io.requests": 3}
     with pytest.raises(StopIteration):
         next(it)
-    assert it.stats() == {"bytes.read": 150, "requests": 3}
-    assert it.stats() == {"bytes.read": 150, "requests": 3}
+    assert it.stats() == {"bytes.read": 150, "io.requests": 3}
+    assert it.stats() == {"bytes.read": 150, "io.requests": 3}
 
 
 # ---------------------------------------------------------------------------

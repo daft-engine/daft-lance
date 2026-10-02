@@ -55,7 +55,7 @@ class _LanceBatchIterator(Iterator[PyRecordBatch]):
 
     def stats(self) -> dict[str, int]:
         """Cumulative I/O counters for this iterator, in the keys Daft recognizes."""
-        return {"bytes.read": self._bytes_read, "requests": self._requests}
+        return {"bytes.read": self._bytes_read, "io.requests": self._requests}
 
     def __iter__(self) -> _LanceBatchIterator:
         return self
