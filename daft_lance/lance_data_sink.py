@@ -646,6 +646,18 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if self._is_insert_overwrite:
             return self._finalize_insert_overwrite(fragments)
 
+        if self._mode == "append" and not fragments:
+            # An empty append has no data to commit. Committing an empty Append
+            # would add a new table version only to record that nothing was
+            # appended -- version churn for readers that pin the latest version.
+            # The checkpointed-append and insert_overwrite paths already skip
+            # this; the plain path must too. create/overwrite with no rows are
+            # not no-ops (they establish/replace the table), so they still commit.
+            dataset = lance.dataset(
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
+            )
+            return _dataset_stats(dataset)
+
         assert self._effective_pyarrow_schema is not None, "LanceDataSink.start() must run before finalize"
         operation: lance.LanceOperation.BaseOperation
         if self._mode == "create" or self._mode == "overwrite":
