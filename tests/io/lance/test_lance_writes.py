@@ -294,3 +294,28 @@ df.write_lance("{lance_dataset_path}", mode="create")
 
     df_loaded = daft.read_lance(lance_dataset_path)
     assert df_loaded.schema()["embedding"].dtype == DataType.embedding(DataType.float32(), 4)
+
+
+def test_empty_append_creates_no_new_version(lance_dataset_path):
+    """An append with no rows must not create a new dataset version.
+
+    An empty or fully-filtered append has nothing to commit. Committing an
+    empty Append would add a table version that only records nothing was
+    appended -- version churn for readers that pin the latest version. The
+    checkpointed-append and insert_overwrite paths already skip this no-op;
+    this guards the plain append path.
+    """
+    import lance
+
+    daft.from_pydict(data1).write_lance(lance_dataset_path, mode="create")
+    before = lance.dataset(lance_dataset_path)
+    version_before = before.version
+    fragments_before = len(before.get_fragments())
+
+    # Fully filtered: zero rows reach the sink.
+    daft.from_pydict(data1).limit(0).write_lance(lance_dataset_path, mode="append")
+
+    after = lance.dataset(lance_dataset_path)
+    assert after.version == version_before
+    assert len(after.get_fragments()) == fragments_before
+    assert daft.read_lance(lance_dataset_path).to_pydict() == data1
