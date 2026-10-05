@@ -222,6 +222,48 @@ def test_update_columns_df_validates_targets_before_execution(
         daft_lance.update_columns_df(source, path, columns=columns)
 
 
+def test_update_columns_df_rejects_struct_column(tmp_path: Path) -> None:
+    """A struct target is rejected before any write.
+
+    A source struct missing one of the target's child fields casts cleanly with
+    the missing field filled as null, so a partial struct would drop data
+    silently. update_columns_df refuses structs rather than risk that. The
+    parametrized target check above only exercises scalar columns, so this pins
+    the struct guard specifically.
+    """
+    path = str(tmp_path / "struct-target.lance")
+    lance.write_dataset(
+        pa.table({"id": pa.array([1, 2], pa.int64()), "payload": pa.array([{"a": 1, "b": 2}, {"a": 3, "b": 4}])}),
+        path,
+    )
+    version = lance.dataset(path).version
+    source = _read_update_source(path)
+
+    with pytest.raises(ValueError, match="Struct column 'payload' is not supported"):
+        daft_lance.update_columns_df(source, path, columns=["payload"])
+
+    assert lance.dataset(path).version == version
+
+
+def test_update_columns_df_rejects_blob_column(tmp_path: Path) -> None:
+    """A blob target is rejected before any write; it cannot be rewritten through the update path."""
+    path = str(tmp_path / "blob-target.lance")
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("data", pa.large_binary(), metadata={"lance-encoding:blob": "true"}),
+        ]
+    )
+    lance.write_dataset(pa.table({"id": [1, 2], "data": [b"x", b"y"]}, schema=schema), path)
+    version = lance.dataset(path).version
+    source = _read_update_source(path)
+
+    with pytest.raises(ValueError, match="Blob column 'data' cannot be updated"):
+        daft_lance.update_columns_df(source, path, columns=["data"])
+
+    assert lance.dataset(path).version == version
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
