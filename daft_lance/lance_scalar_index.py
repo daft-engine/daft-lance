@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 
 import lance
 
-from daft.dependencies import pa
 from daft_lance.utils import distribute_fragments_balanced
 
 logger = logging.getLogger(__name__)
@@ -205,32 +204,27 @@ def create_scalar_index_internal(
             f"directly: lance.dataset(<uri>).create_scalar_index(...)."
         )
 
-    # Validate column exists and has correct type
+    # Validate column exists. Worth doing here because the error can name the
+    # available columns, which Lance's own KeyError does not.
     try:
-        field = lance_ds.schema.field(column)
+        lance_ds.schema.field(column)
     except KeyError as e:
         available_columns = [field.name for field in lance_ds.schema]
         raise ValueError(f"Column '{column}' not found. Available: {available_columns}") from e
 
-    # Check column type for the types with an obvious Python-side rule; the
-    # rest are validated by Lance during the distributed build.
-    value_type = field.type
-    if pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
-        value_type = field.type.value_type
-
-    match index_type:
-        case "INVERTED":
-            if not pa.types.is_string(value_type) and not pa.types.is_large_string(value_type):
-                raise TypeError(f"Column {column} must be string type for INVERTED index, got {value_type}")
-        case "BTREE":
-            if (
-                not pa.types.is_integer(value_type)
-                and not pa.types.is_floating(value_type)
-                and not pa.types.is_string(value_type)
-            ):
-                raise TypeError(f"Column {column} must be numeric or string type for BTREE index, got {value_type}")
-        case _:
-            pass
+    # Column/index-type compatibility is Lance's rule, so ask Lance rather than
+    # restating it here. Hand-rolled copies of this check drifted from Lance and
+    # rejected columns Lance indexes happily: BTREE over `large_string` (what
+    # Daft writes for every Utf8 column, so BTREE was unreachable for Daft-written
+    # strings), BTREE over temporal/boolean/decimal/binary, and INVERTED over a
+    # `lance.json` column. This validator is what pylance's own create_scalar_index
+    # calls, covers every index type, and has no side effects. Running it on the
+    # driver keeps the failure at the API boundary rather than deep inside a
+    # worker; it is a private helper, so if a pylance release drops it the same
+    # validation still happens in the worker's create_index_uncommitted call.
+    prepare_scalar_index_request = getattr(lance_ds, "_prepare_scalar_index_request", None)
+    if prepare_scalar_index_request is not None:
+        prepare_scalar_index_request(column, index_type, dict(kwargs))
 
     # Generate index name if not provided (matches pylance's convention)
     if name is None:
@@ -509,5 +503,5 @@ def optimize_indices_internal(
         indices if indices is not None else "(all)",
         num_indices_to_merge,
     )
-    lance_ds.optimize.optimize_indices(**call_kwargs)  # type: ignore[no-untyped-call]
+    lance_ds.optimize.optimize_indices(**call_kwargs)  # type: ignore[no-untyped-call, unused-ignore]
     return open_context.open_latest()
