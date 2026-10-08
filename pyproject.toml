@@ -19,6 +19,9 @@ dev = [
   "daft>=0.7.0",
   "pyarrow-stubs"
 ]
+ray = [
+  "daft[ray]>=0.7.0"
+]
 lint = [
   "ruff==0.15.1",
   "black==26.1.0",

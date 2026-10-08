@@ -272,21 +272,51 @@ materialize Lance BLOB V2 bytes.
 }
 ```
 
-To materialize blobs, read the dataset with row IDs enabled and call `take_blobs`:
+To materialize blobs, read the dataset with row IDs enabled and call one of two
+functions. Both mirror the Lance method of the same name and replace the
+descriptor column in place:
+
+| Function | Values | Runners | Memory |
+|---|---|---|---|
+| `read_blobs` | `bytes` (null blobs are `None`, empty blobs `b""`) | Any, including Ray | Reads each blob fully |
+| `take_blobs` | lazy `lance.BlobFile` handles, with range reads | Native only | Reads on demand |
+
+Prefer `read_blobs`. `BlobFile` handles cannot be pickled, so `take_blobs`
+raises an error when the runner is Ray. Each handle is also a stateful file
+object, so reusing a cached result can return handles that were already read to
+the end.
 
 ```python
 import lance
 import daft
-from daft_lance import take_blobs
+from daft_lance import read_blobs
 
 ds = lance.dataset("s3://bucket/my_dataset")
-df = daft.read_lance(ds.uri, default_scan_options={"with_row_id": True})
-df = take_blobs(df, ds, "blob_column")
+# pin the version so row IDs in df match the dataset blobs are read from
+df = daft.read_lance(ds.uri, version=ds.version, default_scan_options={"with_row_id": True})
+df = read_blobs(df, ds, "blob_column")
 
-# each value is a lance.Blob — call .read() to fetch bytes
-blobs = df.select("blob_column").to_pydict()["blob_column"]
-data = blobs[0].read()
+data = df.select("blob_column").to_pydict()["blob_column"][0]  # bytes
 ```
+
+`read_blobs` reads blobs in batches of `batch_size` rows (default 16) and holds a
+whole batch in memory. Filter rows before calling it, and raise `batch_size` only
+when blobs are small.
+
+For large blobs where you only need part of each one on the native runner, use
+`take_blobs` and call `.read()` (or seek and read a range) on each handle:
+
+```python
+from daft_lance import take_blobs
+
+df = daft.read_lance(ds.uri, version=ds.version, default_scan_options={"with_row_id": True})
+df = take_blobs(df, ds, "blob_column")
+blob = df.select("blob_column").to_pydict()["blob_column"][0]
+header = blob.read(1024)
+```
+
+The runner check in `take_blobs` runs when you call it. If you switch to the Ray
+runner afterwards, the query still fails, with a pickle error.
 
 To write binary columns as Lance Blob V2, use the `blob_columns` opt-in:
 
