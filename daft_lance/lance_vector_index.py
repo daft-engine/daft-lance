@@ -31,6 +31,15 @@ VECTOR_INDEX_TYPES = frozenset({"IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT",
 # PQ variants need a codebook trained alongside the IVF centroids.
 _PQ_INDEX_TYPES = frozenset({"IVF_PQ", "IVF_HNSW_PQ"})
 
+# SQ variants quantize per-dimension bounds per segment, and pylance exposes
+# no driver-side quantizer trainer to share them. Multi-segment SQ indexes
+# query correctly (each segment is read with its own metadata) but can never
+# be merged — ``optimize_indices`` raises "vector index segments do not share
+# quantizer metadata" — so these types are restricted to a single segment
+# (verified: a single-segment SQ index stays healthy through append +
+# optimize_indices, which keeps it at one segment).
+_SINGLE_SEGMENT_VECTOR_INDEX_TYPES = frozenset({"IVF_SQ", "IVF_HNSW_SQ"})
+
 # The 8-bit PQ codebook trains one centroid per 2^8 codes, so its sample
 # requirement is 256 rows per sampled codebook entry.
 _PQ_CODEBOOK_SIZE = 256
@@ -293,6 +302,16 @@ def create_vector_index_internal(
         # ``optimize_indices`` would later raise). Training here would sample
         # non-deterministically and silently produce a divergent model, so the
         # original model must be supplied.
+        if index_type in _SINGLE_SEGMENT_VECTOR_INDEX_TYPES:
+            # SQ has no shareable quantizer at all (see the type-set comment),
+            # so an appended SQ segment could never merge with the existing
+            # one. Full rebuilds and optimize_indices stay available.
+            raise ValueError(
+                f"Cannot append to SQ index '{name}': pylance exposes no shared SQ quantizer, "
+                "so segments built separately can never be merged (optimize_indices would "
+                "refuse). Rebuild the whole index with replace=True and no fragment_ids, or "
+                "let optimize_indices pick up newly appended fragments."
+            )
         if ivf_centroids is None:
             raise ValueError(
                 f"Cannot append to index '{name}': all segments of a vector index must share "
@@ -417,6 +436,18 @@ def create_vector_index_internal(
     if fragment_group_size > len(fragment_ids_to_use):
         fragment_group_size = len(fragment_ids_to_use)
         logger.info("Adjusted fragment_group_size to %d to match fragment count", fragment_group_size)
+
+    # SQ variants build exactly one segment covering all selected fragments:
+    # per-segment quantizer metadata cannot be shared or merged, so a
+    # multi-segment SQ index would be permanently unmergeable.
+    if index_type in _SINGLE_SEGMENT_VECTOR_INDEX_TYPES and fragment_group_size < len(fragment_ids_to_use):
+        fragment_group_size = len(fragment_ids_to_use)
+        logger.info(
+            "index_type %s builds one segment covering all %d fragments: pylance has no "
+            "shared SQ quantizer, and multi-segment SQ indexes cannot be merged",
+            index_type,
+            len(fragment_ids_to_use),
+        )
 
     fragment_data = distribute_fragments_balanced(fragments, fragment_group_size)
     if not fragment_data:

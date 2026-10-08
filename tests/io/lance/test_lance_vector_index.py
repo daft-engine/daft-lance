@@ -104,6 +104,18 @@ _MIN_RECALL = {
     "IVF_HNSW_PQ": 0.2,
 }
 
+# SQ variants build a single segment covering all fragments (per-segment
+# quantizer metadata cannot be merged); the others fan out one segment per
+# fragment group (the matrix build uses fragment_group_size=4 over 8 fragments).
+_EXPECT_SEGMENTS = {
+    "IVF_FLAT": 2,
+    "IVF_HNSW_FLAT": 2,
+    "IVF_PQ": 2,
+    "IVF_HNSW_PQ": 2,
+    "IVF_SQ": 1,
+    "IVF_HNSW_SQ": 1,
+}
+
 
 def _recall_at_5(ds, vectors: np.ndarray) -> float:
     """Recall@5 of the index against brute-force ground truth, over fixed queries."""
@@ -119,7 +131,7 @@ def _recall_at_5(ds, vectors: np.ndarray) -> float:
 
 @pytest.mark.parametrize("index_type", ALL_VECTOR_INDEX_TYPES)
 def test_every_index_type_builds_and_answers_queries(tmp_path: Path, index_type: str) -> None:
-    """All six advertised vector index types build multi-segment and return results."""
+    """All six advertised vector index types build and return results (SQ single-segment)."""
     uri, vectors = _make_vector_dataset(tmp_path / f"t_{index_type}.lance", seed=13)
 
     create_vector_index(
@@ -130,16 +142,23 @@ def test_every_index_type_builds_and_answers_queries(tmp_path: Path, index_type:
     desc = ds.describe_indices()[0]
     assert desc.index_type == index_type
     assert desc.num_rows_indexed == 2048
-    assert len(desc.segments) == 2
+    assert len(desc.segments) == _EXPECT_SEGMENTS[index_type]
 
     recall = _recall_at_5(ds, vectors)
     assert recall >= _MIN_RECALL[index_type], f"{index_type} recall@5 {recall:.2f} < {_MIN_RECALL[index_type]}"
 
 
-def test_ivf_sq_multi_segment_queryable(tmp_path: Path) -> None:
-    """IVF_SQ also builds multi-segment; recall stays comparable to a single-segment build."""
+def test_ivf_sq_is_single_segment_by_design(tmp_path: Path) -> None:
+    """IVF_SQ builds one segment even when fragment_group_size would split it.
+
+    SQ quantizer metadata cannot be shared across segments, so a multi-segment
+    SQ index would be permanently unmergeable; recall stays high.
+    """
     uri, vectors = _make_vector_dataset(tmp_path / "sq.lance", seed=7)
 
+    # fragment_group_size=4 over 8 fragments would produce 2 segments for
+    # non-SQ types; SQ must collapse to 1 so optimize_indices can never hit
+    # "vector index segments do not share quantizer metadata".
     create_vector_index(
         uri, column="vector", index_type="IVF_SQ", num_partitions=8, sample_rate=8, fragment_group_size=4
     )
@@ -147,16 +166,50 @@ def test_ivf_sq_multi_segment_queryable(tmp_path: Path) -> None:
     ds = lance.dataset(uri)
     desc = ds.describe_indices()[0]
     assert desc.index_type == "IVF_SQ"
-    assert len(desc.segments) == 2
+    assert desc.num_rows_indexed == 2048
+    assert len(desc.segments) == 1
 
-    hits = 0
-    queries = list(range(0, 400, 40))
-    for qi in queries:
-        truth = set(np.argsort(((vectors - vectors[qi]) ** 2).sum(axis=1))[:5].tolist())
-        got = set(ds.to_table(nearest={"column": "vector", "q": vectors[qi], "k": 5})["id"].to_pylist())
-        hits += len(truth & got)
-    # SQ is a lossy compression; a healthy build keeps most of the true top-5.
-    assert hits >= 0.8 * 5 * len(queries)
+    assert _recall_at_5(ds, vectors) >= 0.8
+
+
+def test_sq_backfill_is_rejected(tmp_path: Path) -> None:
+    """Appending SQ segments would create an unmergeable pair; it must raise instead."""
+    uri, _ = _make_vector_dataset(tmp_path / "sq_guard.lance")
+    build = dict(column="vector", index_type="IVF_HNSW_SQ", num_partitions=4, sample_rate=8, name="v_idx")
+
+    create_vector_index(uri, fragment_ids=[0, 1, 2, 3], **build)
+
+    with pytest.raises(ValueError, match="no shared SQ quantizer"):
+        create_vector_index(uri, fragment_ids=[4, 5], **build)
+
+
+def test_sq_single_segment_stays_maintainable(tmp_path: Path) -> None:
+    """Regression: single-segment SQ survives append + optimize_indices (merge included).
+
+    This is the healthy end state multi-segment SQ builds could never reach.
+    """
+    uri, vectors = _make_vector_dataset(tmp_path / "sq_life.lance")
+
+    create_vector_index(uri, column="vector", index_type="IVF_SQ", num_partitions=8, sample_rate=8, name="v_idx")
+    assert len(lance.dataset(uri).describe_indices()[0].segments) == 1
+
+    more = np.random.default_rng(99).standard_normal((512, 8)).astype(np.float32)
+    lance.write_dataset(
+        pa.table(
+            {
+                "id": list(range(2048, 2560)),
+                "vector": pa.FixedSizeListArray.from_arrays(more.reshape(-1), 8),
+            }
+        ),
+        uri,
+        mode="append",
+        max_rows_per_file=256,
+    )
+
+    optimize_indices(uri, indices=["v_idx"], num_indices_to_merge=2)
+    ds = lance.dataset(uri)
+    assert len(ds.describe_indices()[0].segments) == 1
+    assert 7 in ds.to_table(nearest={"column": "vector", "q": vectors[7], "k": 5})["id"].to_pylist()
 
 
 def test_cosine_metric_orders_by_angle_not_distance(tmp_path: Path) -> None:
