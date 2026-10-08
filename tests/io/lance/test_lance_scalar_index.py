@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pickle
 import tempfile
+from datetime import datetime
 from inspect import signature
 from pathlib import Path
 from typing import Any, cast
@@ -249,12 +250,94 @@ class TestDistributedIndexing:
         path = Path(temp_dir) / "non_string_test.lance"
         dataset.write_lance(uri=path, max_rows_per_file=2)
 
-        with pytest.raises(TypeError, match="Column numeric_col must be string type"):
+        with pytest.raises(TypeError, match="INVERTED index column numeric_col must be string"):
             create_scalar_index(
                 uri=path,
                 column="numeric_col",
                 index_type="INVERTED",
             )
+
+    def test_btree_on_daft_written_string_column(self, temp_dir):
+        """BTREE must accept large_string, which is what Daft writes for every Utf8 column."""
+        path = Path(temp_dir) / "btree_large_string.lance"
+        # Written through Daft on purpose: lance.write_dataset would produce
+        # `string` and would not exercise the large_string path at all.
+        daft.from_pydict({"id": [1, 2, 3, 4], "part": ["a", "b", "c", "d"]}).write_lance(uri=path, max_rows_per_file=2)
+        assert pa.types.is_large_string(lance.dataset(str(path)).schema.field("part").type)
+
+        create_scalar_index(uri=path, column="part", index_type="BTREE", name="part_btree")
+
+        described = lance.dataset(str(path)).describe_indices()
+        assert [(d.name, d.index_type) for d in described] == [("part_btree", "BTree")]
+        assert lance.dataset(str(path)).scanner(filter="part >= 'c'").to_table().num_rows == 2
+
+    @pytest.mark.parametrize(
+        ("column", "arrow_type", "values", "predicate", "expected_rows"),
+        [
+            ("ts", pa.timestamp("us"), [datetime(2020, 1, d) for d in (1, 2, 3, 4)], "ts >= timestamp '2020-01-03'", 2),
+            ("flag", pa.bool_(), [True, False, True, False], "flag = true", 2),
+        ],
+    )
+    def test_btree_accepts_other_ordered_scalar_types(
+        self, temp_dir, column, arrow_type, values, predicate, expected_rows
+    ):
+        """Lance's BTREE orders temporal and boolean columns too; the guard must not reject them."""
+        path = Path(temp_dir) / f"btree_{column}.lance"
+        table = pa.table({"id": [1, 2, 3, 4], column: pa.array(values, arrow_type)})
+        lance.write_dataset(table, str(path), mode="create", max_rows_per_file=2)
+
+        create_scalar_index(uri=path, column=column, index_type="BTREE", name="idx")
+
+        described = lance.dataset(str(path)).describe_indices()
+        assert [(d.name, d.index_type) for d in described] == [("idx", "BTree")]
+        assert lance.dataset(str(path)).scanner(filter=predicate).to_table().num_rows == expected_rows
+
+    def test_btree_rejects_nested_column_at_the_api_boundary(self, temp_dir):
+        """A type Lance cannot index must still fail on the driver, not inside a worker."""
+        path = Path(temp_dir) / "btree_nested.lance"
+        table = pa.table({"s": pa.array([{"a": 1}, {"a": 2}], pa.struct([("a", pa.int64())]))})
+        lance.write_dataset(table, str(path), mode="create")
+
+        with pytest.raises(TypeError, match="BTREE/BITMAP index column s must be int"):
+            create_scalar_index(uri=path, column="s", index_type="BTREE")
+
+    def test_inverted_accepts_json_column(self, temp_dir):
+        """The type rules are Lance's: a lance.json column is a valid INVERTED target."""
+        path = Path(temp_dir) / "inverted_json.lance"
+        field = pa.field("j", pa.large_binary(), metadata={b"ARROW:extension:name": b"lance.json"})
+        table = pa.table([pa.array(['{"a": 1}', '{"a": 2}'], pa.large_binary())], schema=pa.schema([field]))
+        lance.write_dataset(table, str(path), mode="create")
+
+        create_scalar_index(uri=path, column="j", index_type="INVERTED", name="j_idx")
+
+        assert [d.name for d in lance.dataset(str(path)).describe_indices()] == ["j_idx"]
+
+    def test_type_validation_is_delegated_to_lance(self, temp_dir):
+        """No hand-rolled type rules: the driver calls Lance's own validator.
+
+        The subset this module used to re-implement is exactly what broke BTREE
+        over large_string, so pin the delegation rather than the symptom.
+        """
+        path = Path(temp_dir) / "delegated.lance"
+        daft.from_pydict({"part": ["a", "b"]}).write_lance(uri=path)
+        ds = lance.dataset(str(path))
+
+        calls: list[tuple[Any, ...]] = []
+
+        def fake_prepare(column: Any, index_type: Any, kwargs: Any) -> tuple[str, str, str]:
+            calls.append((column, index_type, kwargs))
+            return column, index_type, index_type
+
+        ds._prepare_scalar_index_request = fake_prepare  # type: ignore[method-assign]
+        create_scalar_index_internal(
+            lance_ds=ds,
+            open_context=DatasetOpenContext(uri=str(path), version=ds.version),
+            column="part",
+            index_type="BTREE",
+            name="part_idx",
+        )
+
+        assert calls == [("part", "BTREE", {})]
 
     def test_build_distributed_index_with_storage_options(self, multi_fragment_lance_dataset):
         """Test building distributed index with storage options."""

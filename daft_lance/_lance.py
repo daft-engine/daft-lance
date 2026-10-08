@@ -564,7 +564,9 @@ def create_scalar_index(
             "BITMAP", "BTREE", "INVERTED", "FTS", "ZONEMAP", "NGRAM",
             "LABEL_LIST", and "BLOOMFILTER". Other types raise ``ValueError``;
             for those call pylance directly
-            (``lance.dataset(uri).create_scalar_index(...)``).
+            (``lance.dataset(uri).create_scalar_index(...)``). Which column
+            types an index accepts is Lance's rule, validated by Lance itself
+            rather than restated here.
         name: Name of the index (generated if None).
         replace: Whether to replace an existing index with the same name.
             Defaults to True, matching pylance. Replacement is atomic: the
@@ -626,7 +628,7 @@ def create_scalar_index(
         Create a FTS (Full-Text Search) index:
         >>> daft_lance.create_scalar_index("s3://my-bucket/dataset/", column="document", index_type="FTS")
 
-        Create a BTREE index for numeric or string columns:
+        Create a BTREE index over a scalar column:
         >>> daft_lance.create_scalar_index(
         ...     "s3://my-bucket/dataset/", column="price", index_type="BTREE", name="price_idx"
         ... )
