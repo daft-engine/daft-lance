@@ -466,7 +466,7 @@ def optimize_indices_internal(
     if indices is not None:
         if len(indices) == 0:
             raise ValueError("indices must be a non-empty list of index names; pass None to optimize all indexes.")
-        known = _existing_index_names(lance_ds)
+        known = {idx.name for idx in lance_ds.describe_indices()}
         unknown = sorted(set(indices) - known)
         if unknown:
             raise ValueError(f"indices {unknown} do not exist on the dataset. Available index names: {sorted(known)}")
