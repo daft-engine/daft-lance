@@ -827,7 +827,7 @@ def compact_files(
             max_bytes_per_file: Max number of bytes in a single file.
             materialize_deletions: Whether to compact fragments with soft deleted rows so they are no
                 longer present in the file.(default: True).
-            materialize_deletions_threadhold: The fraction of original rows that are soft deleted in a fragment
+            materialize_deletions_threshold: The fraction of original rows that are soft deleted in a fragment
                 before the fragment is a candidate for compaction.(default: 0.1 = 10%).
         partition_num: Number of partitions to use for compaction. Defaults to None.
         concurrency: Number of concurrent compaction tasks to run. Defaults to None.

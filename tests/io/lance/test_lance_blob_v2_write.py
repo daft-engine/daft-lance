@@ -46,6 +46,19 @@ def test_blob_columns_inline(lance_path: str) -> None:
     assert _kinds(lance_path) == [KIND_INLINE, KIND_INLINE, KIND_INLINE]
 
 
+def test_blob_columns_null_and_empty(lance_path: str) -> None:
+    """None stays a null blob while b"" stays a valid empty blob."""
+    df = daft.from_pydict({"id": [1, 2, 3], "data": [b"a", None, b""]})
+    df.write_lance(lance_path, blob_columns=["data"]).collect()
+
+    _assert_logical_blob_field(lance_path, "data")
+    ds = lance.dataset(lance_path)
+    assert ds.to_table(columns=["data"]).column("data").is_null().to_pylist() == [False, True, False]
+    blobs = ds.take_blobs("data", indices=[0, 1, 2])
+    assert blobs[1] is None
+    assert [b.read() for b in (blobs[0], blobs[2])] == [b"a", b""]
+
+
 def test_blob_columns_packed(lance_path: str) -> None:
     df = daft.from_pydict({"id": [1, 2, 3], "data": [b"x" * 100_000] * 3})
     df.write_lance(lance_path, blob_columns=["data"]).collect()
