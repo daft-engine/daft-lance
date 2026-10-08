@@ -18,7 +18,12 @@ from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal, optimize_indices_internal
 from .lance_scan import LanceScanOperator
-from .lance_update_column import UpdateColumnsResult, update_columns_from_df, validate_update_arguments
+from .lance_update_column import (
+    UpdateColumnsResult,
+    update_columns_from_df,
+    update_columns_with_transform,
+    validate_update_arguments,
+)
 from .namespace import validate_uri_or_namespace
 from .utils import construct_lance_dataset_handle
 
@@ -387,6 +392,112 @@ def merge_columns_df(
         left_on=left_on,
         right_on=effective_right_on,
         batch_size=effective_batch_size,
+    )
+
+
+@PublicAPI
+def update_columns(
+    uri: str | pathlib.Path | None = None,
+    io_config: IOConfig | None = None,
+    *,
+    transform: dict[str, str] | BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+    where: str | None = None,
+    columns: Sequence[str] | None = None,
+    read_columns: Sequence[str] | None = None,
+    batch_size: int | None = None,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    storage_options: dict[str, Any] | None = None,
+    version: int | str | None = None,
+    asof: str | None = None,
+    block_size: int | None = None,
+    commit_lock: Any | None = None,
+    index_cache_size: int | None = None,
+    default_scan_options: dict[str, Any] | None = None,
+    metadata_cache_size_bytes: int | None = None,
+    max_concurrency: int | None = None,
+) -> UpdateColumnsResult:
+    """Overwrite existing Lance columns with a row-preserving transform.
+
+    The target snapshot is scanned fragment by fragment. Rows matching ``where``
+    are passed through ``transform`` and joined back to their fragment by the
+    internal ``_rowaddr``. Daft distributes only fragment identifiers; callers do
+    not need to build or group an update DataFrame.
+
+    Args:
+        uri: URI of the target Lance dataset. Mutually exclusive with namespace parameters.
+        io_config: Daft object-store configuration.
+        transform: Either a mapping from existing column names to Lance SQL
+            expressions, a Lance ``BatchUDF``, or a callable accepting and
+            returning an Arrow ``RecordBatch``. Callable output must preserve row
+            count and order and contain only the columns being updated.
+        where: Optional Lance SQL predicate evaluated against the pinned source
+            snapshot before the transform. ``None`` updates every live row.
+        columns: Existing top-level columns to overwrite. Inferred from dict keys
+            or a ``BatchUDF.output_schema``; required for other callables.
+        read_columns: Columns passed to callable transforms. Defaults to all table
+            columns. Ignored for SQL-expression transforms.
+        batch_size: Maximum scan batch size per fragment.
+        table_id: Namespace table identifier.
+        namespace_impl: Lance Namespace implementation.
+        namespace_properties: Properties used to connect to the namespace.
+        storage_options: Additional object-store options.
+        version: Dataset version or tag to read and commit against. Defaults to
+            the version current when this function starts.
+        asof: Find the latest version created on or before this timestamp.
+        block_size: Hint for the minimum object-store I/O request size.
+        commit_lock: Custom Lance commit lock.
+        index_cache_size: Index cache size.
+        default_scan_options: Default Lance scan options.
+        metadata_cache_size_bytes: Metadata cache size in bytes.
+        max_concurrency: Maximum number of concurrent fragment-update workers.
+
+    Returns:
+        The committed dataset version and the number of live rows that matched
+        ``where``. If no rows match, no version is created.
+
+    Note:
+        A fragment failure can leave unreferenced data files written by other
+        workers. No transaction is committed; Lance cleanup removes those files.
+
+    Raises:
+        NotImplementedError: If the dataset uses stable row IDs, because the
+            installed pylance API cannot return matched fragment offsets.
+    """
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    dataset_handle = construct_lance_dataset_handle(
+        uri,
+        storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
+        version=version,
+        asof=asof,
+        block_size=block_size,
+        commit_lock=commit_lock,
+        index_cache_size=index_cache_size,
+        default_scan_options=default_scan_options,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
+    )
+    if dataset_handle.dataset.has_stable_row_ids:
+        raise NotImplementedError(
+            "update_columns does not support datasets with stable row IDs: "
+            "pylance does not yet expose updated fragment offsets, so "
+            "_row_last_updated_at_version and CDF metadata cannot be updated correctly."
+        )
+
+    return update_columns_with_transform(
+        dataset_handle.dataset,
+        dataset_handle.worker_open_context(),
+        transform=transform,
+        columns=columns,
+        read_columns=read_columns,
+        where=where,
+        batch_size=batch_size,
+        commit_lock=commit_lock,
+        max_concurrency=max_concurrency,
     )
 
 

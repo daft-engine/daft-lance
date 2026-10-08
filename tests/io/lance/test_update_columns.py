@@ -31,6 +31,162 @@ def _read_update_source(path: str) -> daft.DataFrame:
     )
 
 
+def test_update_columns_sql_transform_with_where(tmp_path: Path) -> None:
+    path = str(tmp_path / "transform-where.lance")
+    daft.from_pydict(
+        {"id": list(range(6)), "value": [value * 10 for value in range(6)], "score": list(range(6))}
+    ).write_lance(path, max_rows_per_file=2)
+    before_version = lance.dataset(path).version
+    before_files = _fragment_files(path)
+
+    result = daft_lance.update_columns(
+        path,
+        transform={"value": "value + 100", "score": "score * 2"},
+        where="id >= 2 AND id < 4",
+        max_concurrency=2,
+    )
+
+    assert result == daft_lance.UpdateColumnsResult(version=before_version + 1, rows_updated=2)
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict() == {
+        "id": list(range(6)),
+        "value": [0, 10, 120, 130, 40, 50],
+        "score": [0, 1, 4, 6, 4, 5],
+    }
+    after_files = _fragment_files(path)
+    assert {fragment_id for fragment_id in before_files if before_files[fragment_id] != after_files[fragment_id]} == {1}
+
+
+def test_update_columns_callable_receives_only_filtered_rows(tmp_path: Path) -> None:
+    path = str(tmp_path / "callable-where.lance")
+    daft.from_pydict({"id": [1, 2, 3], "value": [10, 20, 30]}).write_lance(path)
+
+    def transform(batch: pa.RecordBatch) -> pa.RecordBatch:
+        assert batch.schema.names == ["id", "value"]
+        assert all(value is not None and value >= 2 for value in batch.column("id").to_pylist())
+        return pa.record_batch([pa.compute.multiply(batch.column("value"), 10)], names=["value"])
+
+    result = daft_lance.update_columns(
+        path,
+        transform=transform,
+        columns=["value"],
+        read_columns=["id", "value"],
+        where="id >= 2",
+        batch_size=1,
+    )
+
+    assert result.rows_updated == 2
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3],
+        "value": [10, 200, 300],
+    }
+
+
+def test_update_columns_batch_udf_infers_columns(tmp_path: Path) -> None:
+    path = str(tmp_path / "batch-udf.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
+
+    @lance.batch_udf(  # type: ignore[no-untyped-call, untyped-decorator]
+        output_schema=pa.schema([pa.field("value", pa.int64())])
+    )
+    def transform(batch: pa.RecordBatch) -> pa.RecordBatch:
+        return pa.record_batch([pa.compute.add(batch.column("value"), 5)], names=["value"])
+
+    result = daft_lance.update_columns(path, transform=transform, read_columns=["value"])
+
+    assert result.rows_updated == 2
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict()["value"] == [15, 25]
+
+
+def test_update_columns_no_matches_is_noop(tmp_path: Path) -> None:
+    path = str(tmp_path / "transform-noop.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path, max_rows_per_file=1)
+    version = lance.dataset(path).version
+
+    result = daft_lance.update_columns(path, transform={"value": "value + 1"}, where="id > 100")
+
+    assert result == daft_lance.UpdateColumnsResult(version=version, rows_updated=0)
+    assert lance.dataset(path).version == version
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"transform": {"value": "value + 1"}, "where": "   "}, "non-empty"),
+        ({"transform": {"value": "value ==== 1"}}, "not valid"),
+        ({"transform": lambda batch: batch}, "columns.*required"),
+        ({"transform": {"missing": "value + 1"}}, "non-existent"),
+        ({"transform": {"value": "value + 1"}, "batch_size": 0}, "batch_size"),
+        ({"transform": {"value": "value + 1"}, "max_concurrency": 0}, "max_concurrency"),
+    ],
+)
+def test_update_columns_validates_before_writing(tmp_path: Path, kwargs: dict[str, Any], message: str) -> None:
+    path = str(tmp_path / "invalid-transform.lance")
+    daft.from_pydict({"id": [1], "value": [10]}).write_lance(path)
+    version = lance.dataset(path).version
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        daft_lance.update_columns(path, **kwargs)
+
+    assert lance.dataset(path).version == version
+
+
+def test_update_columns_rejects_non_row_preserving_transform(tmp_path: Path) -> None:
+    path = str(tmp_path / "row-count.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
+    version = lance.dataset(path).version
+
+    def transform(batch: pa.RecordBatch) -> pa.RecordBatch:
+        return batch.select(["value"]).slice(0, max(0, batch.num_rows - 1))
+
+    with pytest.raises(Exception, match="row count"):
+        daft_lance.update_columns(path, transform=transform, columns=["value"], read_columns=["value"])
+
+    assert lance.dataset(path).version == version
+
+
+def test_update_columns_rejects_stable_row_ids(tmp_path: Path) -> None:
+    path = str(tmp_path / "transform-stable-row-ids.lance")
+    lance.write_dataset(pa.table({"id": [1], "value": [10]}), path, enable_stable_row_ids=True)
+    version = lance.dataset(path).version
+
+    with pytest.raises(NotImplementedError, match="does not support datasets with stable row IDs"):
+        daft_lance.update_columns(path, transform={"value": "value + 1"})
+
+    assert lance.dataset(path).version == version
+
+
+def test_update_columns_preserves_pinned_version_for_occ(tmp_path: Path) -> None:
+    path = str(tmp_path / "transform-occ.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
+    source_version = lance.dataset(path).version
+    lance.dataset(path).update({"value": "999"}, where="id = 1")
+    competing_version = lance.dataset(path).version
+
+    with pytest.raises(Exception, match="conflict|Conflict"):
+        daft_lance.update_columns(path, version=source_version, transform={"value": "value + 100"})
+
+    assert lance.dataset(path).version == competing_version
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict()["value"] == [999, 20]
+
+
+def test_update_columns_namespace_roundtrip(tmp_path: Path) -> None:
+    namespace: dict[str, Any] = {
+        "namespace_impl": "dir",
+        "namespace_properties": {"root": str(tmp_path)},
+        "table_id": ["transform_updates"],
+    }
+    daft_lance.write_lance(
+        daft.from_pydict({"id": [1, 2], "value": [10, 20]}),
+        mode="create",
+        **namespace,
+    ).collect()
+
+    result = daft_lance.update_columns(transform={"value": "value * 10"}, where="id = 2", **namespace)
+
+    assert result.rows_updated == 1
+    assert daft_lance.read_lance(**namespace).sort("id").to_pydict()["value"] == [10, 200]
+
+
 def test_fragment_update_handler_reuses_pinned_dataset() -> None:
     dataset = object()
 

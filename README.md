@@ -139,6 +139,25 @@ later re-run, so callers should filter the input first when they need idempotent
 
 ### Column Updates
 
+Use a row-preserving transform to overwrite existing columns directly from the
+current Lance snapshot. `where` is evaluated before the transform, and Daft
+distributes work by fragment without grouping a user DataFrame:
+
+```python
+from daft_lance import update_columns
+
+result = update_columns(
+    "s3://bucket/my_dataset",
+    transform={"score": "score * 2", "status": "'processed'"},
+    where="date >= DATE '2026-07-01'",
+)
+print(result.version, result.rows_updated)
+```
+
+Python callables receive Arrow record batches after filtering and must return
+exactly the existing columns named by `columns`, with the same row count and
+order. Use `read_columns` to restrict their input.
+
 Use a prepared Daft DataFrame to overwrite existing Lance columns while
 preserving row addresses and untouched column files:
 
@@ -193,7 +212,7 @@ Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance
 (catalog) instead of a raw URI. Pass `namespace_impl` + `namespace_properties` + `table_id`
 in place of `uri` — the namespace resolves the table's storage location and vends any storage
 credentials. This works across `read_lance`, `write_lance`, `merge_columns_df`,
-`update_columns_df`, `create_scalar_index`, and `compact_files`.
+`update_columns`, `update_columns_df`, `create_scalar_index`, and `compact_files`.
 
 ```python
 import daft
