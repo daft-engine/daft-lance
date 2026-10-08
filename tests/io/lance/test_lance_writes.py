@@ -99,17 +99,23 @@ def test_lance_write_with_schema(lance_dataset_path):
     assert compress_field_metadata[b"lance-encoding:compression"] == b"zstd"
 
 
-def test_lance_write_blob(lance_dataset_path):
-    schema = pa.schema(
-        [
-            pa.field("blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}),
-        ]
-    )
+LEGACY_BLOB_SCHEMA = pa.schema(
+    [
+        pa.field("blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}),
+    ]
+)
 
+
+def test_lance_write_blob(lance_dataset_path):
     blobs_data = [b"foo", b"bar", b"baz"]
     df = daft.from_pydict({"blob": blobs_data})
 
-    df.write_lance(lance_dataset_path, schema=daft.schema.Schema.from_pyarrow_schema(schema))
+    # Legacy blob columns are only supported up to storage version 2.1.
+    df.write_lance(
+        lance_dataset_path,
+        schema=daft.schema.Schema.from_pyarrow_schema(LEGACY_BLOB_SCHEMA),
+        data_storage_version="2.1",
+    )
 
     import lance
 
@@ -130,6 +136,37 @@ def test_lance_write_blob(lance_dataset_path):
         assert blob is not None
         with blob as f:
             assert f.read() == expected
+
+
+def test_lance_write_legacy_blob_rejected_by_default_storage_version(lance_dataset_path):
+    df = daft.from_pydict({"blob": [b"foo"]})
+
+    with pytest.raises(Exception, match="Legacy blob columns"):
+        df.write_lance(lance_dataset_path, schema=daft.schema.Schema.from_pyarrow_schema(LEGACY_BLOB_SCHEMA))
+
+
+def test_lance_append_legacy_blob_inherits_storage_version(lance_dataset_path):
+    import lance
+
+    schema = daft.schema.Schema.from_pyarrow_schema(LEGACY_BLOB_SCHEMA)
+    daft.from_pydict({"blob": [b"foo"]}).write_lance(lance_dataset_path, schema=schema, data_storage_version="2.1")
+    daft.from_pydict({"blob": [b"bar"]}).write_lance(lance_dataset_path, mode="append", schema=schema)
+
+    ds = lance.dataset(lance_dataset_path)
+    assert ds.data_storage_version == "2.1"
+    assert ds.count_rows() == 2
+
+
+def test_lance_overwrite_legacy_blob_keeps_storage_version(lance_dataset_path):
+    import lance
+
+    schema = daft.schema.Schema.from_pyarrow_schema(LEGACY_BLOB_SCHEMA)
+    daft.from_pydict({"blob": [b"foo"]}).write_lance(lance_dataset_path, schema=schema, data_storage_version="2.1")
+    daft.from_pydict({"blob": [b"bar"]}).write_lance(lance_dataset_path, mode="overwrite", schema=schema)
+
+    ds = lance.dataset(lance_dataset_path)
+    assert ds.data_storage_version == "2.1"
+    assert ds.count_rows() == 1
 
 
 def test_lance_write_string(lance_dataset_path):
