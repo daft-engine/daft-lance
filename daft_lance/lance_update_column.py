@@ -23,12 +23,13 @@ UpdateTransform = dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch
 
 _ROW_ADDRESS = "_rowaddr"
 _FRAGMENT_ID = "fragment_id"
-_METADATA_COLUMNS = {_ROW_ADDRESS, "_rowid", _FRAGMENT_ID}
+_METADATA_COLUMNS = {_ROW_ADDRESS, "_rowid"}
 _FRAGMENT_UPDATE_RESULT_DTYPE = DataType.struct(
     {
         "fragment_meta": DataType.binary(),
         "rows_updated": DataType.int64(),
         "fields_modified": DataType.list(DataType.int64()),
+        "updated_offsets": DataType.binary(),
     }
 )
 
@@ -56,7 +57,12 @@ class _FragmentUpdateBatch:
     values: pa.Table
 
 
-def validate_update_arguments(columns: Sequence[str], max_concurrency: int | None) -> list[str]:
+def validate_update_arguments(
+    columns: Sequence[str],
+    max_concurrency: int | None,
+    *,
+    allow_fragment_id: bool = False,
+) -> list[str]:
     """Check the arguments that do not depend on the target dataset.
 
     Called before the dataset is opened so a bad argument does not first cost a
@@ -79,7 +85,7 @@ def validate_update_arguments(columns: Sequence[str], max_concurrency: int | Non
         if name in seen:
             raise ValueError(f"Duplicate column {name!r} in 'columns'.")
         seen.add(name)
-        if name == _FRAGMENT_ID:
+        if name == _FRAGMENT_ID and not allow_fragment_id:
             raise ValueError(
                 f"Cannot update {name!r}; it is the grouping key update_columns_df injects, "
                 "not a column of the target dataset."
@@ -97,8 +103,9 @@ def _validate_update_target_columns(
     columns: Sequence[str],
     *,
     operation_name: str,
+    allow_fragment_id: bool = False,
 ) -> list[str]:
-    resolved_columns = validate_update_arguments(columns, None)
+    resolved_columns = validate_update_arguments(columns, None, allow_fragment_id=allow_fragment_id)
     target_names = set(lance_ds.schema.names)
     for name in resolved_columns:
         if name not in target_names:
@@ -187,10 +194,11 @@ def _rewrite_fragment(
         raise ValueError(f"Update columns cannot be safely cast to the target Lance schema: {exc}") from exc
 
     update_table = values.append_column(_ROW_ADDRESS, batch.row_addresses)
-    fragment_meta, fields_modified = fragment.update_columns(
+    fragment_meta, fields_modified, updated_offsets = fragment.update_columns(
         update_table,
         left_on=_ROW_ADDRESS,
         right_on=_ROW_ADDRESS,
+        with_offsets=True,
     )
     if int(fragment_meta.id) != batch.fragment_id:
         raise ValueError(f"Fragment rewrite changed fragment id: expected {batch.fragment_id}, got {fragment_meta.id}.")
@@ -199,6 +207,7 @@ def _rewrite_fragment(
         "fragment_meta": daft.pickle.dumps(fragment_meta),
         "rows_updated": len(batch.row_addresses),
         "fields_modified": [int(field_id) for field_id in fields_modified],
+        "updated_offsets": updated_offsets,
     }
 
 
@@ -261,9 +270,9 @@ def _resolve_transform_columns(
     if columns is None:
         if inferred_columns is None:
             raise ValueError("'columns' is required for a callable transform without an output schema.")
-        return validate_update_arguments(inferred_columns, max_concurrency)
+        return validate_update_arguments(inferred_columns, max_concurrency, allow_fragment_id=True)
 
-    resolved_columns = validate_update_arguments(columns, max_concurrency)
+    resolved_columns = validate_update_arguments(columns, max_concurrency, allow_fragment_id=True)
     if inferred_columns is not None and set(resolved_columns) != set(inferred_columns):
         raise ValueError("'columns' must name exactly the columns produced by 'transform'.")
     return resolved_columns
@@ -303,7 +312,12 @@ def validate_transform_update_arguments(
     if batch_size is not None and batch_size <= 0:
         raise ValueError("batch_size must be a positive integer.")
     resolved_columns = _resolve_transform_columns(transform, columns, max_concurrency)
-    resolved_columns = _validate_update_target_columns(lance_ds, resolved_columns, operation_name="update_columns")
+    resolved_columns = _validate_update_target_columns(
+        lance_ds,
+        resolved_columns,
+        operation_name="update_columns",
+        allow_fragment_id=True,
+    )
     resolved_read_columns = _validate_read_columns(lance_ds, read_columns)
 
     if where is not None:
@@ -421,7 +435,7 @@ def _transform_fragment(
     iterator = iter(transformed_batches())
     first = next(iterator, None)
     if first is None:
-        return {"fragment_meta": None, "rows_updated": 0, "fields_modified": []}
+        return {"fragment_meta": None, "rows_updated": 0, "fields_modified": [], "updated_offsets": None}
 
     rows_updated = first.num_rows
 
@@ -433,10 +447,11 @@ def _transform_fragment(
             yield batch
 
     reader = pa.RecordBatchReader.from_batches(first.schema, counted_batches())
-    fragment_meta, fields_modified = fragment.update_columns(
+    fragment_meta, fields_modified, updated_offsets = fragment.update_columns(
         reader,
         left_on=_ROW_ADDRESS,
         right_on=_ROW_ADDRESS,
+        with_offsets=True,
     )
     if int(fragment_meta.id) != fragment_id:
         raise ValueError(f"Fragment rewrite changed fragment id: expected {fragment_id}, got {fragment_meta.id}.")
@@ -444,6 +459,7 @@ def _transform_fragment(
         "fragment_meta": daft.pickle.dumps(fragment_meta),
         "rows_updated": rows_updated,
         "fields_modified": [int(field_id) for field_id in fields_modified],
+        "updated_offsets": updated_offsets,
     }
 
 
@@ -507,6 +523,7 @@ def _commit_update_messages(
     updated_fragments = []
     seen_fragment_ids: set[int] = set()
     fields_modified: set[int] = set()
+    updated_fragment_offsets: dict[int, bytes] = {}
     rows_updated = 0
     for message in commit_messages:
         fragment_meta = daft.pickle.loads(message["fragment_meta"])
@@ -516,6 +533,7 @@ def _commit_update_messages(
         seen_fragment_ids.add(fragment_id)
         updated_fragments.append(fragment_meta)
         fields_modified.update(int(field_id) for field_id in message["fields_modified"])
+        updated_fragment_offsets[fragment_id] = message["updated_offsets"]
         rows_updated += int(message["rows_updated"])
 
     operation = lance.LanceOperation.Update(
@@ -523,6 +541,7 @@ def _commit_update_messages(
         fields_modified=sorted(fields_modified),
         fields_for_preserving_frag_bitmap=[],
         update_mode="rewrite_columns",
+        updated_fragment_offsets=updated_fragment_offsets,
     )
     committed = lance.LanceDataset.commit(
         open_context.uri,

@@ -461,9 +461,6 @@ def update_columns(
         A fragment failure can leave unreferenced data files written by other
         workers. No transaction is committed; Lance cleanup removes those files.
 
-    Raises:
-        NotImplementedError: If the dataset uses stable row IDs, because the
-            installed pylance API cannot return matched fragment offsets.
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
     dataset_handle = construct_lance_dataset_handle(
@@ -481,13 +478,6 @@ def update_columns(
         default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
-    if dataset_handle.dataset.has_stable_row_ids:
-        raise NotImplementedError(
-            "update_columns does not support datasets with stable row IDs: "
-            "pylance does not yet expose updated fragment offsets, so "
-            "_row_last_updated_at_version and CDF metadata cannot be updated correctly."
-        )
-
     return update_columns_with_transform(
         dataset_handle.dataset,
         dataset_handle.worker_open_context(),
@@ -575,11 +565,6 @@ def update_columns_df(
         unreferenced files stay until Lance cleans them up (see
         ``LanceDataset.cleanup_old_versions``).
 
-    Raises:
-        NotImplementedError: If the target dataset uses stable row IDs. The
-            current pylance transaction binding cannot propagate the updated
-            fragment offsets required for correct CDF metadata.
-
     Examples:
         >>> import daft
         >>> import daft_lance
@@ -613,13 +598,6 @@ def update_columns_df(
         default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
-    if dataset_handle.dataset.has_stable_row_ids:
-        raise NotImplementedError(
-            "update_columns_df does not support datasets with stable row IDs: "
-            "pylance does not yet expose updated fragment offsets, so "
-            "_row_last_updated_at_version and CDF metadata cannot be updated correctly."
-        )
-
     return update_columns_from_df(
         df,
         dataset_handle.dataset,

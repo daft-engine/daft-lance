@@ -85,9 +85,7 @@ def test_update_columns_batch_udf_infers_columns(tmp_path: Path) -> None:
     path = str(tmp_path / "batch-udf.lance")
     daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
 
-    @lance.batch_udf(  # type: ignore[no-untyped-call, untyped-decorator]
-        output_schema=pa.schema([pa.field("value", pa.int64())])
-    )
+    @lance.batch_udf(output_schema=pa.schema([pa.field("value", pa.int64())]))
     def transform(batch: pa.RecordBatch) -> pa.RecordBatch:
         return pa.record_batch([pa.compute.add(batch.column("value"), 5)], names=["value"])
 
@@ -144,15 +142,42 @@ def test_update_columns_rejects_non_row_preserving_transform(tmp_path: Path) -> 
     assert lance.dataset(path).version == version
 
 
-def test_update_columns_rejects_stable_row_ids(tmp_path: Path) -> None:
+def test_update_columns_updates_stable_row_id_metadata(tmp_path: Path) -> None:
     path = str(tmp_path / "transform-stable-row-ids.lance")
-    lance.write_dataset(pa.table({"id": [1], "value": [10]}), path, enable_stable_row_ids=True)
-    version = lance.dataset(path).version
+    lance.write_dataset(
+        pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}),
+        path,
+        enable_stable_row_ids=True,
+    )
+    base_version = lance.dataset(path).version
 
-    with pytest.raises(NotImplementedError, match="does not support datasets with stable row IDs"):
-        daft_lance.update_columns(path, transform={"value": "value + 1"})
+    result = daft_lance.update_columns(
+        path,
+        transform={"value": "value + 100"},
+        where="id IN (1, 3)",
+    )
 
-    assert lance.dataset(path).version == version
+    assert result.rows_updated == 2
+    table = lance.dataset(path).to_table(columns=["id", "value", "_row_last_updated_at_version"]).sort_by("id")
+    assert table.column("value").to_pylist() == [110, 20, 130]
+    assert table.column("_row_last_updated_at_version").to_pylist() == [
+        result.version,
+        base_version,
+        result.version,
+    ]
+
+
+def test_update_columns_can_update_business_fragment_id_column(tmp_path: Path) -> None:
+    path = str(tmp_path / "business-fragment-id.lance")
+    lance.write_dataset(pa.table({"id": [1, 2], "fragment_id": [10, 20]}), path)
+
+    result = daft_lance.update_columns(
+        path,
+        transform={"fragment_id": "fragment_id + 1"},
+    )
+
+    assert result.rows_updated == 2
+    assert lance.dataset(path).to_table().sort_by("id").column("fragment_id").to_pylist() == [11, 21]
 
 
 def test_update_columns_preserves_pinned_version_for_occ(tmp_path: Path) -> None:
@@ -414,24 +439,22 @@ def test_update_columns_df_safe_casts_to_target_type(tmp_path: Path) -> None:
     assert table.column("value").to_pylist() == [123, 123]
 
 
-def test_update_columns_df_rejects_stable_row_ids_before_writing(tmp_path: Path) -> None:
+def test_update_columns_df_updates_stable_row_id_metadata(tmp_path: Path) -> None:
     path = str(tmp_path / "stable-row-ids.lance")
     lance.write_dataset(
         pa.table({"id": [1, 2], "value": [10, 20]}),
         path,
         enable_stable_row_ids=True,
     )
-    source = _read_update_source(path).with_column("value", daft.col("value") + 1)
-    before = lance.dataset(path)
-    before_version = before.version
-    before_values = before.to_table().column("value").to_pylist()
+    source = _read_update_source(path).where("id = 1").with_column("value", daft.col("value") + 1)
+    base_version = lance.dataset(path).version
 
-    with pytest.raises(NotImplementedError, match="does not support datasets with stable row IDs"):
-        daft_lance.update_columns_df(source, path, columns=["value"])
+    result = daft_lance.update_columns_df(source, path, columns=["value"])
 
-    after = lance.dataset(path)
-    assert after.version == before_version
-    assert after.to_table().column("value").to_pylist() == before_values
+    assert result.rows_updated == 1
+    table = lance.dataset(path).to_table(columns=["id", "value", "_row_last_updated_at_version"]).sort_by("id")
+    assert table.column("value").to_pylist() == [11, 20]
+    assert table.column("_row_last_updated_at_version").to_pylist() == [result.version, base_version]
 
 
 def test_update_columns_df_uses_commit_lock(tmp_path: Path) -> None:
