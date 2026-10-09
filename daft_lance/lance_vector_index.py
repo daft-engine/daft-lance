@@ -118,12 +118,6 @@ class VectorFragmentIndexHandler:
         self.name = name
         self.replace = replace
         self.kwargs = kwargs
-        self._lance_ds: lance.LanceDataset | None = None
-
-    def _dataset(self) -> lance.LanceDataset:
-        if self._lance_ds is None:
-            self._lance_ds = self.open_context.open_pinned()
-        return self._lance_ds
 
     def __call__(self, fragment_ids: list[int]) -> bytes:
         """Build one uncommitted vector index segment and return pickled metadata."""
@@ -139,7 +133,9 @@ class VectorFragmentIndexHandler:
         # an existing name with ``replace=False``. Replacement itself happens
         # in the coordinator's single manifest commit, which retires overlapped
         # old segments atomically.
-        index_meta = self._dataset().create_index_uncommitted(
+        # Vector builds mutably borrow the Lance handle; concurrent invocations
+        # must open independent handles to the same pinned snapshot.
+        index_meta = self.open_context.open_pinned().create_index_uncommitted(
             column=self.column,
             index_type=self.index_type,
             name=self.name,

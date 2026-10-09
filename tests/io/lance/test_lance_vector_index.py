@@ -9,7 +9,7 @@ import pytest
 from lance.indices import IndicesBuilder
 
 from daft.dependencies import pa
-from daft_lance import create_vector_index, optimize_indices
+from daft_lance import create_vector_index, lance_vector_index, optimize_indices
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="lance")
 
@@ -380,7 +380,7 @@ def test_replace_true_rebuilds_atomically_in_one_version(tmp_path: Path) -> None
     assert 7 in results["id"].to_pylist()
 
 
-def test_worker_failure_keeps_version_and_old_index(tmp_path: Path) -> None:
+def test_worker_failure_keeps_version_and_old_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A failing segment build aborts before the commit; the old index stays usable."""
     uri, vectors = _make_vector_dataset(tmp_path / "fail.lance", num_rows=240, rows_per_file=40, seed=9)
     create_vector_index(
@@ -395,29 +395,24 @@ def test_worker_failure_keeps_version_and_old_index(tmp_path: Path) -> None:
     ds = lance.dataset(uri)
     version_before = ds.version
 
-    original = lance.LanceDataset.create_index_uncommitted
+    class FailingVectorFragmentIndexHandler(lance_vector_index.VectorFragmentIndexHandler):
+        def __call__(self, fragment_ids: list[int]) -> bytes:
+            if 4 in fragment_ids:
+                raise RuntimeError("injected segment build failure")
+            return super().__call__(fragment_ids)
 
-    def fail_one_batch(self, *args, **kwargs):
-        fragment_ids = kwargs.get("fragment_ids")
-        if fragment_ids and 4 in fragment_ids:
-            raise RuntimeError("injected segment build failure")
-        return original(self, *args, **kwargs)
-
-    lance.LanceDataset.create_index_uncommitted = fail_one_batch
-    try:
-        with pytest.raises(Exception, match="injected segment build failure"):
-            create_vector_index(
-                uri,
-                column="vector",
-                index_type="IVF_FLAT",
-                num_partitions=4,
-                sample_rate=32,
-                name="v_idx",
-                fragment_group_size=2,
-                replace=True,
-            )
-    finally:
-        lance.LanceDataset.create_index_uncommitted = original
+    monkeypatch.setattr(lance_vector_index, "VectorFragmentIndexHandler", FailingVectorFragmentIndexHandler)
+    with pytest.raises(Exception, match="injected segment build failure"):
+        create_vector_index(
+            uri,
+            column="vector",
+            index_type="IVF_FLAT",
+            num_partitions=4,
+            sample_rate=32,
+            name="v_idx",
+            fragment_group_size=2,
+            replace=True,
+        )
 
     ds = lance.dataset(uri)
     assert ds.version == version_before
