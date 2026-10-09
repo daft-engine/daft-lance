@@ -134,6 +134,15 @@ the same `ivf_centroids` (and `pq_codebook` for PQ variants) the existing
 segments were built with, since every segment of a logical vector index must
 share one IVF model — a backfill without the original model raises instead of
 silently training a divergent one.
+Backfill must also use the existing index's `metric`; a different metric is
+rejected because distances from different metrics cannot be ranked together.
+If another task changes the same index during a new build or backfill, the
+operation fails rather than replacing that task's result; retry against the
+latest version. Full rebuilds with `replace=True` retain replacement semantics.
+
+HNSW builds accept `m`, `max_level`, and `ef_construction`. Each worker generates
+its own segment UUID, so `index_uuid` cannot be supplied. For pre-trained IVF
+models, pass `ivf_centroids`; `ivf_centroids_file` is not supported by this API.
 
 The SQ variants (`IVF_SQ`, `IVF_HNSW_SQ`) support multi-segment builds and
 `fragment_ids` backfill. Each segment uses its own SQ quantization metadata

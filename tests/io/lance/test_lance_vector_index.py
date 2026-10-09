@@ -471,3 +471,111 @@ def test_invalid_arguments_raise(tmp_path: Path) -> None:
     # would also fail on this small dataset with a large sample_rate.
     with pytest.raises(ValueError, match="fragment_group_size must be positive"):
         create_vector_index(uri, column="vector", index_type="IVF_FLAT", fragment_group_size=0)
+
+
+def test_existing_segment_uuid_is_rejected_without_overwriting_index(tmp_path: Path) -> None:
+    """A caller cannot overwrite published segment files during a failed rebuild."""
+    uri, vectors = _make_vector_dataset(tmp_path / "uuid.lance", num_rows=240, rows_per_file=60)
+    build = dict(column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=8)
+    create_vector_index(uri, fragment_group_size=4, **build)
+    before = lance.dataset(uri)
+    segment_uuid = str(before.describe_indices()[0].segments[0].uuid)
+    query = {"column": "vector", "q": vectors[7], "k": 5, "nprobes": 4}
+    expected = before.to_table(nearest=query).to_pydict()
+
+    with pytest.raises(TypeError, match="index_uuid"):
+        create_vector_index(
+            uri,
+            replace=True,
+            fragment_group_size=1,
+            max_concurrency=1,
+            index_uuid=segment_uuid,
+            **build,
+        )
+
+    after = lance.dataset(uri)
+    assert after.version == before.version
+    assert str(after.describe_indices()[0].segments[0].uuid) == segment_uuid
+    assert _covered_fragments(uri, "vector_idx") == {0, 1, 2, 3}
+    assert after.to_table(nearest=query).to_pydict() == expected
+
+
+@pytest.mark.parametrize("initial_metric,append_metric", [("L2", "cosine"), ("cosine", None)])
+def test_backfill_rejects_a_different_metric(tmp_path: Path, initial_metric: str, append_metric: str | None) -> None:
+    """Segments must use comparable distances, including when backfill defaults to L2."""
+    uri = str(tmp_path / "mixed_metric.lance")
+    vectors = np.array([[0, 1], [100, 0]], dtype=np.float32)
+    lance.write_dataset(
+        pa.table({"id": [0, 1], "vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 2)}),
+        uri,
+        max_rows_per_file=1,
+    )
+    centroids = pa.FixedSizeListArray.from_arrays(pa.array([1, 0], type=pa.float32()), 2)
+    build = dict(column="vector", index_type="IVF_FLAT", ivf_centroids=centroids)
+    create_vector_index(uri, metric=initial_metric, fragment_ids=[0], **build)
+    before = lance.dataset(uri)
+    query = {"column": "vector", "q": [1, 0], "k": 2, "nprobes": 1, "metric": initial_metric}
+    expected = before.to_table(nearest=query).to_pydict()
+
+    append_kwargs = {} if append_metric is None else {"metric": append_metric}
+    with pytest.raises(ValueError, match="[Mm]etric"):
+        create_vector_index(uri, fragment_ids=[1], **build, **append_kwargs)
+
+    after = lance.dataset(uri)
+    assert after.version == before.version
+    assert _covered_fragments(uri, "vector_idx") == {0}
+    assert after.to_table(nearest=query).to_pydict() == expected
+
+
+@pytest.mark.parametrize("append_metric", ["l2", "L2", "euclidean", "EUCLIDEAN"])
+def test_backfill_accepts_equivalent_metric_spellings(tmp_path: Path, append_metric: str) -> None:
+    """Lance's Euclidean alias and case variations do not imply a changed metric."""
+    uri, _ = _make_vector_dataset(tmp_path / "metric_alias.lance", num_rows=240, rows_per_file=120)
+    centroids = (
+        IndicesBuilder(lance.dataset(uri), "vector")
+        .train_ivf(num_partitions=4, distance_type="l2", sample_rate=8)
+        .centroids
+    )
+    build = dict(column="vector", index_type="IVF_FLAT", ivf_centroids=centroids)
+    create_vector_index(uri, metric="L2", fragment_ids=[0], **build)
+    create_vector_index(uri, metric=append_metric, fragment_ids=[1], **build)
+    assert _covered_fragments(uri, "vector_idx") == {0, 1}
+
+
+def test_hnsw_build_parameters_are_forwarded(tmp_path: Path) -> None:
+    """Real HNSW kwargs are implemented by Lance even though its Python signature uses **kwargs."""
+    uri, vectors = _make_vector_dataset(tmp_path / "hnsw_kwargs.lance", num_rows=240, rows_per_file=60)
+    create_vector_index(
+        uri,
+        column="vector",
+        index_type="IVF_HNSW_FLAT",
+        num_partitions=4,
+        sample_rate=8,
+        fragment_group_size=2,
+        m=4,
+        max_level=3,
+        ef_construction=24,
+    )
+    ds = lance.dataset(uri)
+    assert len(ds.describe_indices()[0].segments) == 2
+    for segment in ds.index_statistics("vector_idx")["segments"]:
+        params = segment["sub_index"]["params"]
+        assert params["m"] == 4
+        assert params["max_level"] == 3
+        assert params["ef_construction"] == 24
+    assert 7 in ds.to_table(nearest={"column": "vector", "q": vectors[7], "k": 5, "nprobes": 4})["id"].to_pylist()
+
+
+def test_centroids_file_is_rejected_before_segment_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unsupported model-file input must fail before training or writing segment files."""
+    uri, _ = _make_vector_dataset(tmp_path / "centroids_file.lance", num_rows=240, rows_per_file=60)
+    before = lance.dataset(uri)
+
+    def unexpected_training(*args, **kwargs):
+        raise AssertionError("unsupported model-file argument reached training")
+
+    monkeypatch.setattr(IndicesBuilder, "train_ivf", unexpected_training)
+    with pytest.raises(TypeError, match="ivf_centroids_file"):
+        create_vector_index(uri, column="vector", index_type="IVF_FLAT", ivf_centroids_file="centroids.npy")
+    assert lance.dataset(uri).version == before.version
+    assert not lance.dataset(uri).describe_indices()

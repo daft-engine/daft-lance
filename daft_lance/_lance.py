@@ -746,7 +746,10 @@ def create_vector_index(
             refused with ``ValueError`` unless ``replace=True``. Replacement is
             atomic: all new segments commit in one transaction that retires the
             overlapped old segments, so readers see either the old or the new index.
-        metric: Distance metric ("L2", "cosine", or "dot").
+            New builds and backfill fail if another task changes the same index
+            during the build; retry the operation against the latest version.
+        metric: Distance metric ("L2", "cosine", or "dot"). Backfill must use
+            the same metric as the existing index; mismatches raise ``ValueError``.
         num_partitions: Number of IVF partitions. If None, Lance derives it from
             the number of rows during training. Note this is the IVF partition
             count of the trained model — unlike ``create_scalar_index``, where
@@ -792,9 +795,11 @@ def create_vector_index(
             backfill, but sharing IVF centroids does not guarantee compatible
             SQ quantization metadata for subsequent segment merging.
         **kwargs: Additional keyword arguments forwarded to Lance's index segment
-            creation API (e.g. ``target_partition_size``). Unknown arguments are
-            rejected with ``TypeError`` — Lance's segment build silently ignores
-            them, so misspellings must not pass silently here.
+            creation API, including HNSW ``m``, ``max_level`` and ``ef_construction``.
+            ``index_uuid`` is managed per segment. ``ivf_centroids_file`` is not
+            supported; supply shared centroids through ``ivf_centroids``.
+            Unknown arguments raise ``TypeError`` — Lance's segment build silently
+            ignores them, so misspellings must not pass silently here.
 
     Returns:
         None

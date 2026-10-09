@@ -35,8 +35,8 @@ _PQ_INDEX_TYPES = frozenset({"IVF_PQ", "IVF_HNSW_PQ"})
 # requirement is 256 rows per sampled codebook entry.
 _PQ_CODEBOOK_SIZE = 256
 
-# Keyword arguments this workflow sets explicitly on the worker's
-# ``create_index_uncommitted`` call; they are not valid user kwargs here.
+# Arguments managed by this workflow or incompatible with its shared-model
+# builds; they are not valid user kwargs on the worker's segment-build call.
 _HANDLER_MANAGED_KWARGS = frozenset(
     {
         "column",
@@ -51,6 +51,8 @@ _HANDLER_MANAGED_KWARGS = frozenset(
         "ivf_centroids",
         "pq_codebook",
         "storage_options",
+        "index_uuid",
+        "ivf_centroids_file",
     }
 )
 
@@ -62,10 +64,10 @@ def _accepted_worker_kwargs() -> frozenset[str]:
     ``create_index_uncommitted`` ends in ``**kwargs`` and silently drops
     unknown keys (verified: a misspelled or unsupported parameter builds an
     index with the wrong configuration and no warning), so the driver
-    validates user kwargs against its signature instead of forwarding blind.
+    validates explicit parameters and the HNSW options parsed from ``**kwargs``.
     """
     params = inspect.signature(lance.LanceDataset.create_index_uncommitted).parameters
-    return frozenset(params) - _HANDLER_MANAGED_KWARGS
+    return (frozenset(params) | {"m", "max_level", "ef_construction"}) - _HANDLER_MANAGED_KWARGS
 
 
 def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
@@ -75,6 +77,10 @@ def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
             "The 'segmented' parameter was removed: the distributed segment-index "
             "workflow is the only code path. Remove the argument."
         )
+    if "index_uuid" in kwargs:
+        raise TypeError("index_uuid is managed per segment; each worker must generate a unique UUID.")
+    if "ivf_centroids_file" in kwargs:
+        raise TypeError("ivf_centroids_file is not supported; pass shared centroids through ivf_centroids.")
     unknown = sorted(set(kwargs) - _accepted_worker_kwargs())
     if not unknown:
         return
@@ -89,6 +95,10 @@ def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
         f"index segment build silently ignores unknown arguments, so they are "
         f"rejected here. Accepted: {sorted(_accepted_worker_kwargs())}."
     )
+
+
+def _index_segment_ids(dataset: lance.LanceDataset, name: str) -> set[str]:
+    return {segment.uuid for index in dataset.describe_indices() if index.name == name for segment in index.segments}
 
 
 class VectorFragmentIndexHandler:
@@ -254,8 +264,9 @@ def create_vector_index_internal(
         requested_fragment_ids = set(unique_ids)
 
     existing_coverage = _existing_index_coverage(lance_ds, name)
+    planned_segment_ids = _index_segment_ids(lance_ds, name)
     if existing_coverage is not None:
-        # Column/model compatibility of a same-name index is validated by
+        # Column/index-type compatibility of a same-name index is validated by
         # Lance's build and commit APIs, not duplicated here.
         if not replace and requested_fragment_ids is None:
             raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
@@ -283,6 +294,19 @@ def create_vector_index_internal(
         if not to_build:
             logger.info("All requested fragments are already covered by index '%s'; nothing to build.", name)
             return
+        # Lance permits mixed metrics at commit, but their distances cannot be
+        # compared when searching the logical index.
+        stats = lance_ds.stats.index_stats(name)
+        if stats["index_type"].startswith("IVF"):
+            requested_metric = metric.lower()
+            if requested_metric == "euclidean":
+                requested_metric = "l2"
+            existing_metrics = {segment["metric_type"] for segment in stats["indices"]}
+            if existing_metrics != {requested_metric}:
+                raise ValueError(
+                    f"Cannot append to index '{name}' with metric '{metric}': "
+                    f"existing segments use {sorted(existing_metrics)}. Use the same metric."
+                )
         # Appended segments join a live logical index, and every segment of a
         # logical vector index must share the same IVF model: Lance's segment
         # merge refuses segments trained on different centroids (the error
@@ -450,8 +474,14 @@ def create_vector_index_internal(
 
     # Phase 3: validate against the live manifest and commit atomically.
     lance_ds = open_context.open_latest()
+    if (not replace or requested_fragment_ids is not None) and _index_segment_ids(
+        lance_ds, name
+    ) != planned_segment_ids:
+        raise ValueError(f"Index '{name}' changed during the build; retry against the latest dataset version.")
     _validate_segments_against_manifest(lance_ds, index_metas, fragment_ids_to_use)
 
+    # Keep the checked handle: a later same-name CreateIndex transaction then
+    # conflicts in Lance instead of being treated as an index to replace.
     logger.info("Collected %d vector index segments; committing as segmented index %s", len(index_metas), name)
     lance_ds.commit_existing_index_segments(name, column, index_metas)
     logger.info("Vector index %s committed successfully", name)
