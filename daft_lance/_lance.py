@@ -737,10 +737,9 @@ def create_vector_index(
             {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
         column: Vector column name to index.
         index_type: Vector index type to build: "IVF_FLAT", "IVF_PQ", "IVF_SQ",
-            "IVF_HNSW_FLAT", "IVF_HNSW_PQ", or "IVF_HNSW_SQ". The SQ variants
-            always build a single segment covering all selected fragments:
-            pylance exposes no shared SQ quantizer, so segments built
-            separately could never be merged by ``optimize_indices``.
+            "IVF_HNSW_FLAT", "IVF_HNSW_PQ", or "IVF_HNSW_SQ". Independently
+            built SQ segments may have different quantization metadata;
+            ``optimize_indices`` cannot merge segments with incompatible metadata.
         name: Name of the index (generated if None).
         replace: Whether to replace an existing index with the same name. Defaults
             to False, matching ``LanceDataset.create_index``; an existing name is
@@ -789,10 +788,9 @@ def create_vector_index(
             same ``ivf_centroids`` (and ``pq_codebook`` for PQ variants) the
             existing segments were built with — retraining would produce a
             divergent model that Lance cannot merge, so a backfill without the
-            original model raises ``ValueError``. SQ variants reject appends
-            entirely (no shareable SQ quantizer exists): rebuild with
-            ``replace=True`` or let ``optimize_indices`` pick up appended
-            fragments.
+            original model raises ``ValueError``. SQ variants also support
+            backfill, but sharing IVF centroids does not guarantee compatible
+            SQ quantization metadata for subsequent segment merging.
         **kwargs: Additional keyword arguments forwarded to Lance's index segment
             creation API (e.g. ``target_partition_size``). Unknown arguments are
             rejected with ``TypeError`` — Lance's segment build silently ignores

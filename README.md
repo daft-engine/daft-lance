@@ -135,13 +135,15 @@ segments were built with, since every segment of a logical vector index must
 share one IVF model — a backfill without the original model raises instead of
 silently training a divergent one.
 
-The SQ variants (`IVF_SQ`, `IVF_HNSW_SQ`) build a **single segment** covering
-all selected fragments and reject `fragment_ids` appends: pylance exposes no
-shared SQ quantizer, so segments built separately query correctly but can
-never be merged — `optimize_indices` refuses with "vector index segments do
-not share quantizer metadata". Rebuild with `replace=True` to retrain, or let
-`optimize_indices` pick up appended fragments (verified to keep a
-single-segment SQ index at one segment).
+The SQ variants (`IVF_SQ`, `IVF_HNSW_SQ`) support multi-segment builds and
+`fragment_ids` backfill. Each segment uses its own SQ quantization metadata
+for queries. Independently built segments may have different quantization
+metadata even when they share IVF centroids; Lance rejects attempts to merge
+incompatible segments through `optimize_indices` with "vector index segments
+do not share quantizer metadata". Use `fragment_group_size` large enough to
+cover all selected fragments when a single segment is preferred. To consolidate
+an existing index, rebuild with that grouping, `replace=True`, and no
+`fragment_ids`.
 
 Training samples `sample_rate` rows per IVF partition (and per PQ centroid)
 and runs in the coordinator process, so its memory footprint grows with
