@@ -18,9 +18,6 @@ if TYPE_CHECKING:
     from daft_lance.namespace import DatasetOpenContext
 
 
-UpdateTransform = dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch]
-
-
 _ROW_ADDRESS = "_rowaddr"
 _FRAGMENT_ID = "fragment_id"
 _METADATA_COLUMNS = {_ROW_ADDRESS, "_rowid"}
@@ -244,7 +241,7 @@ class _FragmentUpdateHandler:
 
 
 def _resolve_transform_columns(
-    transform: UpdateTransform,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
     columns: Sequence[str] | None,
     max_concurrency: int | None,
 ) -> list[str]:
@@ -300,7 +297,7 @@ def _validate_read_columns(lance_ds: lance.LanceDataset, read_columns: Sequence[
 
 def validate_transform_update_arguments(
     lance_ds: lance.LanceDataset,
-    transform: UpdateTransform,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
     *,
     columns: Sequence[str] | None,
     read_columns: Sequence[str] | None,
@@ -377,7 +374,7 @@ def _transform_fragment(
     lance_ds: lance.LanceDataset,
     fragment_id: int,
     *,
-    transform: UpdateTransform,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
     columns: list[str],
     read_columns: list[str] | None,
     where: str | None,
@@ -469,7 +466,7 @@ class _FragmentTransformUpdateHandler:
     def __init__(
         self,
         open_context: DatasetOpenContext,
-        transform: UpdateTransform,
+        transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: list[str],
         read_columns: list[str] | None,
         where: str | None,
@@ -558,7 +555,7 @@ def update_columns_with_transform(
     lance_ds: lance.LanceDataset,
     open_context: DatasetOpenContext,
     *,
-    transform: UpdateTransform,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
     columns: Sequence[str] | None,
     read_columns: Sequence[str] | None,
     where: str | None,
