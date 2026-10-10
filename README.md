@@ -196,6 +196,29 @@ update_columns(
 )
 ```
 
+For a GPU-backed version of the callable above, request resources for each
+Daft transform worker. The actual worker count remains bounded by Ray's
+available resources. Include custom `ray_options` only when the Ray cluster
+advertises the named resource:
+
+```python
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=compute_average,
+    columns=["average"],
+    read_columns=["total", "count"],
+    gpus=1,
+    cpus=2,
+    use_process=True,
+    max_concurrency=8,
+    ray_options={"resources": {"gpu_type_a10": 0.001}},
+)
+```
+
+`cpus=None`, `gpus=0`, `use_process=None`, and `ray_options=None` preserve
+Daft's defaults. These options apply only to transform workers; they are not
+needed by `update_columns_df`, whose input values have already been computed.
+
 Use a prepared Daft DataFrame to overwrite existing Lance columns while
 preserving row addresses and untouched column files:
 

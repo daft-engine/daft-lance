@@ -414,6 +414,10 @@ def update_columns(
     index_cache_size: int | None = None,
     metadata_cache_size_bytes: int | None = None,
     max_concurrency: int | None = None,
+    cpus: float | None = None,
+    gpus: float = 0,
+    use_process: bool | None = None,
+    ray_options: dict[str, Any] | None = None,
 ) -> UpdateColumnsResult:
     """Overwrite existing Lance columns with a row-preserving transform.
 
@@ -445,6 +449,14 @@ def update_columns(
         index_cache_size: Index cache size.
         metadata_cache_size_bytes: Metadata cache size in bytes.
         max_concurrency: Maximum number of concurrent fragment-update workers.
+        cpus: CPU resources requested for each transform worker. ``None`` lets
+            Daft choose.
+        gpus: GPU resources requested for each transform worker. Defaults to
+            ``0`` and is passed to Daft unchanged.
+        use_process: Whether Daft runs each transform worker in a separate
+            process. ``None`` lets Daft choose.
+        ray_options: Additional Ray options for transform workers. Daft
+            validates these options and runner compatibility.
 
     Returns:
         The committed dataset version and the number of live rows that matched
@@ -491,6 +503,21 @@ def update_columns(
         ...     batch_size=8192,
         ... )
 
+        A GPU-backed version of the callable above can request resources for
+        each Daft worker. The actual worker count is still bounded by available
+        Ray resources:
+
+        >>> daft_lance.update_columns(  # doctest: +SKIP
+        ...     "/tmp/events.lance",
+        ...     transform=compute_average,
+        ...     columns=["average"],
+        ...     read_columns=["total", "count"],
+        ...     gpus=1,
+        ...     cpus=2,
+        ...     use_process=True,
+        ...     max_concurrency=8,
+        ... )
+
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
     dataset_handle = construct_lance_dataset_handle(
@@ -515,6 +542,10 @@ def update_columns(
         batch_size=batch_size,
         commit_lock=commit_lock,
         max_concurrency=max_concurrency,
+        cpus=cpus,
+        gpus=gpus,
+        use_process=use_process,
+        ray_options=ray_options,
     )
 
 

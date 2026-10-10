@@ -11,6 +11,7 @@ import pytest
 
 import daft
 import daft_lance
+import daft_lance.lance_update_column as update_column
 from daft.dependencies import pa
 from daft_lance.lance_update_column import _FragmentUpdateHandler
 
@@ -32,12 +33,59 @@ def _read_update_source(path: str) -> daft.DataFrame:
     )
 
 
-def test_update_columns_do_not_accept_historical_snapshot_parameters() -> None:
+def test_update_columns_public_api_parameters() -> None:
     for operation in [daft_lance.update_columns, daft_lance.update_columns_df]:
         parameters = inspect.signature(cast(Callable[..., Any], operation)).parameters
         assert "version" not in parameters
         assert "asof" not in parameters
         assert "default_scan_options" not in parameters
+
+    transform_parameters = inspect.signature(daft_lance.update_columns).parameters
+    assert {"cpus", "gpus", "use_process", "ray_options"} <= set(transform_parameters)
+    assert transform_parameters["cpus"].default is None
+    assert transform_parameters["gpus"].default == 0
+    assert transform_parameters["use_process"].default is None
+    assert transform_parameters["ray_options"].default is None
+
+    dataframe_parameters = inspect.signature(daft_lance.update_columns_df).parameters
+    assert {"cpus", "gpus", "use_process", "ray_options"}.isdisjoint(dataframe_parameters)
+
+
+def test_transform_handler_forwards_resource_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    open_context = object()
+    transform = {"value": "value + 1"}
+
+    def fake_cls(class_: type, **kwargs: Any) -> Callable[..., dict[str, Any]]:
+        captured["class"] = class_
+        captured.update(kwargs)
+        return lambda *args: {"args": args}
+
+    monkeypatch.setattr(daft, "cls", fake_cls)
+
+    handler = update_column._make_transform_update_handler(
+        cast(Any, open_context),
+        transform,
+        ["value"],
+        ["value"],
+        "id > 0",
+        128,
+        cpus=2,
+        gpus=1,
+        use_process=True,
+        max_concurrency=4,
+        ray_options={"resources": {"gpu_type_a10": 0.001}},
+    )
+
+    assert captured == {
+        "class": update_column._FragmentTransformUpdateHandler,
+        "cpus": 2,
+        "gpus": 1,
+        "use_process": True,
+        "max_concurrency": 4,
+        "ray_options": {"resources": {"gpu_type_a10": 0.001}},
+    }
+    assert handler["args"] == (open_context, transform, ["value"], ["value"], "id > 0", 128)
 
 
 def test_update_columns_sql_transform_with_where(tmp_path: Path) -> None:

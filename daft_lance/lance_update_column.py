@@ -506,6 +506,31 @@ class _FragmentTransformUpdateHandler:
         return results
 
 
+def _make_transform_update_handler(
+    open_context: DatasetOpenContext,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+    columns: list[str],
+    read_columns: list[str] | None,
+    where: str | None,
+    batch_size: int | None,
+    *,
+    cpus: float | None,
+    gpus: float,
+    use_process: bool | None,
+    max_concurrency: int | None,
+    ray_options: dict[str, Any] | None,
+) -> Any:
+    handler_cls = daft.cls(
+        _FragmentTransformUpdateHandler,
+        cpus=cpus,
+        gpus=gpus,
+        use_process=use_process,
+        max_concurrency=max_concurrency,
+        ray_options=ray_options,
+    )
+    return handler_cls(open_context, transform, columns, read_columns, where, batch_size)
+
+
 def _commit_update_messages(
     commit_messages: list[dict[str, Any]],
     lance_ds: lance.LanceDataset,
@@ -562,6 +587,10 @@ def update_columns_with_transform(
     batch_size: int | None,
     commit_lock: Any | None,
     max_concurrency: int | None,
+    cpus: float | None,
+    gpus: float,
+    use_process: bool | None,
+    ray_options: dict[str, Any] | None,
 ) -> UpdateColumnsResult:
     resolved_columns, resolved_read_columns, resolved_where = validate_transform_update_arguments(
         lance_ds,
@@ -581,14 +610,18 @@ def update_columns_with_transform(
     source = daft.from_pydict({_FRAGMENT_ID: fragment_ids})
     if len(fragment_ids) > 1 and get_or_create_runner().name != "native":
         source = source.into_partitions(len(fragment_ids))
-    handler_cls = daft.cls(_FragmentTransformUpdateHandler, max_concurrency=max_concurrency)
-    handler = handler_cls(
+    handler = _make_transform_update_handler(
         open_context,
         transform,
         resolved_columns,
         resolved_read_columns,
         resolved_where,
         batch_size,
+        cpus=cpus,
+        gpus=gpus,
+        use_process=use_process,
+        max_concurrency=max_concurrency,
+        ray_options=ray_options,
     )
     results = source.with_column("commit_message", handler(source[_FRAGMENT_ID]))
     commit_messages = results.collect().to_pydict()["commit_message"]
