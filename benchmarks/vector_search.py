@@ -56,13 +56,15 @@ def _prepare(args: argparse.Namespace) -> None:
         index_type=args.index_type,
         name="bench_idx",
         num_partitions=args.partitions,
-        num_sub_vectors=args.subvectors,
+        num_sub_vectors=args.subvectors if args.index_type == "IVF_PQ" else None,
+        metric=args.metric,
         sample_rate=2,
         fragment_group_size=1,
     )
     ds = lance.dataset(uri)
     metadata = {
-        key: getattr(args, key) for key in ("rows", "dim", "segments", "queries", "seed", "index_type", "partitions")
+        key: getattr(args, key)
+        for key in ("rows", "dim", "segments", "queries", "seed", "index_type", "partitions", "metric")
     }
     metadata.update(version=ds.version, actual_segments=len(ds.describe_indices()[0].segments))
     (root / "dataset.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -137,12 +139,35 @@ def _run(args: argparse.Namespace) -> None:
         raise ValueError("Query file is empty")
     ds = lance.dataset(uri)
     version = ds.version
+    # The single-scan baselines select their index through Lance. Requiring one
+    # relevant index makes every backend use the same files without assuming
+    # Lance's default selection agrees with an explicit distributed selection.
+    indices = [
+        idx
+        for idx in ds.describe_indices()
+        if str(idx.index_type).startswith("IVF_") and args.column in idx.field_names
+    ]
+    if len(indices) != 1:
+        raise ValueError("Benchmark requires exactly one vector index for the selected column")
+    index_name = indices[0].name
+    if args.index_name is not None and args.index_name != index_name:
+        raise ValueError(f"Requested index {args.index_name!r} does not match the column's index {index_name!r}")
     predicate = args.filter
     if predicate is None and args.selectivity < 1:
         predicate = f"bucket < {round(1000 * args.selectivity)}"
     base_nearest = {"column": args.column, "k": args.k, "nprobes": args.nprobes, "metric": args.metric}
     if args.refine_factor is not None:
         base_nearest["refine_factor"] = args.refine_factor
+    # Explicit segments make Lance reject a metric mismatch instead of allowing
+    # a baseline to silently fall back to brute-force search.
+    ds.scanner(
+        columns=[args.id_column],
+        nearest={**base_nearest, "q": queries[0]},
+        index_segments=[str(segment.uuid) for segment in indices[0].segments],
+        filter=predicate,
+        prefilter=True,
+        fast_search=True,
+    ).projected_schema
     ray_module = None
     if args.runner == "ray" and args.backend != "pylance":
         import ray
@@ -157,7 +182,7 @@ def _run(args: argparse.Namespace) -> None:
                 uri,
                 version=version,
                 nearest={**base_nearest, "q": queries},
-                index_name=args.index_name,
+                index_name=index_name,
                 columns=[args.id_column],
                 filter=predicate,
                 num_tasks=1 if args.backend == "queries" else args.tasks,
@@ -230,7 +255,7 @@ def _run(args: argparse.Namespace) -> None:
             uri,
             version=version,
             nearest={**base_nearest, "q": queries[0]},
-            index_name=args.index_name,
+            index_name=index_name,
             columns=[args.id_column],
             filter=predicate,
             num_tasks=1 if args.backend == "queries" else args.tasks,
@@ -244,6 +269,7 @@ def _run(args: argparse.Namespace) -> None:
         "cpu_affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
         "threads_per_process": os.environ["RAYON_NUM_THREADS"],
         "dataset_version": version,
+        "index_name": index_name,
         "rows": ds.count_rows(),
         "segments": {idx.name: len(idx.segments) for idx in ds.describe_indices()},
         "queries_per_run": len(queries),

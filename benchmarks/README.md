@@ -109,6 +109,10 @@ python benchmarks/vector_search.py run --root /tmp/real-bench \
 ```
 
 Use environment-based object-store credentials and a completely covered index.
+Comparison runs require exactly one vector index on the selected column, so
+every backend uses the same index. `--index-name` validates that index's name,
+and `--metric` must match its metric. Synthetic preparation builds the index
+with `--metric` (default: `l2`) and records it in `dataset.json`.
 Queries must be a finite matrix with the same dimension as the vector field;
 the ID column must uniquely identify rows for recall calculation. Use an
 explicit predicate for existing tables instead of synthetic `--selectivity`.
