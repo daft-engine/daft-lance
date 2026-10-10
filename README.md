@@ -143,6 +143,10 @@ latest version. Full rebuilds with `replace=True` retain replacement semantics.
 HNSW builds accept `m`, `max_level`, and `ef_construction`. Each worker generates
 its own segment UUID, so `index_uuid` cannot be supplied. For pre-trained IVF
 models, pass `ivf_centroids`; `ivf_centroids_file` is not supported by this API.
+PQ builds accept `num_bits` (default 8; 4 and 8 are supported by Lance). The same
+bit width is used for shared codebook training and every segment build. When
+supplying a `pq_codebook`, also pass its original `num_sub_vectors` and
+`num_bits`; a bare codebook array does not carry the sub-vector count.
 
 The SQ variants (`IVF_SQ`, `IVF_HNSW_SQ`) support multi-segment builds and
 `fragment_ids` backfill. Each segment uses its own SQ quantization metadata
@@ -158,7 +162,7 @@ Training samples `sample_rate` rows per IVF partition (and per PQ centroid)
 and runs in the coordinator process, so its memory footprint grows with
 `num_partitions * sample_rate * dimension`; `sample_rate` is clamped down
 automatically (with a warning) to what the dataset size supports
-(`num_partitions * sample_rate` rows, `256 * sample_rate` for the 8-bit PQ
+(`num_partitions * sample_rate` rows, `2**num_bits * sample_rate` for the PQ
 codebook).
 
 

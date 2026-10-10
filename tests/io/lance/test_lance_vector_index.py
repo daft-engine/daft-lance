@@ -285,13 +285,18 @@ def test_pretrained_centroids_are_used(tmp_path: Path) -> None:
     assert desc.num_rows_indexed == 240
 
 
-def test_pq_codebook_without_num_sub_vectors_derives_it(tmp_path: Path) -> None:
-    """A supplied codebook implies num_sub_vectors; no deep worker error."""
+def test_pq_codebook_requires_original_num_sub_vectors(tmp_path: Path) -> None:
+    """A bare codebook cannot reveal how the original vectors were split."""
     uri, _ = _make_vector_dataset(tmp_path / "codebook.lance", seed=19)
     ds = lance.dataset(uri)
     builder = IndicesBuilder(ds, "vector")
     ivf = builder.train_ivf(num_partitions=4, distance_type="l2", sample_rate=32)
     pq = builder.train_pq(ivf, num_subvectors=2, sample_rate=8)
+
+    with pytest.raises(ValueError, match="original num_sub_vectors"):
+        create_vector_index(
+            uri, column="vector", index_type="IVF_PQ", ivf_centroids=ivf.centroids, pq_codebook=pq.codebook
+        )
 
     create_vector_index(
         uri,
@@ -299,12 +304,17 @@ def test_pq_codebook_without_num_sub_vectors_derives_it(tmp_path: Path) -> None:
         index_type="IVF_PQ",
         ivf_centroids=ivf.centroids,
         pq_codebook=pq.codebook,
+        num_sub_vectors=2,
         fragment_group_size=4,
     )
 
     desc = lance.dataset(uri).describe_indices()[0]
     assert desc.index_type == "IVF_PQ"
     assert desc.num_rows_indexed == 2048
+    assert all(
+        segment["sub_index"]["num_sub_vectors"] == 2
+        for segment in lance.dataset(uri).stats.index_stats("vector_idx")["indices"]
+    )
 
 
 def test_backfill_requires_the_original_shared_model(tmp_path: Path) -> None:
@@ -577,5 +587,91 @@ def test_centroids_file_is_rejected_before_segment_build(tmp_path: Path, monkeyp
     monkeypatch.setattr(IndicesBuilder, "train_ivf", unexpected_training)
     with pytest.raises(TypeError, match="ivf_centroids_file"):
         create_vector_index(uri, column="vector", index_type="IVF_FLAT", ivf_centroids_file="centroids.npy")
+    assert lance.dataset(uri).version == before.version
+    assert not lance.dataset(uri).describe_indices()
+
+
+@pytest.mark.parametrize("index_type", ["IVF_PQ", "IVF_HNSW_PQ"])
+@pytest.mark.parametrize("num_bits", [4, 8])
+def test_pq_bit_width_is_shared_by_all_segments(tmp_path: Path, index_type: str, num_bits: int) -> None:
+    uri, vectors = _make_vector_dataset(tmp_path / "bits.lance", num_rows=512, rows_per_file=128)
+    create_vector_index(
+        uri,
+        column="vector",
+        index_type=index_type,
+        num_partitions=2,
+        num_sub_vectors=2,
+        num_bits=num_bits,
+        sample_rate=8,
+        fragment_group_size=2,
+    )
+    ds = lance.dataset(uri)
+    segments = ds.stats.index_stats("vector_idx")["indices"]
+    assert len(segments) == 2
+    assert all(segment["sub_index"]["nbits"] == num_bits for segment in segments)
+    assert all(segment["sub_index"]["num_sub_vectors"] == 2 for segment in segments)
+    result = ds.to_table(nearest={"column": "vector", "q": vectors[7], "k": 5, "nprobes": 2})
+    assert result.num_rows == 5
+    assert np.isfinite(result["_distance"].to_numpy()).all()
+
+
+def test_four_bit_pq_sampling_uses_sixteen_centroids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    uri, _ = _make_vector_dataset(tmp_path / "sampling_bits.lance", num_rows=128, rows_per_file=64)
+    centroids = pa.FixedSizeListArray.from_arrays(pa.array([0.0] * 8, type=pa.float32()), 8)
+    original_train = IndicesBuilder.train_pq
+    calls = []
+
+    def train_with_recorded_sample(builder, *args, **kwargs):
+        calls.append((kwargs["num_bits"], kwargs["sample_rate"]))
+        return original_train(builder, *args, **kwargs)
+
+    monkeypatch.setattr(IndicesBuilder, "train_pq", train_with_recorded_sample)
+    create_vector_index(
+        uri,
+        column="vector",
+        index_type="IVF_PQ",
+        ivf_centroids=centroids,
+        num_sub_vectors=2,
+        num_bits=4,
+        sample_rate=8,
+        fragment_group_size=1,
+    )
+    # 16 * 8 samples fit in 128 rows; no IVF training or 256-entry cap applies.
+    assert calls == [(4, 8)]
+    assert all(
+        segment["sub_index"]["nbits"] == 4 for segment in lance.dataset(uri).stats.index_stats("vector_idx")["indices"]
+    )
+
+
+def test_supplied_four_bit_pq_model_backfills_with_original_configuration(tmp_path: Path) -> None:
+    uri, vectors = _make_vector_dataset(tmp_path / "supplied_bits.lance", num_rows=256, rows_per_file=128)
+    builder = IndicesBuilder(lance.dataset(uri), "vector")
+    ivf = builder.train_ivf(num_partitions=2, sample_rate=8)
+    pq = builder.train_pq(ivf, num_subvectors=2, num_bits=4, sample_rate=8)
+    build = dict(
+        column="vector",
+        index_type="IVF_PQ",
+        ivf_centroids=ivf.centroids,
+        pq_codebook=pq.codebook,
+        num_sub_vectors=2,
+        num_bits=4,
+    )
+    create_vector_index(uri, fragment_ids=[0], **build)
+    create_vector_index(uri, fragment_ids=[1], **build)
+    ds = lance.dataset(uri)
+    segments = ds.stats.index_stats("vector_idx")["indices"]
+    assert len(segments) == 2
+    assert all(segment["sub_index"]["nbits"] == 4 for segment in segments)
+    assert all(segment["sub_index"]["num_sub_vectors"] == 2 for segment in segments)
+    assert _covered_fragments(uri, "vector_idx") == {0, 1}
+    assert ds.to_table(nearest={"column": "vector", "q": vectors[7], "k": 5, "nprobes": 2}).num_rows == 5
+
+
+@pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_SQ"])
+def test_non_pq_bit_width_is_not_silently_ignored(tmp_path: Path, index_type: str) -> None:
+    uri, _ = _make_vector_dataset(tmp_path / "non_pq_bits.lance", num_rows=128, rows_per_file=64)
+    before = lance.dataset(uri)
+    with pytest.raises(ValueError, match="configurable only for IVF_PQ"):
+        create_vector_index(uri, column="vector", index_type=index_type, num_bits=4)
     assert lance.dataset(uri).version == before.version
     assert not lance.dataset(uri).describe_indices()

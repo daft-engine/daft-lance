@@ -698,6 +698,7 @@ def create_vector_index(
     metric: str = "L2",
     num_partitions: int | None = None,
     num_sub_vectors: int | None = None,
+    num_bits: int = 8,
     sample_rate: int = 256,
     ivf_centroids: Any | None = None,
     pq_codebook: Any | None = None,
@@ -756,21 +757,27 @@ def create_vector_index(
             ``num_partitions`` controls Daft's fragment repartitioning; build
             parallelism here comes from ``fragment_group_size``/``max_concurrency``.
         num_sub_vectors: Number of PQ sub-vectors (PQ variants only). If None,
-            Lance derives it from the vector dimension during training, or from
-            the supplied ``pq_codebook`` when one is given.
+            Lance derives it from the vector dimension during training. Required
+            when supplying a ``pq_codebook``; the array does not carry this metadata.
+        num_bits: Bits per PQ code, default 8; Lance supports 4 and 8. Configurable
+            only for ``IVF_PQ`` and ``IVF_HNSW_PQ``. Passed to shared codebook
+            training and every segment build. Lance validates supported configurations.
+            Supplied PQ codebooks and backfill must use the matching bit width.
         sample_rate: Rows sampled per IVF partition (and per PQ centroid) during
             training. Training requires at least ``num_partitions * sample_rate``
-            rows (256 * sample_rate for the 8-bit PQ codebook); the value is
+            rows (2**num_bits * sample_rate for the PQ codebook); the value is
             automatically clamped down (with a warning) to what the dataset
-            size supports, so the default works on datasets of any size, at the
-            cost of a smaller training sample on small datasets.
+            size supports, at the cost of a smaller training sample on small
+            datasets. Lance still rejects data below the minimum training size
+            (2**num_bits rows for PQ); clamping does not remove that requirement.
         ivf_centroids: Pre-trained IVF centroids (a pyarrow array); skips IVF
             training. Supplying the same centroids to every build is how
             independently built segments share one model. Required when
             appending to an existing index (``fragment_ids`` backfill): all
             segments of a logical vector index must share one IVF model.
         pq_codebook: Pre-trained PQ codebook (PQ variants only); skips PQ
-            training. Required when appending to an existing PQ index, for the
+            training. Supply its original ``num_sub_vectors`` and ``num_bits``.
+            Required when appending to an existing PQ index, for the
             same shared-model reason as ``ivf_centroids``.
         storage_options: Storage options for the dataset.
         version: Version of the dataset to use.
@@ -863,6 +870,7 @@ def create_vector_index(
         metric=metric,
         num_partitions=num_partitions,
         num_sub_vectors=num_sub_vectors,
+        num_bits=num_bits,
         sample_rate=sample_rate,
         ivf_centroids=ivf_centroids,
         pq_codebook=pq_codebook,

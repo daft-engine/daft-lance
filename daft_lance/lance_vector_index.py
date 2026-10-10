@@ -31,10 +31,6 @@ VECTOR_INDEX_TYPES = frozenset({"IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT",
 # PQ variants need a codebook trained alongside the IVF centroids.
 _PQ_INDEX_TYPES = frozenset({"IVF_PQ", "IVF_HNSW_PQ"})
 
-# The 8-bit PQ codebook trains one centroid per 2^8 codes, so its sample
-# requirement is 256 rows per sampled codebook entry.
-_PQ_CODEBOOK_SIZE = 256
-
 # Arguments managed by this workflow or incompatible with its shared-model
 # builds; they are not valid user kwargs on the worker's segment-build call.
 _HANDLER_MANAGED_KWARGS = frozenset(
@@ -48,6 +44,7 @@ _HANDLER_MANAGED_KWARGS = frozenset(
         "metric",
         "num_partitions",
         "num_sub_vectors",
+        "num_bits",
         "ivf_centroids",
         "pq_codebook",
         "storage_options",
@@ -168,6 +165,7 @@ def create_vector_index_internal(
     metric: str = "L2",
     num_partitions: int | None = None,
     num_sub_vectors: int | None = None,
+    num_bits: int = 8,
     sample_rate: int = 256,
     ivf_centroids: pa.Array[Any] | None = None,
     pq_codebook: pa.Array[Any] | None = None,
@@ -190,10 +188,10 @@ def create_vector_index_internal(
        ``ivf_centroids`` / ``pq_codebook``. One shared model across segments is
        what lets independently built segments commit as one logical index.
        ``sample_rate`` is clamped down to what the dataset size supports
-       (training needs ``num_partitions * sample_rate`` rows, and the 8-bit PQ
-       codebook needs ``256 * sample_rate``); ``num_sub_vectors`` and
-       ``num_partitions`` are derived from a supplied codebook / centroids when
-       not given explicitly.
+       (training needs ``num_partitions * sample_rate`` rows, and the PQ
+       codebook needs ``2**num_bits * sample_rate``). ``num_partitions`` is
+       derived from supplied centroids. A supplied codebook requires explicit
+       ``num_sub_vectors`` because the array does not carry that metadata.
     2. Fragment batches are distributed across Daft workers, one partition per
        batch; each worker calls ``create_index_uncommitted`` with the shared
        model for its fragments and pickles the segment metadata back.
@@ -226,15 +224,19 @@ def create_vector_index_internal(
 
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    if index_type not in _PQ_INDEX_TYPES and num_bits != 8:
+        raise ValueError("num_bits is configurable only for IVF_PQ and IVF_HNSW_PQ.")
 
     # Reject kwargs Lance's segment build would silently swallow (misspelled
     # or unsupported parameters must not build a misconfigured index).
     _validate_worker_kwargs(kwargs)
+    if index_type in _PQ_INDEX_TYPES and pq_codebook is not None and num_sub_vectors is None:
+        raise ValueError("A supplied pq_codebook requires its original num_sub_vectors; it cannot be inferred.")
 
     # Validate column exists; whether it is a vector column is Lance's rule,
     # enforced by the training and build APIs with clear errors.
     try:
-        field = lance_ds.schema.field(column)
+        lance_ds.schema.field(column)
     except KeyError as e:
         available_columns = [field.name for field in lance_ds.schema]
         raise ValueError(f"Column '{column}' not found. Available: {available_columns}") from e
@@ -352,12 +354,14 @@ def create_vector_index_internal(
         # Clamp the sample rate to what this dataset can support, mirroring
         # Lance's own training requirements: num_partitions * sample_rate rows
         # for IVF (Lance derives num_partitions as sqrt(num_rows) when None)
-        # and 256 * sample_rate rows for the 8-bit PQ codebook.
-        effective_partitions = num_partitions if num_partitions is not None else max(1, round(math.sqrt(num_rows)))
-        caps = [max(1, num_rows // effective_partitions)]
+        # and 2**num_bits * sample_rate rows for the PQ codebook.
+        caps = [sample_rate]
+        if needs_ivf_training:
+            effective_partitions = num_partitions if num_partitions is not None else max(1, round(math.sqrt(num_rows)))
+            caps.append(max(1, num_rows // effective_partitions))
         if needs_pq_training:
-            caps.append(max(1, num_rows // _PQ_CODEBOOK_SIZE))
-        clamped = min([sample_rate, *caps])
+            caps.append(max(1, num_rows // (2**num_bits)))
+        clamped = min(caps)
         if clamped < sample_rate:
             logger.warning(
                 "sample_rate %d exceeds what the dataset supports (%d rows); clamping to %d",
@@ -401,34 +405,23 @@ def create_vector_index_internal(
         pq_model = builder.train_pq(
             ivf_model,
             num_subvectors=num_sub_vectors,
+            num_bits=num_bits,
             sample_rate=effective_sample_rate,
         )
         pq_codebook = pq_model.codebook
         num_sub_vectors = pq_model.num_subvectors
         logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
 
-    # Derive the model shape from supplied artifacts when not given: the
-    # partition count is the number of centroids, and the sub-vector count
-    # follows from the codebook's entry size versus the column dimension.
+    # Derive the partition count from supplied centroids when not given.
     if num_partitions is None and ivf_centroids is not None:
         num_partitions = len(ivf_centroids)
-    if num_sub_vectors is None and pq_codebook is not None:
-        dimension = getattr(field.type, "list_size", None)
-        subvector_size = getattr(pq_codebook.type, "list_size", None)
-        if dimension and subvector_size and dimension % subvector_size == 0:
-            num_sub_vectors = dimension // subvector_size
-        else:
-            raise ValueError(
-                f"Cannot derive num_sub_vectors from the supplied pq_codebook "
-                f"(column dimension {dimension}, codebook entry size {subvector_size}); "
-                "pass num_sub_vectors explicitly."
-            )
 
     model_kwargs: dict[str, Any] = {
         "metric": metric,
         "ivf_centroids": ivf_centroids,
         "num_partitions": num_partitions,
         "num_sub_vectors": num_sub_vectors,
+        "num_bits": num_bits,
         "pq_codebook": pq_codebook,
     }
 
