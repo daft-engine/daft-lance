@@ -148,7 +148,7 @@ from daft_lance import update_columns
 
 result = update_columns(
     "s3://bucket/my_dataset",
-    transform={"score": "score * 2", "status": "'processed'"},
+    transform={"score": "raw_score * weight", "status": "'processed'"},
     where="date >= DATE '2026-07-01'",
 )
 print(result.version, result.rows_updated)
@@ -163,14 +163,15 @@ import pyarrow as pa
 from daft_lance import update_columns
 
 @lance.batch_udf(output_schema=pa.schema([pa.field("score", pa.int64())]))
-def double_score(batch: pa.RecordBatch) -> pa.RecordBatch:
-    return pa.record_batch([pa.compute.multiply(batch.column("score"), 2)], names=["score"])
+def compute_score(batch: pa.RecordBatch) -> pa.RecordBatch:
+    score = pa.compute.multiply(batch.column("raw_score"), batch.column("multiplier"))
+    return pa.record_batch([score], names=["score"])
 
 update_columns(
     "s3://bucket/my_dataset",
-    transform=double_score,
+    transform=compute_score,
     where="status = 'new'",
-    read_columns=["score"],
+    read_columns=["raw_score", "multiplier"],
 )
 ```
 
@@ -182,15 +183,15 @@ row count and order:
 import pyarrow as pa
 from daft_lance import update_columns
 
-def normalize_score(batch: pa.RecordBatch) -> pa.RecordBatch:
-    score = batch.column("score")
-    return pa.record_batch([pa.compute.divide(score, 100)], names=["score"])
+def compute_average(batch: pa.RecordBatch) -> pa.RecordBatch:
+    average = pa.compute.divide(batch.column("total"), batch.column("count"))
+    return pa.record_batch([average], names=["average"])
 
 update_columns(
     "s3://bucket/my_dataset",
-    transform=normalize_score,
-    columns=["score"],
-    read_columns=["score"],
+    transform=compute_average,
+    columns=["average"],
+    read_columns=["total", "count"],
     batch_size=8192,
 )
 ```

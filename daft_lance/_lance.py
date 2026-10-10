@@ -462,7 +462,7 @@ def update_columns(
         >>> import daft_lance  # doctest: +SKIP
         >>> daft_lance.update_columns(  # doctest: +SKIP
         ...     "/tmp/events.lance",
-        ...     transform={"score": "score * 2", "status": "'processed'"},
+        ...     transform={"score": "raw_score * weight", "status": "'processed'"},
         ...     where="date >= DATE '2026-07-01'",
         ... )
 
@@ -472,23 +472,24 @@ def update_columns(
         >>> import lance  # doctest: +SKIP
         >>> import pyarrow as pa  # doctest: +SKIP
         >>> @lance.batch_udf(output_schema=pa.schema([pa.field("score", pa.int64())]))  # doctest: +SKIP
-        ... def double_score(batch):
-        ...     return pa.record_batch([pa.compute.multiply(batch.column("score"), 2)], names=["score"])
+        ... def compute_score(batch):
+        ...     score = pa.compute.multiply(batch.column("raw_score"), batch.column("multiplier"))
+        ...     return pa.record_batch([score], names=["score"])
         >>> daft_lance.update_columns(  # doctest: +SKIP
-        ...     "/tmp/events.lance", transform=double_score, read_columns=["score"]
+        ...     "/tmp/events.lance", transform=compute_score, read_columns=["raw_score", "multiplier"]
         ... )
 
         A regular callable must declare ``columns`` and return exactly those
         columns, preserving the input row count and order:
 
-        >>> def normalize_score(batch):  # doctest: +SKIP
-        ...     score = batch.column("score")
-        ...     return pa.record_batch([pa.compute.divide(score, 100)], names=["score"])
+        >>> def compute_average(batch):  # doctest: +SKIP
+        ...     average = pa.compute.divide(batch.column("total"), batch.column("count"))
+        ...     return pa.record_batch([average], names=["average"])
         >>> daft_lance.update_columns(  # doctest: +SKIP
         ...     "/tmp/events.lance",
-        ...     transform=normalize_score,
-        ...     columns=["score"],
-        ...     read_columns=["score"],
+        ...     transform=compute_average,
+        ...     columns=["average"],
+        ...     read_columns=["total", "count"],
         ...     batch_size=8192,
         ... )
 
