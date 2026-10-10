@@ -18,7 +18,12 @@ from .lance_data_sink import LanceDataSink
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal, optimize_indices_internal
 from .lance_scan import LanceScanOperator
-from .lance_update_column import UpdateColumnsResult, update_columns_from_df, validate_update_arguments
+from .lance_update_column import (
+    UpdateColumnsResult,
+    update_columns_from_df,
+    update_columns_with_transform,
+    validate_update_arguments,
+)
 from .namespace import validate_uri_or_namespace
 from .utils import construct_lance_dataset_handle
 
@@ -391,6 +396,160 @@ def merge_columns_df(
 
 
 @PublicAPI
+def update_columns(
+    uri: str | pathlib.Path | None = None,
+    io_config: IOConfig | None = None,
+    *,
+    transform: dict[str, str] | BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+    where: str | None = None,
+    columns: Sequence[str] | None = None,
+    read_columns: Sequence[str] | None = None,
+    batch_size: int | None = None,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    storage_options: dict[str, Any] | None = None,
+    block_size: int | None = None,
+    commit_lock: Any | None = None,
+    index_cache_size: int | None = None,
+    metadata_cache_size_bytes: int | None = None,
+    max_concurrency: int | None = None,
+    cpus: float | None = None,
+    gpus: float = 0,
+    use_process: bool | None = None,
+    ray_options: dict[str, Any] | None = None,
+) -> UpdateColumnsResult:
+    """Overwrite existing Lance columns with a row-preserving transform.
+
+    The target snapshot is scanned fragment by fragment. Rows matching ``where``
+    are passed through ``transform`` and joined back to their fragment by the
+    internal ``_rowaddr``. Daft distributes only fragment identifiers; callers do
+    not need to build or group an update DataFrame.
+
+    Args:
+        uri: URI of the target Lance dataset. Mutually exclusive with namespace parameters.
+        io_config: Daft object-store configuration.
+        transform: Either a mapping from existing column names to Lance SQL
+            expressions, a Lance ``BatchUDF``, or a callable accepting and
+            returning an Arrow ``RecordBatch``. Callable output must preserve row
+            count and order and contain only the columns being updated.
+        where: Optional Lance SQL predicate evaluated against the pinned source
+            snapshot before the transform. ``None`` updates every live row.
+        columns: Existing top-level columns to overwrite. Inferred from dict keys
+            or a ``BatchUDF.output_schema``; required for other callables.
+        read_columns: Columns passed to callable transforms. Defaults to all table
+            columns. Ignored for SQL-expression transforms.
+        batch_size: Maximum scan batch size per fragment.
+        table_id: Namespace table identifier.
+        namespace_impl: Lance Namespace implementation.
+        namespace_properties: Properties used to connect to the namespace.
+        storage_options: Additional object-store options.
+        block_size: Hint for the minimum object-store I/O request size.
+        commit_lock: Custom Lance commit lock.
+        index_cache_size: Index cache size.
+        metadata_cache_size_bytes: Metadata cache size in bytes.
+        max_concurrency: Maximum number of concurrent fragment-update workers.
+        cpus: CPU resources requested for each transform worker. ``None`` lets
+            Daft choose.
+        gpus: GPU resources requested for each transform worker. Defaults to
+            ``0`` and is passed to Daft unchanged.
+        use_process: Whether Daft runs each transform worker in a separate
+            process. ``None`` lets Daft choose.
+        ray_options: Additional Ray options for transform workers. Daft
+            validates these options and runner compatibility.
+
+    Returns:
+        The committed dataset version and the number of live rows that matched
+        ``where``. If no rows match, no version is created.
+
+    Note:
+        A fragment failure can leave unreferenced data files written by other
+        workers. No transaction is committed; Lance cleanup removes those files.
+
+    Examples:
+        Update columns with Lance SQL expressions. Dict keys infer ``columns``:
+
+        >>> import daft_lance  # doctest: +SKIP
+        >>> daft_lance.update_columns(  # doctest: +SKIP
+        ...     "/tmp/events.lance",
+        ...     transform={"score": "raw_score * weight", "status": "'processed'"},
+        ...     where="date >= DATE '2026-07-01'",
+        ... )
+
+        Use a ``BatchUDF`` when its output schema is known. Its output schema
+        infers ``columns`` and ``read_columns`` limits data provided to the UDF:
+
+        >>> import lance  # doctest: +SKIP
+        >>> import pyarrow as pa  # doctest: +SKIP
+        >>> @lance.batch_udf(output_schema=pa.schema([pa.field("score", pa.int64())]))  # doctest: +SKIP
+        ... def compute_score(batch):
+        ...     score = pa.compute.multiply(batch.column("raw_score"), batch.column("multiplier"))
+        ...     return pa.record_batch([score], names=["score"])
+        >>> daft_lance.update_columns(  # doctest: +SKIP
+        ...     "/tmp/events.lance", transform=compute_score, read_columns=["raw_score", "multiplier"]
+        ... )
+
+        A regular callable must declare ``columns`` and return exactly those
+        columns, preserving the input row count and order:
+
+        >>> def compute_average(batch):  # doctest: +SKIP
+        ...     average = pa.compute.divide(batch.column("total"), batch.column("count"))
+        ...     return pa.record_batch([average], names=["average"])
+        >>> daft_lance.update_columns(  # doctest: +SKIP
+        ...     "/tmp/events.lance",
+        ...     transform=compute_average,
+        ...     columns=["average"],
+        ...     read_columns=["total", "count"],
+        ...     batch_size=8192,
+        ... )
+
+        A GPU-backed version of the callable above can request resources for
+        each Daft worker. The actual worker count is still bounded by available
+        Ray resources:
+
+        >>> daft_lance.update_columns(  # doctest: +SKIP
+        ...     "/tmp/events.lance",
+        ...     transform=compute_average,
+        ...     columns=["average"],
+        ...     read_columns=["total", "count"],
+        ...     gpus=1,
+        ...     cpus=2,
+        ...     use_process=True,
+        ...     max_concurrency=8,
+        ... )
+
+    """
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    dataset_handle = construct_lance_dataset_handle(
+        uri,
+        storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
+        block_size=block_size,
+        commit_lock=commit_lock,
+        index_cache_size=index_cache_size,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
+    )
+    return update_columns_with_transform(
+        dataset_handle.dataset,
+        dataset_handle.worker_open_context(),
+        transform=transform,
+        columns=columns,
+        read_columns=read_columns,
+        where=where,
+        batch_size=batch_size,
+        commit_lock=commit_lock,
+        max_concurrency=max_concurrency,
+        cpus=cpus,
+        gpus=gpus,
+        use_process=use_process,
+        ray_options=ray_options,
+    )
+
+
+@PublicAPI
 def update_columns_df(
     df: DataFrame,
     uri: str | pathlib.Path | None = None,
@@ -401,12 +560,9 @@ def update_columns_df(
     namespace_impl: str | None = None,
     namespace_properties: dict[str, str] | None = None,
     storage_options: dict[str, Any] | None = None,
-    version: int | str | None = None,
-    asof: str | None = None,
     block_size: int | None = None,
     commit_lock: Any | None = None,
     index_cache_size: int | None = None,
-    default_scan_options: dict[str, Any] | None = None,
     metadata_cache_size_bytes: int | None = None,
     max_concurrency: int | None = None,
 ) -> UpdateColumnsResult:
@@ -434,16 +590,9 @@ def update_columns_df(
         namespace_impl: Lance Namespace implementation.
         namespace_properties: Properties used to connect to the namespace.
         storage_options: Additional object-store options.
-        version: Dataset version or tag to read and commit against. Defaults to
-            the current version. It must be the snapshot the source ``_rowaddr``
-            values were read from. Lance rebases the commit over concurrent
-            transactions that touch other fragments; a concurrent write to a
-            fragment this update rewrites raises ``CommitConflictError``.
-        asof: If specified, find the latest version created on or earlier than the given argument value.
         block_size: Block size in bytes. Provide a hint for the size of the minimal I/O request.
         commit_lock: Custom Lance commit lock.
         index_cache_size: Index cache size.
-        default_scan_options: Default scan options.
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
         max_concurrency: Maximum number of concurrent fragment-update workers.
 
@@ -454,8 +603,8 @@ def update_columns_df(
         of the pinned snapshot updates nothing, and a ``_rowaddr`` repeated in
         the source updates its row once with an unspecified one of the
         submitted values. Both are silent and both are still counted. Keep the
-        source aligned with ``version``, and unique, to keep the count
-        meaningful.
+        source aligned with the current target snapshot, and unique, to keep
+        the count meaningful.
 
     Note:
         Fragments are rewritten in parallel, so a failure raised by one
@@ -463,11 +612,6 @@ def update_columns_df(
         Nothing is committed and the dataset version does not change; the
         unreferenced files stay until Lance cleans them up (see
         ``LanceDataset.cleanup_old_versions``).
-
-    Raises:
-        NotImplementedError: If the target dataset uses stable row IDs. The
-            current pylance transaction binding cannot propagate the updated
-            fragment offsets required for correct CDF metadata.
 
     Examples:
         >>> import daft
@@ -494,21 +638,11 @@ def update_columns_df(
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
-        version=version,
-        asof=asof,
         block_size=block_size,
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,
-        default_scan_options=default_scan_options,
         metadata_cache_size_bytes=metadata_cache_size_bytes,
     )
-    if dataset_handle.dataset.has_stable_row_ids:
-        raise NotImplementedError(
-            "update_columns_df does not support datasets with stable row IDs: "
-            "pylance does not yet expose updated fragment offsets, so "
-            "_row_last_updated_at_version and CDF metadata cannot be updated correctly."
-        )
-
     return update_columns_from_df(
         df,
         dataset_handle.dataset,

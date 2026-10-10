@@ -11,6 +11,7 @@ from ._lance import (
     merge_columns_df,
     optimize_indices,
     read_lance,
+    update_columns,
     update_columns_df,
     write_lance,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "read_blobs",
     "read_lance",
     "take_blobs",
+    "update_columns",
     "update_columns_df",
     "write_lance",
 ]

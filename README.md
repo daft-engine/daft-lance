@@ -139,6 +139,86 @@ later re-run, so callers should filter the input first when they need idempotent
 
 ### Column Updates
 
+Use a row-preserving transform to overwrite existing columns directly from the
+current Lance snapshot. `where` is evaluated before the transform, and Daft
+distributes work by fragment without grouping a user DataFrame:
+
+```python
+from daft_lance import update_columns
+
+result = update_columns(
+    "s3://bucket/my_dataset",
+    transform={"score": "raw_score * weight", "status": "'processed'"},
+    where="date >= DATE '2026-07-01'",
+)
+print(result.version, result.rows_updated)
+```
+
+`BatchUDF` transforms infer update columns from `output_schema`; use
+`read_columns` to restrict the source columns supplied to the UDF:
+
+```python
+import lance
+import pyarrow as pa
+from daft_lance import update_columns
+
+@lance.batch_udf(output_schema=pa.schema([pa.field("score", pa.int64())]))
+def compute_score(batch: pa.RecordBatch) -> pa.RecordBatch:
+    score = pa.compute.multiply(batch.column("raw_score"), batch.column("multiplier"))
+    return pa.record_batch([score], names=["score"])
+
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=compute_score,
+    where="status = 'new'",
+    read_columns=["raw_score", "multiplier"],
+)
+```
+
+Regular Python callables receive Arrow record batches after filtering. They
+must declare `columns`, and return exactly those existing columns with the same
+row count and order:
+
+```python
+import pyarrow as pa
+from daft_lance import update_columns
+
+def compute_average(batch: pa.RecordBatch) -> pa.RecordBatch:
+    average = pa.compute.divide(batch.column("total"), batch.column("count"))
+    return pa.record_batch([average], names=["average"])
+
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=compute_average,
+    columns=["average"],
+    read_columns=["total", "count"],
+    batch_size=8192,
+)
+```
+
+For a GPU-backed version of the callable above, request resources for each
+Daft transform worker. The actual worker count remains bounded by Ray's
+available resources. Include custom `ray_options` only when the Ray cluster
+advertises the named resource:
+
+```python
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=compute_average,
+    columns=["average"],
+    read_columns=["total", "count"],
+    gpus=1,
+    cpus=2,
+    use_process=True,
+    max_concurrency=8,
+    ray_options={"resources": {"gpu_type_a10": 0.001}},
+)
+```
+
+`cpus=None`, `gpus=0`, `use_process=None`, and `ray_options=None` preserve
+Daft's defaults. These options apply only to transform workers; they are not
+needed by `update_columns_df`, whose input values have already been computed.
+
 Use a prepared Daft DataFrame to overwrite existing Lance columns while
 preserving row addresses and untouched column files:
 
@@ -172,14 +252,14 @@ left-outer join on `_rowaddr` and both failures are expressible in it: an
 address matching no live row updates nothing, and a repeated address updates
 its row once with one of the submitted values, chosen by row order rather than
 by any rule. Both are silent, and both still count towards `rows_updated`.
-Read the source from the snapshot you are updating (pass the same `version` if
-you pin one) rather than replaying an address list produced against an older
-snapshot, and make sure an upstream join cannot fan a row address out. The
-update itself is committed atomically using Lance `RewriteColumns`.
+Read the source immediately before updating rather than replaying an address
+list produced against an older snapshot, and make sure an upstream join cannot
+fan a row address out. The update itself is committed atomically using Lance
+`RewriteColumns`.
 
-Stable-row-ID datasets are rejected before any fragments are written because
-current pylance bindings cannot propagate the offsets required to advance
-`_row_last_updated_at_version` and keep CDF metadata correct.
+Stable-row-ID datasets are supported: each fragment rewrite propagates its
+matched physical offsets so Lance updates `_row_last_updated_at_version` and
+CDF metadata only for rows that actually changed.
 
 Fragments are rewritten in parallel, so a per-fragment failure can surface
 after other fragments have already written their new column files. Nothing is
@@ -193,7 +273,7 @@ Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance
 (catalog) instead of a raw URI. Pass `namespace_impl` + `namespace_properties` + `table_id`
 in place of `uri` — the namespace resolves the table's storage location and vends any storage
 credentials. This works across `read_lance`, `write_lance`, `merge_columns_df`,
-`update_columns_df`, `create_scalar_index`, and `compact_files`.
+`update_columns`, `update_columns_df`, `create_scalar_index`, and `compact_files`.
 
 ```python
 import daft
