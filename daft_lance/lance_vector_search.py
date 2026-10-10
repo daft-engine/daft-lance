@@ -35,26 +35,17 @@ def _search_segments(
 ) -> Iterator[PyRecordBatch]:
     ds = _worker_dataset(serialized_context)
     k = nearest["k"]
-    # Include all candidates tied at the local boundary before applying the
-    # row-ID tie-break. Sorting only Lance's first k rows can discard a winner.
-    candidate_k = k + 1
-    while True:
-        table = ds.scanner(
-            columns=columns,
-            nearest={**nearest, "k": candidate_k},
-            index_segments=segments,
-            filter=predicate,
-            prefilter=True,
-            fast_search=True,
-            with_row_id=True,
-            blob_handling="blobs_descriptions",
-        ).to_table()
-        table = table.sort_by([("_distance", "ascending"), ("_rowid", "ascending")])
-        if table.num_rows < candidate_k or table.num_rows <= k:
-            break
-        if table["_distance"][k - 1].as_py() != table["_distance"][-1].as_py():
-            break
-        candidate_k *= 2
+    table = ds.scanner(
+        columns=columns,
+        nearest=nearest,
+        index_segments=segments,
+        filter=predicate,
+        prefilter=True,
+        fast_search=True,
+        with_row_id=True,
+        blob_handling="blobs_descriptions",
+    ).to_table()
+    table = table.sort_by([("_distance", "ascending"), ("_rowid", "ascending")])
     table = table.slice(0, k)
     table = table.append_column("_query_id", pa.array([query_id] * table.num_rows, type=pa.int64()))
     for batch in table.to_batches():
@@ -149,24 +140,27 @@ def vector_search_internal(
     column = nearest.get("column")
     if columns is not None:
         columns = list(dict.fromkeys([*columns, "_distance"]))
-    vectors = np.asarray(nearest.get("q"), dtype=np.float32)
+    vectors = np.array(nearest.get("q"), dtype=np.float32, copy=True)
     if vectors.ndim == 1:
         vectors = vectors.reshape(1, -1)
     if vectors.ndim != 2 or not all(vectors.shape) or not np.isfinite(vectors).all():
         raise ValueError("nearest['q'] must be a finite vector or a non-empty matrix of query vectors")
     if "_query_id" in ds.schema.names:
         raise ValueError("_query_id is reserved for vector search results")
+    field = ds.lance_schema.field(column) if isinstance(column, str) else None
     indices = [
         idx
         for idx in ds.describe_indices()
         if str(idx.index_type).startswith("IVF_")
-        and column in idx.field_names
+        and field is not None
+        and field.id() in idx.fields
         and (index_name is None or idx.name == index_name)
     ]
     if len(indices) != 1:
         raise ValueError("Select exactly one vector index for nearest['column']; specify index_name if ambiguous")
     index = indices[0]
-    live = {fragment.fragment_id for fragment in ds.get_fragments()}
+    fragments = ds.get_fragments()
+    live = {fragment.fragment_id for fragment in fragments}
     covered = {fid for segment in index.segments for fid in segment.fragment_ids}
     if live - covered:
         raise ValueError("vector_search requires complete index coverage; run optimize_indices or rebuild the index")
@@ -174,7 +168,21 @@ def vector_search_internal(
     if not segments:
         raise ValueError("vector_search requires a non-empty vector index")
     count = min(num_tasks or len(segments), len(segments))
-    groups = [segments[i::count] for i in range(count)]
+    if count == 1:
+        groups = [segments]
+    elif count == len(segments):
+        groups = [[segment] for segment in segments]
+    else:
+        groups = [[] for _ in range(count)]
+        rows = {fragment.fragment_id: fragment.metadata.num_rows for fragment in fragments}
+        weights = {
+            str(segment.uuid): sum(rows.get(fid, 0) for fid in segment.fragment_ids) for segment in index.segments
+        }
+        group_weights = [0] * count
+        for segment in sorted(segments, key=lambda uuid: weights[uuid], reverse=True):
+            group = min(range(count), key=lambda i: (group_weights[i], len(groups[i])))
+            groups[group].append(segment)
+            group_weights[group] += weights[segment]
     results: list[DataFrame] = []
     for query_id, vector in enumerate(vectors):
         query = {**nearest, "q": vector}

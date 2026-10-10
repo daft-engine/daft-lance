@@ -142,10 +142,11 @@ def _run(args: argparse.Namespace) -> None:
     # The single-scan baselines select their index through Lance. Requiring one
     # relevant index makes every backend use the same files without assuming
     # Lance's default selection agrees with an explicit distributed selection.
+    field = ds.lance_schema.field(args.column)
     indices = [
         idx
         for idx in ds.describe_indices()
-        if str(idx.index_type).startswith("IVF_") and args.column in idx.field_names
+        if str(idx.index_type).startswith("IVF_") and field is not None and field.id() in idx.fields
     ]
     if len(indices) != 1:
         raise ValueError("Benchmark requires exactly one vector index for the selected column")

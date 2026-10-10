@@ -1,5 +1,10 @@
 # Exploratory local vector-search results — 2026-10-09
 
+These historical measurements precede the upstream rebase and review fixes
+for bounded local candidates and row-balanced segment grouping. The hashes
+in the raw JSONL identify the measured code; the numbers below do not measure
+the current implementation.
+
 Measured on one Intel Xeon Platinum 8457C host with local disk. All cases use
 128-dimensional clustered synthetic vectors, 8 IVF_FLAT segments, 32 partitions,
 all 32 probes, L2, K=10, no filter, complete coverage and independent query vectors.

@@ -84,12 +84,111 @@ def test_batch_queries_have_independent_topk(tmp_path: Path) -> None:
         assert result.slice(query_id * 5, 5)["id"].to_pylist() == expected["id"].to_pylist()
 
 
-def test_tie_boundary_is_deterministic(tmp_path: Path) -> None:
+def test_tie_boundary_keeps_bounded_candidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from daft_lance import lance_vector_search
+
     uri, vectors = _dataset(tmp_path / "ties.lance", tied=True)
     nearest = {"column": "vector", "q": vectors[0], "k": 5, "nprobes": 1}
+    ds = lance.dataset(uri)
+    segments = [str(segment.uuid) for segment in ds.describe_indices()[0].segments]
+    scanner = ds.scanner
+    calls: list[int] = []
+
+    def counted_scanner(**kwargs):
+        calls.append(kwargs["nearest"]["k"])
+        return scanner(**kwargs)
+
+    monkeypatch.setattr(lance_vector_search, "_worker_dataset", lambda _: ds)
+    monkeypatch.setattr(ds, "scanner", counted_scanner)
+    batches = list(lance_vector_search._search_segments(b"", segments, nearest, ["id", "_distance"], None, 0))
+    assert calls == [5]
+    assert sum(len(batch) for batch in batches) == 5
     for tasks in (1, 2, 4):
         result = vector_search(uri, nearest=nearest, num_tasks=tasks, columns=["id"]).to_arrow()
-        assert result["id"].to_pylist() == list(range(5))
+        assert result.num_rows == 5
+        assert len(set(result["id"].to_pylist())) == 5
+        assert result["_distance"].to_pylist() == [0.0] * 5
+        assert result["_rowid"].to_pylist() == sorted(result["_rowid"].to_pylist())
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_query_buffer_is_copied_when_planning(tmp_path: Path, batch: bool) -> None:
+    uri, vectors = _dataset(tmp_path / "query-copy.lance")
+    queries = vectors[[3, 301]].copy() if batch else vectors[3].copy()
+    original = queries.copy()
+    pending = vector_search(uri, nearest={"column": "vector", "q": queries, "k": 5}, columns=["id"])
+    queries[:] = vectors[400]
+    expected = vector_search(uri, nearest={"column": "vector", "q": original, "k": 5}, columns=["id"])
+    assert pending.to_pydict() == expected.to_pydict()
+
+
+def test_quoted_vector_column_matches_lance(tmp_path: Path) -> None:
+    uri, vectors = _dataset(tmp_path / "quoted.lance")
+    nearest = {"column": "`vector`", "q": vectors[3], "k": 5, "nprobes": 4}
+    result = vector_search(uri, nearest=nearest, columns=["id"]).to_arrow()
+    reference = lance.dataset(uri).scanner(nearest=nearest, columns=["id"]).to_table()
+    assert result["id"].to_pylist() == reference["id"].to_pylist()
+
+
+def test_uneven_segments_are_balanced_by_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from daft_lance import lance_vector_search
+    from daft_lance.namespace import DatasetOpenContext
+
+    sizes = [256, 32, 256, 32]
+    vectors = np.random.default_rng(19).normal(size=(sum(sizes), 8)).astype("float32")
+    uri = str(tmp_path / "skew.lance")
+    start = 0
+    for size in sizes:
+        lance.write_dataset(
+            pa.table(
+                {
+                    "id": np.arange(start, start + size),
+                    "vector": pa.FixedSizeListArray.from_arrays(pa.array(vectors[start : start + size].ravel()), 8),
+                }
+            ),
+            uri,
+            mode="create" if start == 0 else "append",
+            max_rows_per_file=size,
+        )
+        start += size
+    create_vector_index(
+        uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=2, fragment_group_size=1
+    )
+    ds = lance.dataset(uri)
+    rows = {fragment.fragment_id: fragment.metadata.num_rows for fragment in ds.get_fragments()}
+    index = ds.describe_indices()[0]
+    # Manifest order is not a workload ordering guarantee. Arrange valid
+    # segments by fragment ID so round-robin groups both large segments together.
+    segments = sorted(index.segments, key=lambda segment: min(segment.fragment_ids))
+    description = SimpleNamespace(index_type=index.index_type, fields=index.fields, name=index.name, segments=segments)
+    monkeypatch.setattr(ds, "describe_indices", lambda: [description])
+    weights = {
+        str(segment.uuid): sum(rows[fid] for fid in segment.fragment_ids)
+        for segment in ds.describe_indices()[0].segments
+    }
+    operator = lance_vector_search.VectorSearchScanOperator
+    groups: list[list[str]] = []
+
+    def capture_groups(open_context, assigned, *args):
+        groups.extend(assigned)
+        return operator(open_context, assigned, *args)
+
+    monkeypatch.setattr(lance_vector_search, "VectorSearchScanOperator", capture_groups)
+    nearest = {"column": "vector", "q": vectors[3], "k": 5, "nprobes": 4}
+    result = lance_vector_search.vector_search_internal(
+        ds,
+        DatasetOpenContext.from_dataset(ds, uri),
+        nearest=nearest,
+        index_name=None,
+        columns=["id"],
+        predicate=None,
+        num_tasks=2,
+    ).to_arrow()
+    assert [sum(weights[segment] for segment in group) for group in groups] == [288, 288]
+    reference = ds.scanner(nearest=nearest, columns=["id"]).to_table()
+    assert result["id"].to_pylist() == reference["id"].to_pylist()
 
 
 def test_snapshot_is_pinned_and_partial_coverage_rejected(tmp_path: Path) -> None:

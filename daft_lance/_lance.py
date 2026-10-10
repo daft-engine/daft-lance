@@ -55,9 +55,12 @@ def vector_search(
     metric, nprobes and refine_factor are passed to Lance. ``q`` can be one
     vector or a matrix: each query gets its own global k results, ordered by
     distance then row ID. ``filter`` is applied before nearest search.
+    Equal-distance membership at the k boundary is chosen by Lance and may
+    vary with segment grouping; row-ID ordering applies to returned candidates.
 
     Workers read the pinned dataset version and only their assigned segments.
-    ``num_tasks`` caps segment groups per query (default: one per segment).
+    ``num_tasks`` caps segment groups per query (default: one per segment),
+    balanced by fragment row counts.
     The runner determines concurrency; use the Ray runner for multiple workers.
     Index coverage must be complete; use optimize_indices after appending data.
     A single segment produces one task per query. Approximate index results can

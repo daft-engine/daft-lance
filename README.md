@@ -203,10 +203,12 @@ result.collect()
 
 Each scan task searches its assigned index segments at one pinned dataset
 version; Daft merges the global Top-K, ordered by `_distance` then `_rowid`.
+Equal-distance membership at the K boundary is chosen by Lance and may vary
+with segment grouping; row-ID ordering applies to the returned candidates.
 The returned lazy DataFrame also includes `_query_id`. Pass a matrix as `q` to
 search multiple vectors, each with its own global K. Filters apply before
 search. The Ray runner can execute tasks across workers; `num_tasks` controls
-segment groups, while the runner controls concurrency. One segment offers
+segment groups balanced by fragment row counts, while the runner controls concurrency. One segment offers
 one task per query. This API requires full index coverage; after appending
 data, run `optimize_indices` or rebuild the index first.
 
