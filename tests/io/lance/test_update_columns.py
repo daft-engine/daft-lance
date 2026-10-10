@@ -167,7 +167,7 @@ def test_update_columns_no_matches_is_noop(tmp_path: Path) -> None:
     ("kwargs", "message"),
     [
         ({"transform": {"value": "value + 1"}, "where": "   "}, "non-empty"),
-        ({"transform": {"value": "value ==== 1"}}, "not valid"),
+        ({"transform": {"value": "value ==== 1"}}, "sql parser error"),
         ({"transform": lambda batch: batch}, "columns.*required"),
         ({"transform": {"missing": "value + 1"}}, "non-existent"),
         ({"transform": {"value": "value + 1"}, "batch_size": 0}, "batch_size"),

@@ -324,16 +324,6 @@ def validate_transform_update_arguments(
         if not where:
             raise ValueError("'where' must be a non-empty Lance SQL predicate when provided.")
 
-    projection: dict[str, str] | list[str]
-    if isinstance(transform, dict):
-        projection = {name: transform[name] for name in resolved_columns}
-    else:
-        projection = []
-    try:
-        lance_ds.scanner(columns=projection, filter=where, limit=1).explain_plan(True)
-    except Exception as exc:
-        raise ValueError(f"Transform or where predicate is not valid for the target Lance dataset: {exc}") from exc
-
     return resolved_columns, resolved_read_columns, where
 
 
