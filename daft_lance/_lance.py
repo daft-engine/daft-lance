@@ -456,6 +456,42 @@ def update_columns(
         A fragment failure can leave unreferenced data files written by other
         workers. No transaction is committed; Lance cleanup removes those files.
 
+    Examples:
+        Update columns with Lance SQL expressions. Dict keys infer ``columns``:
+
+        >>> import daft_lance  # doctest: +SKIP
+        >>> daft_lance.update_columns(  # doctest: +SKIP
+        ...     "/tmp/events.lance",
+        ...     transform={"score": "score * 2", "status": "'processed'"},
+        ...     where="date >= DATE '2026-07-01'",
+        ... )
+
+        Use a ``BatchUDF`` when its output schema is known. Its output schema
+        infers ``columns`` and ``read_columns`` limits data provided to the UDF:
+
+        >>> import lance  # doctest: +SKIP
+        >>> import pyarrow as pa  # doctest: +SKIP
+        >>> @lance.batch_udf(output_schema=pa.schema([pa.field("score", pa.int64())]))  # doctest: +SKIP
+        ... def double_score(batch):
+        ...     return pa.record_batch([pa.compute.multiply(batch.column("score"), 2)], names=["score"])
+        >>> daft_lance.update_columns(  # doctest: +SKIP
+        ...     "/tmp/events.lance", transform=double_score, read_columns=["score"]
+        ... )
+
+        A regular callable must declare ``columns`` and return exactly those
+        columns, preserving the input row count and order:
+
+        >>> def normalize_score(batch):  # doctest: +SKIP
+        ...     score = batch.column("score")
+        ...     return pa.record_batch([pa.compute.divide(score, 100)], names=["score"])
+        >>> daft_lance.update_columns(  # doctest: +SKIP
+        ...     "/tmp/events.lance",
+        ...     transform=normalize_score,
+        ...     columns=["score"],
+        ...     read_columns=["score"],
+        ...     batch_size=8192,
+        ... )
+
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
     dataset_handle = construct_lance_dataset_handle(

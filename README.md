@@ -154,9 +154,46 @@ result = update_columns(
 print(result.version, result.rows_updated)
 ```
 
-Python callables receive Arrow record batches after filtering and must return
-exactly the existing columns named by `columns`, with the same row count and
-order. Use `read_columns` to restrict their input.
+`BatchUDF` transforms infer update columns from `output_schema`; use
+`read_columns` to restrict the source columns supplied to the UDF:
+
+```python
+import lance
+import pyarrow as pa
+from daft_lance import update_columns
+
+@lance.batch_udf(output_schema=pa.schema([pa.field("score", pa.int64())]))
+def double_score(batch: pa.RecordBatch) -> pa.RecordBatch:
+    return pa.record_batch([pa.compute.multiply(batch.column("score"), 2)], names=["score"])
+
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=double_score,
+    where="status = 'new'",
+    read_columns=["score"],
+)
+```
+
+Regular Python callables receive Arrow record batches after filtering. They
+must declare `columns`, and return exactly those existing columns with the same
+row count and order:
+
+```python
+import pyarrow as pa
+from daft_lance import update_columns
+
+def normalize_score(batch: pa.RecordBatch) -> pa.RecordBatch:
+    score = batch.column("score")
+    return pa.record_batch([pa.compute.divide(score, 100)], names=["score"])
+
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=normalize_score,
+    columns=["score"],
+    read_columns=["score"],
+    batch_size=8192,
+)
+```
 
 Use a prepared Daft DataFrame to overwrite existing Lance columns while
 preserving row addresses and untouched column files:
@@ -191,14 +228,14 @@ left-outer join on `_rowaddr` and both failures are expressible in it: an
 address matching no live row updates nothing, and a repeated address updates
 its row once with one of the submitted values, chosen by row order rather than
 by any rule. Both are silent, and both still count towards `rows_updated`.
-Read the source from the snapshot you are updating (pass the same `version` if
-you pin one) rather than replaying an address list produced against an older
-snapshot, and make sure an upstream join cannot fan a row address out. The
-update itself is committed atomically using Lance `RewriteColumns`.
+Read the source immediately before updating rather than replaying an address
+list produced against an older snapshot, and make sure an upstream join cannot
+fan a row address out. The update itself is committed atomically using Lance
+`RewriteColumns`.
 
-Stable-row-ID datasets are rejected before any fragments are written because
-current pylance bindings cannot propagate the offsets required to advance
-`_row_last_updated_at_version` and keep CDF metadata correct.
+Stable-row-ID datasets are supported: each fragment rewrite propagates its
+matched physical offsets so Lance updates `_row_last_updated_at_version` and
+CDF metadata only for rows that actually changed.
 
 Fragments are rewritten in parallel, so a per-fragment failure can surface
 after other fragments have already written their new column files. Nothing is
