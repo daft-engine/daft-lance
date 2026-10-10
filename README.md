@@ -104,6 +104,87 @@ returns the updated dataset; for a distributed rebuild use
 `ValueError`.
 
 
+### Vector Indexing
+
+Vector indexes (`IVF_FLAT`, `IVF_PQ`, `IVF_SQ`, `IVF_HNSW_FLAT`,
+`IVF_HNSW_PQ`, `IVF_HNSW_SQ`) are built distributed in three phases: the
+driver trains the global model once — IVF centroids (and the PQ codebook for
+PQ variants) via pylance's `IndicesBuilder` — then Daft workers each build one
+uncommitted index segment for their fragment batch with the shared model, and
+the coordinator commits all segments atomically. Segments built against the
+same centroids and codebook commit as one logical index.
+
+```python
+from daft_lance import create_vector_index
+
+create_vector_index("s3://bucket/my_dataset", column="vector", index_type="IVF_PQ", num_partitions=16)
+create_vector_index("s3://bucket/my_dataset", column="embedding", index_type="IVF_FLAT", metric="cosine")
+```
+
+`replace` defaults to `False`, matching pylance's `create_index` — which,
+unlike its scalar counterpart `create_scalar_index` (default `True` above),
+defaults `replace` to `False`. An existing index name is refused unless
+`replace=True`, which rebuilds atomically (one manifest transaction retires
+the old segments and lands the new ones).
+
+`create_vector_index` always builds every fragment in the opened dataset version.
+Use `optimize_indices` after appending data: Lance reuses the existing index model,
+indexes uncovered fragments, and merges existing segments according to
+`num_indices_to_merge`. Setting that option to `0` builds a new segment without
+merging old segments. Full rebuilds remain distributed and use `replace=True`.
+With `replace=False`, a concurrent same-name index creation is rejected; ordinary
+data appends do not prevent the planned index commit.
+If another task indexes appended fragments outside the rebuild's planned
+snapshot, full replacement fails and must be retried to include those fragments.
+This prevents old model segments from surviving a full rebuild.
+
+**Breaking change — vector index migration:** `create_vector_index` no longer
+accepts `fragment_ids`, `ivf_centroids`, or `pq_codebook`, partial builds, or
+backfill/no-op requests. For an initial build, remove `fragment_ids` to create
+coverage for the full dataset. Once the index exists, replace calls that used `create_vector_index(..., fragment_ids=[...])`
+to cover appended data with:
+
+```python
+from daft_lance import optimize_indices
+
+optimize_indices("s3://bucket/my_dataset", indices=["vector_idx"], num_indices_to_merge=0)
+```
+
+Maintenance discovers uncovered fragments automatically; it needs neither a
+fragment list nor caller-supplied models. To retrain or replace the index, use
+`create_vector_index(..., replace=True)`. Scalar `fragment_ids` and backfill
+semantics are unchanged.
+
+HNSW builds accept `m`, `max_level`, and `ef_construction`. Each worker generates
+its own segment UUID, so `index_uuid` cannot be supplied.
+The coordinator always trains the shared IVF centroids and, for PQ types,
+the shared codebook; user-supplied models and `ivf_centroids_file` are not supported.
+PQ builds retain `num_bits` (default 8; 4 and 8 are supported by Lance). The same
+bit width is used for shared codebook training and every segment build.
+
+Training `sample_rate` is a multiplier, not a percentage: for example,
+4 IVF partitions and `sample_rate=32` require 128 rows; 8-bit PQ requires
+`256 * sample_rate` rows. The requested value is passed unchanged to Lance.
+Automatic sample reduction has been removed. If training reports insufficient
+data, lower the training parameters or provide more data. Calls that previously
+provided pre-trained models should omit them and let the build train its models.
+
+The SQ variants (`IVF_SQ`, `IVF_HNSW_SQ`) support multi-segment builds.
+Each segment uses its own SQ quantization metadata
+for queries. Independently built segments may have different quantization
+metadata even when they share IVF centroids; Lance rejects attempts to merge
+incompatible segments through `optimize_indices` with "vector index segments
+do not share quantizer metadata". Use `fragment_group_size` large enough to
+cover all fragments when a single segment is preferred. To consolidate
+an existing index, rebuild with that grouping and `replace=True`. Use
+`optimize_indices(..., num_indices_to_merge=0)` to add coverage without merging
+incompatible old SQ segments.
+
+Training runs in the coordinator process. Its memory footprint grows with
+`num_partitions * sample_rate * dimension` for IVF and
+`2**num_bits * sample_rate * dimension` for PQ.
+
+
 ### Column Merging
 
 ```python

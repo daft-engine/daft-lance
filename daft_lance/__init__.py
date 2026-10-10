@@ -7,6 +7,7 @@ from ._blob import read_blobs, take_blobs
 from ._lance import (
     compact_files,
     create_scalar_index,
+    create_vector_index,
     merge_columns,
     merge_columns_df,
     optimize_indices,
@@ -20,6 +21,7 @@ __all__ = [
     "UpdateColumnsResult",
     "compact_files",
     "create_scalar_index",
+    "create_vector_index",
     "merge_columns",
     "merge_columns_df",
     "optimize_indices",
