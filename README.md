@@ -109,8 +109,7 @@ returns the updated dataset; for a distributed rebuild use
 Vector indexes (`IVF_FLAT`, `IVF_PQ`, `IVF_SQ`, `IVF_HNSW_FLAT`,
 `IVF_HNSW_PQ`, `IVF_HNSW_SQ`) are built distributed in three phases: the
 driver trains the global model once — IVF centroids (and the PQ codebook for
-PQ variants) via pylance's `IndicesBuilder`, unless pre-trained
-`ivf_centroids`/`pq_codebook` are supplied — then Daft workers each build one
+PQ variants) via pylance's `IndicesBuilder` — then Daft workers each build one
 uncommitted index segment for their fragment batch with the shared model, and
 the coordinator commits all segments atomically. Segments built against the
 same centroids and codebook commit as one logical index.
@@ -140,9 +139,9 @@ snapshot, full replacement fails and must be retried to include those fragments.
 This prevents old model segments from surviving a full rebuild.
 
 **Breaking change — vector index migration:** `create_vector_index` no longer
-accepts `fragment_ids`, partial builds, or backfill/no-op requests. For an initial
-build, remove `fragment_ids` to create coverage for the full dataset. Once the
-index exists, replace calls that used `create_vector_index(..., fragment_ids=[...])`
+accepts `fragment_ids`, `ivf_centroids`, or `pq_codebook`, partial builds, or
+backfill/no-op requests. For an initial build, remove `fragment_ids` to create
+coverage for the full dataset. Once the index exists, replace calls that used `create_vector_index(..., fragment_ids=[...])`
 to cover appended data with:
 
 ```python
@@ -157,12 +156,18 @@ fragment list nor caller-supplied models. To retrain or replace the index, use
 semantics are unchanged.
 
 HNSW builds accept `m`, `max_level`, and `ef_construction`. Each worker generates
-its own segment UUID, so `index_uuid` cannot be supplied. For pre-trained IVF
-models, pass `ivf_centroids`; `ivf_centroids_file` is not supported by this API.
-PQ builds accept `num_bits` (default 8; 4 and 8 are supported by Lance). The same
-bit width is used for shared codebook training and every segment build. When
-supplying a `pq_codebook`, also pass its original `num_sub_vectors` and
-`num_bits`; a bare codebook array does not carry the sub-vector count.
+its own segment UUID, so `index_uuid` cannot be supplied.
+The coordinator always trains the shared IVF centroids and, for PQ types,
+the shared codebook; user-supplied models and `ivf_centroids_file` are not supported.
+PQ builds retain `num_bits` (default 8; 4 and 8 are supported by Lance). The same
+bit width is used for shared codebook training and every segment build.
+
+Training `sample_rate` is a multiplier, not a percentage: for example,
+4 IVF partitions and `sample_rate=32` require 128 rows; 8-bit PQ requires
+`256 * sample_rate` rows. The requested value is passed unchanged to Lance.
+Automatic sample reduction has been removed. If training reports insufficient
+data, lower the training parameters or provide more data. Calls that previously
+provided pre-trained models should omit them and let the build train its models.
 
 The SQ variants (`IVF_SQ`, `IVF_HNSW_SQ`) support multi-segment builds.
 Each segment uses its own SQ quantization metadata
@@ -175,12 +180,9 @@ an existing index, rebuild with that grouping and `replace=True`. Use
 `optimize_indices(..., num_indices_to_merge=0)` to add coverage without merging
 incompatible old SQ segments.
 
-Training samples `sample_rate` rows per IVF partition (and per PQ centroid)
-and runs in the coordinator process, so its memory footprint grows with
-`num_partitions * sample_rate * dimension`; `sample_rate` is clamped down
-automatically (with a warning) to what the dataset size supports
-(`num_partitions * sample_rate` rows, `2**num_bits * sample_rate` for the PQ
-codebook).
+Training runs in the coordinator process. Its memory footprint grows with
+`num_partitions * sample_rate * dimension` for IVF and
+`2**num_bits * sample_rate * dimension` for PQ.
 
 
 ### Column Merging

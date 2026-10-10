@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import math
 import pickle
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -15,7 +14,6 @@ if TYPE_CHECKING:
 
 import lance
 
-from daft.dependencies import pa
 from daft_lance.lance_scalar_index import (
     _validate_segments_against_manifest,
 )
@@ -73,6 +71,11 @@ def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
             "create_vector_index no longer accepts fragment_ids; it builds all fragments. "
             "Use optimize_indices to index appended data."
         )
+    removed_models = sorted(set(kwargs) & {"ivf_centroids", "pq_codebook", "ivf_centroids_file"})
+    if removed_models:
+        raise TypeError(
+            f"create_vector_index does not accept {removed_models}; models are trained by the build workflow."
+        )
     if "segmented" in kwargs:
         raise TypeError(
             "The 'segmented' parameter was removed: the distributed segment-index "
@@ -80,8 +83,6 @@ def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
         )
     if "index_uuid" in kwargs:
         raise TypeError("index_uuid is managed per segment; each worker must generate a unique UUID.")
-    if "ivf_centroids_file" in kwargs:
-        raise TypeError("ivf_centroids_file is not supported; pass shared centroids through ivf_centroids.")
     unknown = sorted(set(kwargs) - _accepted_worker_kwargs())
     if not unknown:
         return
@@ -171,8 +172,6 @@ def create_vector_index_internal(
     num_sub_vectors: int | None = None,
     num_bits: int = 8,
     sample_rate: int = 256,
-    ivf_centroids: pa.Array[Any] | None = None,
-    pq_codebook: pa.Array[Any] | None = None,
     fragment_group_size: int | None = None,
     max_concurrency: int | None = None,
     **kwargs: Any,
@@ -187,14 +186,8 @@ def create_vector_index_internal(
 
     1. The driver trains the global model once — IVF centroids via
        ``IndicesBuilder.train_ivf`` and, for PQ variants, the PQ codebook via
-       ``IndicesBuilder.train_pq`` — unless the caller supplies pre-trained
-       ``ivf_centroids`` / ``pq_codebook``. One shared model across segments is
-       what lets independently built segments commit as one logical index.
-       ``sample_rate`` is clamped down to what the dataset size supports
-       (training needs ``num_partitions * sample_rate`` rows, and the PQ
-       codebook needs ``2**num_bits * sample_rate``). ``num_partitions`` is
-       derived from supplied centroids. A supplied codebook requires explicit
-       ``num_sub_vectors`` because the array does not carry that metadata.
+       ``IndicesBuilder.train_pq``. The user's ``sample_rate`` is passed
+       unchanged; Lance validates that enough training data is available.
     2. Fragment batches are distributed across Daft workers, one partition per
        batch; each worker calls ``create_index_uncommitted`` with the shared
        model for its fragments and pickles the segment metadata back.
@@ -228,8 +221,6 @@ def create_vector_index_internal(
     # Reject kwargs Lance's segment build would silently swallow (misspelled
     # or unsupported parameters must not build a misconfigured index).
     _validate_worker_kwargs(kwargs)
-    if index_type in _PQ_INDEX_TYPES and pq_codebook is not None and num_sub_vectors is None:
-        raise ValueError("A supplied pq_codebook requires its original num_sub_vectors; it cannot be inferred.")
 
     # Validate column exists; whether it is a vector column is Lance's rule,
     # enforced by the training and build APIs with clear errors.
@@ -263,75 +254,35 @@ def create_vector_index_internal(
 
     # Phase 1: train the global model once on the driver so all segments
     # share the same centroids (and codebook) and commit as one logical index.
-    num_rows = lance_ds.count_rows()
-    effective_sample_rate = sample_rate
-    needs_ivf_training = ivf_centroids is None
-    needs_pq_training = index_type in _PQ_INDEX_TYPES and pq_codebook is None
-    if needs_ivf_training or needs_pq_training:
-        # Clamp the sample rate to what this dataset can support, mirroring
-        # Lance's own training requirements: num_partitions * sample_rate rows
-        # for IVF (Lance derives num_partitions as sqrt(num_rows) when None)
-        # and 2**num_bits * sample_rate rows for the PQ codebook.
-        caps = [sample_rate]
-        if needs_ivf_training:
-            effective_partitions = num_partitions if num_partitions is not None else max(1, round(math.sqrt(num_rows)))
-            caps.append(max(1, num_rows // effective_partitions))
-        if needs_pq_training:
-            caps.append(max(1, num_rows // (2**num_bits)))
-        clamped = min(caps)
-        if clamped < sample_rate:
-            logger.warning(
-                "sample_rate %d exceeds what the dataset supports (%d rows); clamping to %d",
-                sample_rate,
-                num_rows,
-                clamped,
-            )
-            effective_sample_rate = clamped
-
     builder = lance.indices.IndicesBuilder(lance_ds, column)
-    ivf_model: lance.indices.IvfModel | None = None
-    if needs_ivf_training:
-        logger.info(
-            "Phase 1: training IVF centroids (index_type=%s, metric=%s, num_partitions=%s, sample_rate=%d)",
-            index_type,
-            metric,
-            num_partitions,
-            effective_sample_rate,
-        )
-        ivf_model = builder.train_ivf(
-            num_partitions=num_partitions,
-            distance_type=metric.lower(),
-            sample_rate=effective_sample_rate,
-        )
-        ivf_centroids = ivf_model.centroids
-        num_partitions = ivf_model.num_partitions
-        logger.info("IVF training completed: num_partitions=%d", num_partitions)
+    logger.info(
+        "Phase 1: training IVF centroids (index_type=%s, metric=%s, num_partitions=%s, sample_rate=%d)",
+        index_type,
+        metric,
+        num_partitions,
+        sample_rate,
+    )
+    ivf_model = builder.train_ivf(
+        num_partitions=num_partitions,
+        distance_type=metric.lower(),
+        sample_rate=sample_rate,
+    )
+    ivf_centroids = ivf_model.centroids
+    num_partitions = ivf_model.num_partitions
+    logger.info("IVF training completed: num_partitions=%d", num_partitions)
 
-    if needs_pq_training:
-        logger.info(
-            "Phase 1: training PQ codebook (num_sub_vectors=%s, sample_rate=%d)", num_sub_vectors, effective_sample_rate
-        )
-        if ivf_model is None:
-            # Caller-supplied centroids: wrap them so train_pq can partition
-            # its samples with the same model the segments will be built with.
-            # needs_ivf_training is False exactly when ivf_centroids was
-            # supplied, so the None case cannot occur in practice.
-            if ivf_centroids is None:
-                raise ValueError("PQ codebook training requires IVF centroids")
-            ivf_model = lance.indices.IvfModel(ivf_centroids, metric.lower())
+    pq_codebook = None
+    if index_type in _PQ_INDEX_TYPES:
+        logger.info("Phase 1: training PQ codebook (num_sub_vectors=%s, sample_rate=%d)", num_sub_vectors, sample_rate)
         pq_model = builder.train_pq(
             ivf_model,
             num_subvectors=num_sub_vectors,
             num_bits=num_bits,
-            sample_rate=effective_sample_rate,
+            sample_rate=sample_rate,
         )
         pq_codebook = pq_model.codebook
         num_sub_vectors = pq_model.num_subvectors
         logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
-
-    # Derive the partition count from supplied centroids when not given.
-    if num_partitions is None and ivf_centroids is not None:
-        num_partitions = len(ivf_centroids)
 
     model_kwargs: dict[str, Any] = {
         "metric": metric,

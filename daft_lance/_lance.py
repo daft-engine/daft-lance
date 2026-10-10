@@ -700,8 +700,6 @@ def create_vector_index(
     num_sub_vectors: int | None = None,
     num_bits: int = 8,
     sample_rate: int = 256,
-    ivf_centroids: Any | None = None,
-    pq_codebook: Any | None = None,
     storage_options: dict[str, Any] | None = None,
     version: int | str | None = None,
     asof: str | None = None,
@@ -718,8 +716,7 @@ def create_vector_index(
 
     The build runs in three phases: the driver trains the global model once
     (IVF centroids via ``IndicesBuilder.train_ivf``, and a PQ codebook via
-    ``IndicesBuilder.train_pq`` for PQ variants, unless pre-trained
-    ``ivf_centroids``/``pq_codebook`` are supplied), fragment batches are
+    ``IndicesBuilder.train_pq`` for PQ variants), fragment batches are
     distributed across Daft workers where each builds one uncommitted index
     segment with Lance's ``create_index_uncommitted`` using the shared model,
     and the coordinator commits all segments atomically with
@@ -728,7 +725,8 @@ def create_vector_index(
     step is needed.
 
     Incremental indexing of appended data belongs to ``optimize_indices``.
-    This API does not accept ``fragment_ids`` and does not skip covered data.
+    This API does not accept ``fragment_ids``, ``ivf_centroids`` or
+    ``pq_codebook``. Models are always trained by the driver.
 
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
@@ -760,24 +758,16 @@ def create_vector_index(
             ``num_partitions`` controls Daft's fragment repartitioning; build
             parallelism here comes from ``fragment_group_size``/``max_concurrency``.
         num_sub_vectors: Number of PQ sub-vectors (PQ variants only). If None,
-            Lance derives it from the vector dimension during training. Required
-            when supplying a ``pq_codebook``; the array does not carry this metadata.
+            Lance derives it from the vector dimension during training.
         num_bits: Bits per PQ code, default 8; Lance supports 4 and 8. Configurable
             only for ``IVF_PQ`` and ``IVF_HNSW_PQ``. Passed to shared codebook
             training and every segment build. Lance validates supported configurations.
-            Supplied PQ codebooks must use the matching bit width.
-        sample_rate: Rows sampled per IVF partition (and per PQ centroid) during
-            training. Training requires at least ``num_partitions * sample_rate``
-            rows (2**num_bits * sample_rate for the PQ codebook); the value is
-            automatically clamped down (with a warning) to what the dataset
-            size supports, at the cost of a smaller training sample on small
-            datasets. Lance still rejects data below the minimum training size
-            (2**num_bits rows for PQ); clamping does not remove that requirement.
-        ivf_centroids: Pre-trained IVF centroids (a pyarrow array); skips IVF
-            training. Supplying the same centroids to every build is how
-            independently built segments share one model.
-        pq_codebook: Pre-trained PQ codebook (PQ variants only); skips PQ
-            training. Supply its original ``num_sub_vectors`` and ``num_bits``.
+        sample_rate: Training sampling multiplier, not a percentage. Lance samples
+            up to this many rows per IVF partition or PQ centroid. For example,
+            4 IVF partitions and sample_rate=32 require 128 rows; 8-bit PQ
+            requires 256 * sample_rate rows. The value is passed unchanged to
+            Lance, which rejects insufficient training data. Adjust the training
+            parameters or provide more data if training fails.
         storage_options: Storage options for the dataset.
         version: Version of the dataset to use.
         asof: Timestamp to use for time travel queries.
@@ -793,7 +783,7 @@ def create_vector_index(
         **kwargs: Additional keyword arguments forwarded to Lance's index segment
             creation API, including HNSW ``m``, ``max_level`` and ``ef_construction``.
             ``index_uuid`` is managed per segment. ``ivf_centroids_file`` is not
-            supported; supply shared centroids through ``ivf_centroids``.
+            supported; the driver trains the shared models internally.
             Unknown arguments raise ``TypeError`` — Lance's segment build silently
             ignores them, so misspellings must not pass silently here.
 
@@ -803,9 +793,8 @@ def create_vector_index(
     Raises:
         ValueError: If input parameters are invalid (e.g. empty column name,
             non-existent column, unsupported index type, an existing index
-            name with ``replace=False``, a supplied codebook without its original
-            sub-vector count, or a dataset too small to train an IVF model even
-            at ``sample_rate=1`` — Lance raises its training ``ValueError``)
+            name with ``replace=False``, or insufficient data for the requested
+            training parameters — Lance raises its training ``ValueError``)
         TypeError: If column type is incompatible with the chosen ``index_type``,
             or an unknown keyword argument is passed
         RuntimeError: If index building fails (e.g. version compatibility issues, commit failures)
@@ -861,8 +850,6 @@ def create_vector_index(
         num_sub_vectors=num_sub_vectors,
         num_bits=num_bits,
         sample_rate=sample_rate,
-        ivf_centroids=ivf_centroids,
-        pq_codebook=pq_codebook,
         fragment_group_size=fragment_group_size,
         max_concurrency=max_concurrency,
         **kwargs,

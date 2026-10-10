@@ -20,10 +20,7 @@ def _dataset(tmp_path: Path):
         uri,
         max_rows_per_file=40,
     )
-    centroids = (
-        lance.indices.IndicesBuilder(lance.dataset(uri), "vector").train_ivf(num_partitions=4, sample_rate=8).centroids
-    )
-    return uri, vectors, centroids
+    return uri, vectors
 
 
 def _segments(dataset):
@@ -31,20 +28,22 @@ def _segments(dataset):
 
 
 def test_same_name_created_before_live_check_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    uri, vectors, centroids = _dataset(tmp_path)
+    uri, vectors = _dataset(tmp_path)
     original_open = DatasetOpenContext.open_latest
     competing = {}
 
     def open_after_competing_commit(self):
         dataset = lance.dataset(uri)
-        dataset.create_index("vector", "IVF_FLAT", name="vector_idx", ivf_centroids=centroids, num_partitions=4)
+        dataset.create_index("vector", "IVF_FLAT", name="vector_idx", num_partitions=4)
         competing["version"] = dataset.version
         competing["segments"] = _segments(dataset)
         return original_open(self)
 
     monkeypatch.setattr(DatasetOpenContext, "open_latest", open_after_competing_commit)
     with pytest.raises(ValueError, match="changed during the build"):
-        create_vector_index(uri, column="vector", index_type="IVF_FLAT", ivf_centroids=centroids, fragment_group_size=2)
+        create_vector_index(
+            uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=8, fragment_group_size=2
+        )
 
     dataset = lance.dataset(uri)
     assert dataset.version == competing["version"]
@@ -55,20 +54,22 @@ def test_same_name_created_before_live_check_is_preserved(tmp_path: Path, monkey
 def test_same_name_created_after_live_check_causes_commit_conflict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    uri, vectors, centroids = _dataset(tmp_path)
+    uri, vectors = _dataset(tmp_path)
     original_validate = lance_vector_index._validate_segments_against_manifest
     competing = {}
 
     def validate_after_competing_commit(dataset, index_metas, expected_fragment_ids):
         other = lance.dataset(uri)
-        other.create_index("vector", "IVF_FLAT", name="vector_idx", ivf_centroids=centroids, num_partitions=4)
+        other.create_index("vector", "IVF_FLAT", name="vector_idx", num_partitions=4)
         competing["version"] = other.version
         competing["segments"] = _segments(other)
         return original_validate(dataset, index_metas, expected_fragment_ids)
 
     monkeypatch.setattr(lance_vector_index, "_validate_segments_against_manifest", validate_after_competing_commit)
     with pytest.raises(CommitConflictError, match="CreateIndex"):
-        create_vector_index(uri, column="vector", index_type="IVF_FLAT", ivf_centroids=centroids, fragment_group_size=2)
+        create_vector_index(
+            uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=8, fragment_group_size=2
+        )
 
     dataset = lance.dataset(uri)
     assert dataset.version == competing["version"]
@@ -77,8 +78,8 @@ def test_same_name_created_after_live_check_causes_commit_conflict(
 
 
 def test_replace_true_replaces_concurrently_rebuilt_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    uri, vectors, centroids = _dataset(tmp_path)
-    create_vector_index(uri, column="vector", index_type="IVF_FLAT", ivf_centroids=centroids)
+    uri, vectors = _dataset(tmp_path)
+    create_vector_index(uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=8)
     original_open = DatasetOpenContext.open_latest
     competing = {}
 
@@ -90,7 +91,6 @@ def test_replace_true_replaces_concurrently_rebuilt_index(tmp_path: Path, monkey
             name="vector_idx",
             metric="cosine",
             replace=True,
-            ivf_centroids=centroids,
             num_partitions=4,
         )
         competing["version"] = dataset.version
@@ -99,7 +99,13 @@ def test_replace_true_replaces_concurrently_rebuilt_index(tmp_path: Path, monkey
 
     monkeypatch.setattr(DatasetOpenContext, "open_latest", open_after_rebuild)
     create_vector_index(
-        uri, column="vector", index_type="IVF_FLAT", ivf_centroids=centroids, replace=True, fragment_group_size=2
+        uri,
+        column="vector",
+        index_type="IVF_FLAT",
+        num_partitions=4,
+        sample_rate=8,
+        replace=True,
+        fragment_group_size=2,
     )
 
     dataset = lance.dataset(uri)
@@ -111,7 +117,7 @@ def test_replace_true_replaces_concurrently_rebuilt_index(tmp_path: Path, monkey
 
 
 def test_unrelated_append_after_live_check_allows_index_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    uri, vectors, centroids = _dataset(tmp_path)
+    uri, vectors = _dataset(tmp_path)
     original_validate = lance_vector_index._validate_segments_against_manifest
 
     def validate_after_append(dataset, index_metas, expected_fragment_ids):
@@ -121,7 +127,9 @@ def test_unrelated_append_after_live_check_allows_index_commit(tmp_path: Path, m
         return original_validate(dataset, index_metas, expected_fragment_ids)
 
     monkeypatch.setattr(lance_vector_index, "_validate_segments_against_manifest", validate_after_append)
-    create_vector_index(uri, column="vector", index_type="IVF_FLAT", ivf_centroids=centroids, fragment_group_size=2)
+    create_vector_index(
+        uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=8, fragment_group_size=2
+    )
 
     dataset = lance.dataset(uri)
     assert dataset.version == 3
@@ -135,8 +143,8 @@ def test_replace_rejects_concurrently_indexed_appended_fragments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A replacement must not leave an old-metric segment outside its pinned build plan."""
-    uri, vectors, centroids = _dataset(tmp_path)
-    create_vector_index(uri, column="vector", index_type="IVF_FLAT", ivf_centroids=centroids)
+    uri, vectors = _dataset(tmp_path)
+    create_vector_index(uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=8)
     original_open = DatasetOpenContext.open_latest
     more = np.random.default_rng(31).standard_normal((40, 8)).astype(np.float32) + 10
     competing = {}
@@ -165,7 +173,8 @@ def test_replace_rejects_concurrently_indexed_appended_fragments(
             uri,
             column="vector",
             index_type="IVF_FLAT",
-            ivf_centroids=centroids,
+            num_partitions=4,
+            sample_rate=8,
             metric="cosine",
             replace=True,
             fragment_group_size=2,
