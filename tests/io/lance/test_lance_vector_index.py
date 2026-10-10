@@ -131,18 +131,19 @@ def test_every_index_type_builds_and_answers_queries(tmp_path: Path, index_type:
     assert desc.index_type == index_type
     assert desc.num_rows_indexed == 2048
     assert len(desc.segments) == 2
+    assert _covered_fragments(uri, "vector_idx") == {f.fragment_id for f in ds.get_fragments()}
 
     recall = _recall_at_5(ds, vectors)
     assert recall >= _MIN_RECALL[index_type], f"{index_type} recall@5 {recall:.2f} < {_MIN_RECALL[index_type]}"
 
 
 @pytest.mark.parametrize("index_type", ["IVF_SQ", "IVF_HNSW_SQ"])
-def test_sq_backfill_and_failed_merge_preserve_index(tmp_path: Path, index_type: str) -> None:
-    """SQ backfill is searchable; incompatible merges leave the committed index intact."""
+def test_sq_multi_segment_build_and_failed_merge_preserve_index(tmp_path: Path, index_type: str) -> None:
+    """A full SQ build is searchable; incompatible merges preserve the committed index."""
     rng = np.random.default_rng(7)
     vectors = rng.uniform(0, 1, (2048, 8)).astype(np.float32)
-    vectors[1024:] += 10
-    uri = str(tmp_path / "sq_backfill.lance")
+    vectors.reshape(8, 256, 8)[1::2] += 10
+    uri = str(tmp_path / "sq_segments.lance")
     lance.write_dataset(
         pa.table({"id": list(range(2048)), "vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 8)}),
         uri,
@@ -154,8 +155,7 @@ def test_sq_backfill_and_failed_merge_preserve_index(tmp_path: Path, index_type:
         .centroids
     )
     build = dict(column="vector", index_type=index_type, ivf_centroids=centroids, name="v_idx")
-    create_vector_index(uri, fragment_ids=[0, 1, 2, 3], **build)
-    create_vector_index(uri, fragment_ids=[4, 5, 6, 7], **build)
+    create_vector_index(uri, fragment_group_size=4, **build)
 
     before = lance.dataset(uri)
     assert len(before.describe_indices()[0].segments) == 2
@@ -317,46 +317,6 @@ def test_pq_codebook_requires_original_num_sub_vectors(tmp_path: Path) -> None:
     )
 
 
-def test_backfill_requires_the_original_shared_model(tmp_path: Path) -> None:
-    """Appending segments without the original centroids would fork the IVF model."""
-    uri, _ = _make_vector_dataset(tmp_path / "guard.lance")
-    build = dict(column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=8, name="v_idx")
-
-    create_vector_index(uri, fragment_ids=[0, 1, 2, 3], **build)
-
-    # Retraining on the backfill would produce a divergent model — refused.
-    with pytest.raises(ValueError, match="ivf_centroids"):
-        create_vector_index(uri, fragment_ids=[4, 5], **build)
-
-
-def test_backfill_with_shared_model_then_optimize_indices_merges(tmp_path: Path) -> None:
-    """A same-model backfill stays mergeable by optimize_indices (shared-centroid invariant)."""
-    uri, vectors = _make_vector_dataset(tmp_path / "backfill.lance")
-    centroids = (
-        IndicesBuilder(lance.dataset(uri), "vector")
-        .train_ivf(num_partitions=4, distance_type="l2", sample_rate=8)
-        .centroids
-    )
-    build = dict(column="vector", index_type="IVF_FLAT", ivf_centroids=centroids, name="v_idx")
-
-    create_vector_index(uri, fragment_ids=[0, 1, 2, 3], **build)
-    assert _covered_fragments(uri, "v_idx") == {0, 1, 2, 3}
-
-    # Backfill appends coverage for the remaining fragments.
-    create_vector_index(uri, fragment_ids=[1, 4, 5, 6, 7], **build)
-    assert _covered_fragments(uri, "v_idx") == {0, 1, 2, 3, 4, 5, 6, 7}
-
-    # Segments built from one model must remain mergeable.
-    optimize_indices(uri, indices=["v_idx"], num_indices_to_merge=2)
-    assert _covered_fragments(uri, "v_idx") == {0, 1, 2, 3, 4, 5, 6, 7}
-    assert 7 in lance.dataset(uri).to_table(nearest={"column": "vector", "q": vectors[7], "k": 5})["id"].to_pylist()
-
-    # A fully covered request is a no-op: version stays unchanged.
-    version_before = lance.dataset(uri).version
-    create_vector_index(uri, fragment_ids=[2, 3], **build)
-    assert lance.dataset(uri).version == version_before
-
-
 def test_replace_default_false_rejects_existing_name(tmp_path: Path) -> None:
     uri, _ = _make_vector_dataset(tmp_path / "repl.lance", num_rows=240, rows_per_file=40, seed=5)
     create_vector_index(uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=32, name="v_idx")
@@ -471,12 +431,6 @@ def test_invalid_arguments_raise(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="sample_rate must be positive"):
         create_vector_index(uri, column="vector", index_type="IVF_FLAT", sample_rate=0)
 
-    with pytest.raises(ValueError, match="fragment_ids must be a non-empty list"):
-        create_vector_index(uri, column="vector", index_type="IVF_FLAT", fragment_ids=[])
-
-    with pytest.raises(ValueError, match="do not exist in the dataset"):
-        create_vector_index(uri, column="vector", index_type="IVF_FLAT", fragment_ids=[99])
-
     # Argument validation must fire before training work, even when training
     # would also fail on this small dataset with a large sample_rate.
     with pytest.raises(ValueError, match="fragment_group_size must be positive"):
@@ -508,48 +462,6 @@ def test_existing_segment_uuid_is_rejected_without_overwriting_index(tmp_path: P
     assert str(after.describe_indices()[0].segments[0].uuid) == segment_uuid
     assert _covered_fragments(uri, "vector_idx") == {0, 1, 2, 3}
     assert after.to_table(nearest=query).to_pydict() == expected
-
-
-@pytest.mark.parametrize("initial_metric,append_metric", [("L2", "cosine"), ("cosine", None)])
-def test_backfill_rejects_a_different_metric(tmp_path: Path, initial_metric: str, append_metric: str | None) -> None:
-    """Segments must use comparable distances, including when backfill defaults to L2."""
-    uri = str(tmp_path / "mixed_metric.lance")
-    vectors = np.array([[0, 1], [100, 0]], dtype=np.float32)
-    lance.write_dataset(
-        pa.table({"id": [0, 1], "vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 2)}),
-        uri,
-        max_rows_per_file=1,
-    )
-    centroids = pa.FixedSizeListArray.from_arrays(pa.array([1, 0], type=pa.float32()), 2)
-    build = dict(column="vector", index_type="IVF_FLAT", ivf_centroids=centroids)
-    create_vector_index(uri, metric=initial_metric, fragment_ids=[0], **build)
-    before = lance.dataset(uri)
-    query = {"column": "vector", "q": [1, 0], "k": 2, "nprobes": 1, "metric": initial_metric}
-    expected = before.to_table(nearest=query).to_pydict()
-
-    append_kwargs = {} if append_metric is None else {"metric": append_metric}
-    with pytest.raises(ValueError, match="[Mm]etric"):
-        create_vector_index(uri, fragment_ids=[1], **build, **append_kwargs)
-
-    after = lance.dataset(uri)
-    assert after.version == before.version
-    assert _covered_fragments(uri, "vector_idx") == {0}
-    assert after.to_table(nearest=query).to_pydict() == expected
-
-
-@pytest.mark.parametrize("append_metric", ["l2", "L2", "euclidean", "EUCLIDEAN"])
-def test_backfill_accepts_equivalent_metric_spellings(tmp_path: Path, append_metric: str) -> None:
-    """Lance's Euclidean alias and case variations do not imply a changed metric."""
-    uri, _ = _make_vector_dataset(tmp_path / "metric_alias.lance", num_rows=240, rows_per_file=120)
-    centroids = (
-        IndicesBuilder(lance.dataset(uri), "vector")
-        .train_ivf(num_partitions=4, distance_type="l2", sample_rate=8)
-        .centroids
-    )
-    build = dict(column="vector", index_type="IVF_FLAT", ivf_centroids=centroids)
-    create_vector_index(uri, metric="L2", fragment_ids=[0], **build)
-    create_vector_index(uri, metric=append_metric, fragment_ids=[1], **build)
-    assert _covered_fragments(uri, "vector_idx") == {0, 1}
 
 
 def test_hnsw_build_parameters_are_forwarded(tmp_path: Path) -> None:
@@ -643,7 +555,7 @@ def test_four_bit_pq_sampling_uses_sixteen_centroids(tmp_path: Path, monkeypatch
     )
 
 
-def test_supplied_four_bit_pq_model_backfills_with_original_configuration(tmp_path: Path) -> None:
+def test_supplied_four_bit_pq_model_builds_with_original_configuration(tmp_path: Path) -> None:
     uri, vectors = _make_vector_dataset(tmp_path / "supplied_bits.lance", num_rows=256, rows_per_file=128)
     builder = IndicesBuilder(lance.dataset(uri), "vector")
     ivf = builder.train_ivf(num_partitions=2, sample_rate=8)
@@ -656,8 +568,7 @@ def test_supplied_four_bit_pq_model_backfills_with_original_configuration(tmp_pa
         num_sub_vectors=2,
         num_bits=4,
     )
-    create_vector_index(uri, fragment_ids=[0], **build)
-    create_vector_index(uri, fragment_ids=[1], **build)
+    create_vector_index(uri, fragment_group_size=1, **build)
     ds = lance.dataset(uri)
     segments = ds.stats.index_stats("vector_idx")["indices"]
     assert len(segments) == 2
@@ -675,3 +586,63 @@ def test_non_pq_bit_width_is_not_silently_ignored(tmp_path: Path, index_type: st
         create_vector_index(uri, column="vector", index_type=index_type, num_bits=4)
     assert lance.dataset(uri).version == before.version
     assert not lance.dataset(uri).describe_indices()
+
+
+@pytest.mark.parametrize("fragment_ids", [None, [], [0]])
+def test_fragment_subset_argument_is_rejected(
+    tmp_path: Path, fragment_ids: list[int] | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Creation always covers the dataset; even explicitly passing None is a removed argument."""
+    uri, _ = _make_vector_dataset(tmp_path / "removed_subset.lance", num_rows=240, rows_per_file=60)
+    before = lance.dataset(uri)
+
+    def unexpected_training(*args, **kwargs):
+        raise AssertionError("removed fragment_ids argument reached training")
+
+    monkeypatch.setattr(IndicesBuilder, "train_ivf", unexpected_training)
+    with pytest.raises(TypeError, match="fragment_ids.*optimize_indices"):
+        create_vector_index(uri, column="vector", index_type="IVF_FLAT", fragment_ids=fragment_ids)
+    assert lance.dataset(uri).version == before.version
+    assert not lance.dataset(uri).describe_indices()
+
+
+@pytest.mark.parametrize("index_type", ALL_VECTOR_INDEX_TYPES)
+def test_optimize_indices_covers_appended_vectors(tmp_path: Path, index_type: str) -> None:
+    """Incremental coverage belongs to maintenance, while creation covers every existing fragment."""
+    uri, _ = _make_vector_dataset(tmp_path / "incremental.lance", num_rows=512, rows_per_file=128)
+    create_vector_index(
+        uri,
+        column="vector",
+        index_type=index_type,
+        num_partitions=2,
+        num_sub_vectors=2,
+        sample_rate=2,
+        fragment_group_size=2,
+    )
+    original = lance.dataset(uri)
+    old_fragment_ids = {f.fragment_id for f in original.get_fragments()}
+    old_segment_ids = {segment.uuid for segment in original.describe_indices()[0].segments}
+    assert _covered_fragments(uri, "vector_idx") == old_fragment_ids
+
+    more = np.random.default_rng(99).standard_normal((256, 8)).astype(np.float32)
+    lance.write_dataset(
+        pa.table({"id": list(range(512, 768)), "vector": pa.FixedSizeListArray.from_arrays(more.reshape(-1), 8)}),
+        uri,
+        mode="append",
+        max_rows_per_file=128,
+    )
+    appended = lance.dataset(uri)
+    assert _covered_fragments(uri, "vector_idx") == old_fragment_ids
+    assert len(appended.get_fragments()) == 6
+
+    # Keep old segments separate, including SQ segments whose quantizers may differ.
+    optimize_indices(uri, indices=["vector_idx"], num_indices_to_merge=0)
+    maintained = lance.dataset(uri)
+    assert maintained.version == appended.version + 1
+    assert _covered_fragments(uri, "vector_idx") == {f.fragment_id for f in maintained.get_fragments()}
+    assert maintained.describe_indices()[0].num_rows_indexed == 768
+    assert old_segment_ids <= {segment.uuid for segment in maintained.describe_indices()[0].segments}
+    result = maintained.to_table(nearest={"column": "vector", "q": more[7], "k": 5, "nprobes": 2, "refine_factor": 20})
+    assert result.num_rows == 5
+    assert 519 in result["id"].to_pylist()
+    assert np.isfinite(result["_distance"].to_numpy()).all()

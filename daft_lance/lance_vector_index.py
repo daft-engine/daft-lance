@@ -17,7 +17,6 @@ import lance
 
 from daft.dependencies import pa
 from daft_lance.lance_scalar_index import (
-    _existing_index_coverage,
     _validate_segments_against_manifest,
 )
 from daft_lance.utils import distribute_fragments_balanced
@@ -69,6 +68,11 @@ def _accepted_worker_kwargs() -> frozenset[str]:
 
 def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
     """Reject kwargs Lance's segment build would silently ignore."""
+    if "fragment_ids" in kwargs:
+        raise TypeError(
+            "create_vector_index no longer accepts fragment_ids; it builds all fragments. "
+            "Use optimize_indices to index appended data."
+        )
     if "segmented" in kwargs:
         raise TypeError(
             "The 'segmented' parameter was removed: the distributed segment-index "
@@ -94,8 +98,8 @@ def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
     )
 
 
-def _index_segment_ids(dataset: lance.LanceDataset, name: str) -> set[str]:
-    return {segment.uuid for index in dataset.describe_indices() if index.name == name for segment in index.segments}
+def _index_exists(dataset: lance.LanceDataset, name: str) -> bool:
+    return any(index.name == name for index in dataset.describe_indices())
 
 
 class VectorFragmentIndexHandler:
@@ -171,7 +175,6 @@ def create_vector_index_internal(
     pq_codebook: pa.Array[Any] | None = None,
     fragment_group_size: int | None = None,
     max_concurrency: int | None = None,
-    fragment_ids: list[int] | None = None,
     **kwargs: Any,
 ) -> None:
     """Internal implementation of distributed vector index creation.
@@ -203,13 +206,8 @@ def create_vector_index_internal(
     ``replace`` defaults to ``False``, matching pylance's ``create_index``:
     an existing index name is refused unless ``replace=True``. Column type
     compatibility is validated by Lance's training and build APIs, not
-    duplicated here. ``fragment_ids`` restricts the build to a subset of
-    fragments; already-covered fragments are skipped and the remainder
-    appended. Appending requires the same ``ivf_centroids`` (and
-    ``pq_codebook`` for PQ variants) the existing segments were built with:
-    every segment of a logical vector index must share one IVF model, or
-    Lance cannot merge the segments later, so a backfill without the original
-    model raises instead of silently training a divergent one.
+    duplicated here. Every fragment in the opened dataset snapshot is indexed.
+    Incremental coverage of appended data belongs to ``optimize_indices``.
     """
     if not column:
         raise ValueError("Column name cannot be empty")
@@ -245,96 +243,15 @@ def create_vector_index_internal(
     if name is None:
         name = f"{column}_idx"
 
+    index_exists = _index_exists(lance_ds, name)
+    if index_exists and not replace:
+        raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
+
+    # Each worker builds against the pinned snapshot. Replacement is committed
+    # once, after every fragment batch has succeeded.
+    handler_replace = index_exists
     fragments = lance_ds.get_fragments()
-    available_fragment_ids = {fragment.fragment_id for fragment in fragments}
-
-    # Validate and normalize the requested fragment subset, if any.
-    requested_fragment_ids: set[int] | None = None
-    if fragment_ids is not None:
-        if len(fragment_ids) == 0:
-            raise ValueError("fragment_ids must be a non-empty list of fragment IDs; pass None to index all fragments.")
-        unique_ids = list(dict.fromkeys(fragment_ids))
-        duplicates = sorted({fid for fid in unique_ids if fragment_ids.count(fid) > 1})
-        if duplicates:
-            logger.warning("Duplicate fragment_ids %s were given; each fragment is scheduled once.", duplicates)
-        unknown_ids = sorted(fid for fid in unique_ids if fid not in available_fragment_ids)
-        if unknown_ids:
-            raise ValueError(
-                f"fragment_ids {unknown_ids} do not exist in the dataset. "
-                f"Available fragment IDs: {sorted(available_fragment_ids)}"
-            )
-        requested_fragment_ids = set(unique_ids)
-
-    existing_coverage = _existing_index_coverage(lance_ds, name)
-    planned_segment_ids = _index_segment_ids(lance_ds, name)
-    if existing_coverage is not None:
-        # Column/index-type compatibility of a same-name index is validated by
-        # Lance's build and commit APIs, not duplicated here.
-        if not replace and requested_fragment_ids is None:
-            raise ValueError(f"Index with name '{name}' already exists. Set replace=True to replace it.")
-
-    # Workers open the pinned snapshot where a same-name index still exists;
-    # building against that name always requires replace=True. The actual
-    # replacement happens in the coordinator's atomic commit.
-    handler_replace = existing_coverage is not None
-    if existing_coverage is not None and requested_fragment_ids is not None:
-        # Incremental backfill: skip fragments already covered by committed
-        # segments; only the remainder is built and appended.
-        covered = existing_coverage & available_fragment_ids
-        already_covered = requested_fragment_ids & covered
-        to_build = requested_fragment_ids - covered
-        if already_covered:
-            logger.info(
-                "Fragments %s are already covered by index '%s'; skipping them%s",
-                sorted(already_covered),
-                name,
-                " (replace does not rebuild covered fragments; use replace=True without "
-                "fragment_ids for a full rebuild)"
-                if replace
-                else "",
-            )
-        if not to_build:
-            logger.info("All requested fragments are already covered by index '%s'; nothing to build.", name)
-            return
-        # Lance permits mixed metrics at commit, but their distances cannot be
-        # compared when searching the logical index.
-        stats = lance_ds.stats.index_stats(name)
-        if stats["index_type"].startswith("IVF"):
-            requested_metric = metric.lower()
-            if requested_metric == "euclidean":
-                requested_metric = "l2"
-            existing_metrics = {segment["metric_type"] for segment in stats["indices"]}
-            if existing_metrics != {requested_metric}:
-                raise ValueError(
-                    f"Cannot append to index '{name}' with metric '{metric}': "
-                    f"existing segments use {sorted(existing_metrics)}. Use the same metric."
-                )
-        # Appended segments join a live logical index, and every segment of a
-        # logical vector index must share the same IVF model: Lance's segment
-        # merge refuses segments trained on different centroids (the error
-        # ``optimize_indices`` would later raise). Training here would sample
-        # non-deterministically and silently produce a divergent model, so the
-        # original model must be supplied.
-        if ivf_centroids is None:
-            raise ValueError(
-                f"Cannot append to index '{name}': all segments of a vector index must share "
-                "one IVF model, and retraining would produce a divergent one. Pass the same "
-                "ivf_centroids (and pq_codebook, for PQ variants) the existing segments were "
-                "built with, or rebuild the whole index with replace=True and no fragment_ids."
-            )
-        if index_type in _PQ_INDEX_TYPES and pq_codebook is None:
-            raise ValueError(
-                f"Cannot append to PQ index '{name}' without the original pq_codebook: all "
-                "segments must share one model. Pass the codebook the existing segments were "
-                "built with, or rebuild the whole index with replace=True and no fragment_ids."
-            )
-        requested_fragment_ids = to_build
-
-    if requested_fragment_ids is not None:
-        fragments = [fragment for fragment in fragments if fragment.fragment_id in requested_fragment_ids]
-    fragment_ids_to_use = sorted(
-        requested_fragment_ids if requested_fragment_ids is not None else (f.fragment_id for f in fragments)
-    )
+    fragment_ids_to_use = sorted(fragment.fragment_id for fragment in fragments)
     if not fragment_ids_to_use:
         raise ValueError(f"Dataset at {open_context.uri} contains no fragments")
 
@@ -467,10 +384,21 @@ def create_vector_index_internal(
 
     # Phase 3: validate against the live manifest and commit atomically.
     lance_ds = open_context.open_latest()
-    if (not replace or requested_fragment_ids is not None) and _index_segment_ids(
-        lance_ds, name
-    ) != planned_segment_ids:
+    if not replace and _index_exists(lance_ds, name):
         raise ValueError(f"Index '{name}' changed during the build; retry against the latest dataset version.")
+    if replace:
+        indexed_fragments = {
+            fid
+            for index in lance_ds.describe_indices()
+            if index.name == name
+            for segment in index.segments
+            for fid in segment.fragment_ids
+        }
+        live_fragments = {fragment.fragment_id for fragment in lance_ds.get_fragments()}
+        if (indexed_fragments & live_fragments).difference(fragment_ids_to_use):
+            raise ValueError(
+                f"Index '{name}' gained coverage outside the build plan; retry against the latest dataset version."
+            )
     _validate_segments_against_manifest(lance_ds, index_metas, fragment_ids_to_use)
 
     # Keep the checked handle: a later same-name CreateIndex transaction then

@@ -128,17 +128,33 @@ defaults `replace` to `False`. An existing index name is refused unless
 `replace=True`, which rebuilds atomically (one manifest transaction retires
 the old segments and lands the new ones).
 
-`fragment_ids` partial builds and incremental backfill work like the scalar
-workflow, with one vector-specific requirement: appending segments requires
-the same `ivf_centroids` (and `pq_codebook` for PQ variants) the existing
-segments were built with, since every segment of a logical vector index must
-share one IVF model — a backfill without the original model raises instead of
-silently training a divergent one.
-Backfill must also use the existing index's `metric`; a different metric is
-rejected because distances from different metrics cannot be ranked together.
-If another task changes the same index during a new build or backfill, the
-operation fails rather than replacing that task's result; retry against the
-latest version. Full rebuilds with `replace=True` retain replacement semantics.
+`create_vector_index` always builds every fragment in the opened dataset version.
+Use `optimize_indices` after appending data: Lance reuses the existing index model,
+indexes uncovered fragments, and merges existing segments according to
+`num_indices_to_merge`. Setting that option to `0` builds a new segment without
+merging old segments. Full rebuilds remain distributed and use `replace=True`.
+With `replace=False`, a concurrent same-name index creation is rejected; ordinary
+data appends do not prevent the planned index commit.
+If another task indexes appended fragments outside the rebuild's planned
+snapshot, full replacement fails and must be retried to include those fragments.
+This prevents old model segments from surviving a full rebuild.
+
+**Breaking change — vector index migration:** `create_vector_index` no longer
+accepts `fragment_ids`, partial builds, or backfill/no-op requests. For an initial
+build, remove `fragment_ids` to create coverage for the full dataset. Once the
+index exists, replace calls that used `create_vector_index(..., fragment_ids=[...])`
+to cover appended data with:
+
+```python
+from daft_lance import optimize_indices
+
+optimize_indices("s3://bucket/my_dataset", indices=["vector_idx"], num_indices_to_merge=0)
+```
+
+Maintenance discovers uncovered fragments automatically; it needs neither a
+fragment list nor caller-supplied models. To retrain or replace the index, use
+`create_vector_index(..., replace=True)`. Scalar `fragment_ids` and backfill
+semantics are unchanged.
 
 HNSW builds accept `m`, `max_level`, and `ef_construction`. Each worker generates
 its own segment UUID, so `index_uuid` cannot be supplied. For pre-trained IVF
@@ -148,15 +164,16 @@ bit width is used for shared codebook training and every segment build. When
 supplying a `pq_codebook`, also pass its original `num_sub_vectors` and
 `num_bits`; a bare codebook array does not carry the sub-vector count.
 
-The SQ variants (`IVF_SQ`, `IVF_HNSW_SQ`) support multi-segment builds and
-`fragment_ids` backfill. Each segment uses its own SQ quantization metadata
+The SQ variants (`IVF_SQ`, `IVF_HNSW_SQ`) support multi-segment builds.
+Each segment uses its own SQ quantization metadata
 for queries. Independently built segments may have different quantization
 metadata even when they share IVF centroids; Lance rejects attempts to merge
 incompatible segments through `optimize_indices` with "vector index segments
 do not share quantizer metadata". Use `fragment_group_size` large enough to
-cover all selected fragments when a single segment is preferred. To consolidate
-an existing index, rebuild with that grouping, `replace=True`, and no
-`fragment_ids`.
+cover all fragments when a single segment is preferred. To consolidate
+an existing index, rebuild with that grouping and `replace=True`. Use
+`optimize_indices(..., num_indices_to_merge=0)` to add coverage without merging
+incompatible old SQ segments.
 
 Training samples `sample_rate` rows per IVF partition (and per PQ centroid)
 and runs in the coordinator process, so its memory footprint grows with

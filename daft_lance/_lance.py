@@ -712,10 +712,9 @@ def create_vector_index(
     metadata_cache_size_bytes: int | None = None,
     fragment_group_size: int | None = None,
     max_concurrency: int | None = None,
-    fragment_ids: list[int] | None = None,
     **kwargs: Any,
 ) -> None:
-    """Build a distributed vector index using Daft's distributed execution.
+    """Build a distributed vector index over every fragment in the opened version.
 
     The build runs in three phases: the driver trains the global model once
     (IVF centroids via ``IndicesBuilder.train_ivf``, and a PQ codebook via
@@ -727,6 +726,9 @@ def create_vector_index(
     ``commit_existing_index_segments``. Segments built against the same
     centroids and codebook commit as one logical index, so no central build
     step is needed.
+
+    Incremental indexing of appended data belongs to ``optimize_indices``.
+    This API does not accept ``fragment_ids`` and does not skip covered data.
 
     Args:
         uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
@@ -747,10 +749,11 @@ def create_vector_index(
             refused with ``ValueError`` unless ``replace=True``. Replacement is
             atomic: all new segments commit in one transaction that retires the
             overlapped old segments, so readers see either the old or the new index.
-            New builds and backfill fail if another task changes the same index
-            during the build; retry the operation against the latest version.
-        metric: Distance metric ("L2", "cosine", or "dot"). Backfill must use
-            the same metric as the existing index; mismatches raise ``ValueError``.
+            With replace=False, a concurrent same-name creation fails this build
+            instead of being overwritten; retry against the latest version.
+            Full replacement also fails if concurrent index maintenance adds
+            coverage outside the planned snapshot; retry to include that data.
+        metric: Distance metric ("L2", "cosine", or "dot").
         num_partitions: Number of IVF partitions. If None, Lance derives it from
             the number of rows during training. Note this is the IVF partition
             count of the trained model — unlike ``create_scalar_index``, where
@@ -762,7 +765,7 @@ def create_vector_index(
         num_bits: Bits per PQ code, default 8; Lance supports 4 and 8. Configurable
             only for ``IVF_PQ`` and ``IVF_HNSW_PQ``. Passed to shared codebook
             training and every segment build. Lance validates supported configurations.
-            Supplied PQ codebooks and backfill must use the matching bit width.
+            Supplied PQ codebooks must use the matching bit width.
         sample_rate: Rows sampled per IVF partition (and per PQ centroid) during
             training. Training requires at least ``num_partitions * sample_rate``
             rows (2**num_bits * sample_rate for the PQ codebook); the value is
@@ -772,13 +775,9 @@ def create_vector_index(
             (2**num_bits rows for PQ); clamping does not remove that requirement.
         ivf_centroids: Pre-trained IVF centroids (a pyarrow array); skips IVF
             training. Supplying the same centroids to every build is how
-            independently built segments share one model. Required when
-            appending to an existing index (``fragment_ids`` backfill): all
-            segments of a logical vector index must share one IVF model.
+            independently built segments share one model.
         pq_codebook: Pre-trained PQ codebook (PQ variants only); skips PQ
             training. Supply its original ``num_sub_vectors`` and ``num_bits``.
-            Required when appending to an existing PQ index, for the
-            same shared-model reason as ``ivf_centroids``.
         storage_options: Storage options for the dataset.
         version: Version of the dataset to use.
         asof: Timestamp to use for time travel queries.
@@ -791,16 +790,6 @@ def create_vector_index(
             defaults to 10. Each group becomes one independently built index segment.
         max_concurrency: Maximum number of concurrent tasks for fragment batches.
             If None, Daft uses its default concurrency setting.
-        fragment_ids: Optional list of fragment IDs to index. Fragments already
-            covered by committed segments of the same index are skipped and the
-            remaining ones appended (incremental backfill); pass ``replace=True``
-            without ``fragment_ids`` for a full rebuild. Appending requires the
-            same ``ivf_centroids`` (and ``pq_codebook`` for PQ variants) the
-            existing segments were built with — retraining would produce a
-            divergent model that Lance cannot merge, so a backfill without the
-            original model raises ``ValueError``. SQ variants also support
-            backfill, but sharing IVF centroids does not guarantee compatible
-            SQ quantization metadata for subsequent segment merging.
         **kwargs: Additional keyword arguments forwarded to Lance's index segment
             creation API, including HNSW ``m``, ``max_level`` and ``ef_construction``.
             ``index_uuid`` is managed per segment. ``ivf_centroids_file`` is not
@@ -814,8 +803,8 @@ def create_vector_index(
     Raises:
         ValueError: If input parameters are invalid (e.g. empty column name,
             non-existent column, unsupported index type, an existing index
-            name with ``replace=False``, a backfill without the original
-            shared model, or a dataset too small to train an IVF model even
+            name with ``replace=False``, a supplied codebook without its original
+            sub-vector count, or a dataset too small to train an IVF model even
             at ``sample_rate=1`` — Lance raises its training ``ValueError``)
         TypeError: If column type is incompatible with the chosen ``index_type``,
             or an unknown keyword argument is passed
@@ -839,8 +828,8 @@ def create_vector_index(
         Refuse to overwrite an existing index:
         >>> daft_lance.create_vector_index("s3://my-bucket/dataset/", column="vector", replace=False)
 
-        Index appended fragments incrementally:
-        >>> daft_lance.create_vector_index("s3://my-bucket/dataset/", column="vector", fragment_ids=[10, 11])
+        Maintain coverage after appending data:
+        >>> daft_lance.optimize_indices("s3://my-bucket/dataset/", indices=["vector_idx"])
     """
     io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -876,7 +865,6 @@ def create_vector_index(
         pq_codebook=pq_codebook,
         fragment_group_size=fragment_group_size,
         max_concurrency=max_concurrency,
-        fragment_ids=fragment_ids,
         **kwargs,
     )
 
