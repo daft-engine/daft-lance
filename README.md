@@ -185,6 +185,36 @@ Training runs in the coordinator process. Its memory footprint grows with
 `2**num_bits * sample_rate * dimension` for PQ.
 
 
+### Distributed Vector Search
+
+```python
+from daft_lance import vector_search
+
+result = vector_search(
+    "s3://bucket/my_dataset",
+    nearest={"column": "vector", "q": [0.1, 0.2], "k": 10, "nprobes": 8},
+    columns=["id"],
+    filter="active = true",
+    num_tasks=4,
+)
+result.explain(show_all=True)
+result.collect()
+```
+
+Each scan task searches its assigned index segments at one pinned dataset
+version; Daft merges the global Top-K, ordered by `_distance` then `_rowid`.
+The returned lazy DataFrame also includes `_query_id`. Pass a matrix as `q` to
+search multiple vectors, each with its own global K. Filters apply before
+search. The Ray runner can execute tasks across workers; `num_tasks` controls
+segment groups, while the runner controls concurrency. One segment offers
+one task per query. This API requires full index coverage; after appending
+data, run `optimize_indices` or rebuild the index first.
+
+Approximate-index candidates can differ from a single scanner because each
+task refines its own candidates. Compare recall as well as latency. See the
+[benchmark guide](benchmarks/README.md) for reproducible comparisons against
+native Lance, the existing single-task path and independent-query parallelism.
+
 ### Column Merging
 
 ```python

@@ -20,6 +20,7 @@ from .lance_scalar_index import create_scalar_index_internal, optimize_indices_i
 from .lance_scan import LanceScanOperator
 from .lance_update_column import UpdateColumnsResult, update_columns_from_df, validate_update_arguments
 from .lance_vector_index import create_vector_index_internal
+from .lance_vector_search import vector_search_internal
 from .namespace import validate_uri_or_namespace
 from .utils import construct_lance_dataset_handle
 
@@ -28,6 +29,73 @@ if TYPE_CHECKING:
     from lance.udf import BatchUDF
 
     from daft.checkpoint import CheckpointConfig
+
+
+@PublicAPI
+def vector_search(
+    uri: str | pathlib.Path | None = None,
+    io_config: IOConfig | None = None,
+    *,
+    nearest: dict[str, Any],
+    index_name: str | None = None,
+    columns: list[str] | None = None,
+    filter: str | None = None,
+    num_tasks: int | None = None,
+    version: int | str | None = None,
+    storage_options: dict[str, Any] | None = None,
+    index_cache_size: int | None = None,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+) -> DataFrame:
+    """Search vector index segments in parallel and merge the global top-k.
+
+    Returns a lazy DataFrame with ``_distance``, ``_rowid`` and ``_query_id``.
+    ``nearest`` contains Lance's ``column``, ``q`` and positive ``k`` options;
+    metric, nprobes and refine_factor are passed to Lance. ``q`` can be one
+    vector or a matrix: each query gets its own global k results, ordered by
+    distance then row ID. ``filter`` is applied before nearest search.
+
+    Workers read the pinned dataset version and only their assigned segments.
+    ``num_tasks`` caps segment groups per query (default: one per segment).
+    The runner determines concurrency; use the Ray runner for multiple workers.
+    Index coverage must be complete; use optimize_indices after appending data.
+    A single segment produces one task per query. Approximate index results can
+    differ from a monolithic search because candidate refinement runs per task.
+
+    URI and namespace table entry points follow read_lance's conventions.
+    Output uses blob descriptors, like read_lance. Projection must retain the
+    result columns needed for the global merge (added by Lance automatically).
+
+    Example:
+        >>> result = vector_search(  # doctest: +SKIP
+        ...     "table.lance", nearest={"column": "vector", "q": [0.1, 0.2], "k": 10}
+        ... )
+        >>> result.explain()  # doctest: +SKIP
+        >>> result.collect()  # doctest: +SKIP
+    """
+    if nearest.get("use_index") is False:
+        raise ValueError("vector_search requires use_index=True")
+    io_config = context.get_context().daft_planning_config.default_io_config if io_config is None else io_config
+    handle = construct_lance_dataset_handle(
+        uri,
+        io_config=io_config,
+        storage_options=storage_options,
+        index_cache_size=index_cache_size,
+        version=version,
+        table_id=table_id,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+    )
+    return vector_search_internal(
+        handle.dataset,
+        handle.worker_open_context(),
+        nearest=nearest,
+        index_name=index_name,
+        columns=columns,
+        predicate=filter,
+        num_tasks=num_tasks,
+    )
 
 
 @PublicAPI

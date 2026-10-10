@@ -13,6 +13,7 @@ from ._lance import (
     optimize_indices,
     read_lance,
     update_columns_df,
+    vector_search,
     write_lance,
 )
 from .lance_update_column import UpdateColumnsResult
@@ -29,5 +30,6 @@ __all__ = [
     "read_lance",
     "take_blobs",
     "update_columns_df",
+    "vector_search",
     "write_lance",
 ]
