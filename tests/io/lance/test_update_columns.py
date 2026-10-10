@@ -37,6 +37,7 @@ def test_update_columns_do_not_accept_historical_snapshot_parameters() -> None:
         parameters = inspect.signature(cast(Callable[..., Any], operation)).parameters
         assert "version" not in parameters
         assert "asof" not in parameters
+        assert "default_scan_options" not in parameters
 
 
 def test_update_columns_sql_transform_with_where(tmp_path: Path) -> None:
