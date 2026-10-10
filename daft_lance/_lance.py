@@ -409,8 +409,6 @@ def update_columns(
     namespace_impl: str | None = None,
     namespace_properties: dict[str, str] | None = None,
     storage_options: dict[str, Any] | None = None,
-    version: int | str | None = None,
-    asof: str | None = None,
     block_size: int | None = None,
     commit_lock: Any | None = None,
     index_cache_size: int | None = None,
@@ -443,9 +441,6 @@ def update_columns(
         namespace_impl: Lance Namespace implementation.
         namespace_properties: Properties used to connect to the namespace.
         storage_options: Additional object-store options.
-        version: Dataset version or tag to read and commit against. Defaults to
-            the version current when this function starts.
-        asof: Find the latest version created on or before this timestamp.
         block_size: Hint for the minimum object-store I/O request size.
         commit_lock: Custom Lance commit lock.
         index_cache_size: Index cache size.
@@ -470,8 +465,6 @@ def update_columns(
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
-        version=version,
-        asof=asof,
         block_size=block_size,
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,
@@ -502,8 +495,6 @@ def update_columns_df(
     namespace_impl: str | None = None,
     namespace_properties: dict[str, str] | None = None,
     storage_options: dict[str, Any] | None = None,
-    version: int | str | None = None,
-    asof: str | None = None,
     block_size: int | None = None,
     commit_lock: Any | None = None,
     index_cache_size: int | None = None,
@@ -535,12 +526,6 @@ def update_columns_df(
         namespace_impl: Lance Namespace implementation.
         namespace_properties: Properties used to connect to the namespace.
         storage_options: Additional object-store options.
-        version: Dataset version or tag to read and commit against. Defaults to
-            the current version. It must be the snapshot the source ``_rowaddr``
-            values were read from. Lance rebases the commit over concurrent
-            transactions that touch other fragments; a concurrent write to a
-            fragment this update rewrites raises ``CommitConflictError``.
-        asof: If specified, find the latest version created on or earlier than the given argument value.
         block_size: Block size in bytes. Provide a hint for the size of the minimal I/O request.
         commit_lock: Custom Lance commit lock.
         index_cache_size: Index cache size.
@@ -555,8 +540,8 @@ def update_columns_df(
         of the pinned snapshot updates nothing, and a ``_rowaddr`` repeated in
         the source updates its row once with an unspecified one of the
         submitted values. Both are silent and both are still counted. Keep the
-        source aligned with ``version``, and unique, to keep the count
-        meaningful.
+        source aligned with the current target snapshot, and unique, to keep
+        the count meaningful.
 
     Note:
         Fragments are rewritten in parallel, so a failure raised by one
@@ -590,8 +575,6 @@ def update_columns_df(
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
         table_id=table_id,
-        version=version,
-        asof=asof,
         block_size=block_size,
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,

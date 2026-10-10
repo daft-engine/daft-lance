@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+import inspect
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -29,6 +30,13 @@ def _read_update_source(path: str) -> daft.DataFrame:
         default_scan_options={"with_row_address": True},
         include_fragment_id=True,
     )
+
+
+def test_update_columns_do_not_accept_historical_snapshot_parameters() -> None:
+    for operation in [daft_lance.update_columns, daft_lance.update_columns_df]:
+        parameters = inspect.signature(cast(Callable[..., Any], operation)).parameters
+        assert "version" not in parameters
+        assert "asof" not in parameters
 
 
 def test_update_columns_sql_transform_with_where(tmp_path: Path) -> None:
@@ -180,18 +188,16 @@ def test_update_columns_can_update_business_fragment_id_column(tmp_path: Path) -
     assert lance.dataset(path).to_table().sort_by("id").column("fragment_id").to_pylist() == [11, 21]
 
 
-def test_update_columns_preserves_pinned_version_for_occ(tmp_path: Path) -> None:
+def test_update_columns_uses_current_snapshot(tmp_path: Path) -> None:
     path = str(tmp_path / "transform-occ.lance")
     daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
-    source_version = lance.dataset(path).version
     lance.dataset(path).update({"value": "999"}, where="id = 1")
     competing_version = lance.dataset(path).version
 
-    with pytest.raises(Exception, match="conflict|Conflict"):
-        daft_lance.update_columns(path, version=source_version, transform={"value": "value + 100"})
+    result = daft_lance.update_columns(path, transform={"value": "value + 100"})
 
-    assert lance.dataset(path).version == competing_version
-    assert lance.dataset(path).to_table().sort_by("id").to_pydict()["value"] == [999, 20]
+    assert result == daft_lance.UpdateColumnsResult(version=competing_version + 1, rows_updated=2)
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict()["value"] == [1099, 120]
 
 
 def test_update_columns_namespace_roundtrip(tmp_path: Path) -> None:
