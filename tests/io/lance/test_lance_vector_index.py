@@ -13,7 +13,7 @@ from daft_lance import create_vector_index, lance_vector_index, optimize_indices
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="lance")
 
-ALL_VECTOR_INDEX_TYPES = ["IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+ALL_VECTOR_INDEX_TYPES = ["IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_RQ"]
 
 
 def _make_vector_dataset(
@@ -102,16 +102,20 @@ _MIN_RECALL = {
     "IVF_HNSW_SQ": 0.8,
     "IVF_PQ": 0.2,
     "IVF_HNSW_PQ": 0.2,
+    "IVF_RQ": 0.8,
 }
 
 
-def _recall_at_5(ds, vectors: np.ndarray) -> float:
+def _recall_at_5(ds, vectors: np.ndarray, refine_factor: int | None = None) -> float:
     """Recall@5 of the index against brute-force ground truth, over fixed queries."""
     queries = list(range(0, 400, 40)) + [7]
     hits = 0
     for qi in queries:
         truth = set(np.argsort(((vectors - vectors[qi]) ** 2).sum(axis=1))[:5].tolist())
-        got = set(ds.to_table(nearest={"column": "vector", "q": vectors[qi], "k": 5})["id"].to_pylist())
+        nearest = {"column": "vector", "q": vectors[qi], "k": 5}
+        if refine_factor is not None:
+            nearest["refine_factor"] = refine_factor
+        got = set(ds.to_table(nearest=nearest)["id"].to_pylist())
         assert len(got) == 5
         hits += len(truth & got)
     return hits / (5 * len(queries))
@@ -119,7 +123,7 @@ def _recall_at_5(ds, vectors: np.ndarray) -> float:
 
 @pytest.mark.parametrize("index_type", ALL_VECTOR_INDEX_TYPES)
 def test_every_index_type_builds_and_answers_queries(tmp_path: Path, index_type: str) -> None:
-    """All six advertised vector index types build multiple segments and return results."""
+    """All advertised vector index types build multiple segments and return results."""
     uri, vectors = _make_vector_dataset(tmp_path / f"t_{index_type}.lance", seed=13)
 
     create_vector_index(
@@ -133,7 +137,8 @@ def test_every_index_type_builds_and_answers_queries(tmp_path: Path, index_type:
     assert len(desc.segments) == 2
     assert _covered_fragments(uri, "vector_idx") == {f.fragment_id for f in ds.get_fragments()}
 
-    recall = _recall_at_5(ds, vectors)
+    # One-bit RQ needs exact refinement, particularly for this small 8-dimensional fixture.
+    recall = _recall_at_5(ds, vectors, refine_factor=100 if index_type == "IVF_RQ" else None)
     assert recall >= _MIN_RECALL[index_type], f"{index_type} recall@5 {recall:.2f} < {_MIN_RECALL[index_type]}"
 
 
@@ -239,19 +244,21 @@ def test_cosine_metric_orders_by_angle_not_distance(tmp_path: Path) -> None:
     assert got.isdisjoint(l2_truth)
 
 
-def test_replace_default_false_rejects_existing_name(tmp_path: Path) -> None:
+@pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_RQ"])
+def test_replace_default_false_rejects_existing_name(tmp_path: Path, index_type: str) -> None:
     uri, _ = _make_vector_dataset(tmp_path / "repl.lance", num_rows=240, rows_per_file=40, seed=5)
-    create_vector_index(uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=32, name="v_idx")
+    create_vector_index(uri, column="vector", index_type=index_type, num_partitions=4, sample_rate=32, name="v_idx")
 
     with pytest.raises(ValueError, match="already exists. Set replace=True"):
-        create_vector_index(uri, column="vector", index_type="IVF_FLAT", num_partitions=4, sample_rate=32, name="v_idx")
+        create_vector_index(uri, column="vector", index_type=index_type, num_partitions=4, sample_rate=32, name="v_idx")
 
 
-def test_replace_true_rebuilds_atomically_in_one_version(tmp_path: Path) -> None:
+@pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_RQ"])
+def test_replace_true_rebuilds_atomically_in_one_version(tmp_path: Path, index_type: str) -> None:
     uri, vectors = _make_vector_dataset(tmp_path / "rebuild.lance", num_rows=240, rows_per_file=40, seed=6)
     build = dict(
         column="vector",
-        index_type="IVF_FLAT",
+        index_type=index_type,
         num_partitions=4,
         sample_rate=32,
         name="v_idx",
@@ -268,17 +275,20 @@ def test_replace_true_rebuilds_atomically_in_one_version(tmp_path: Path) -> None
     assert len(described) == 1
     assert described[0].name == "v_idx"
     assert len(described[0].segments) == 3
-    results = ds.to_table(nearest={"column": "vector", "q": vectors[7], "k": 5})
+    results = ds.to_table(nearest={"column": "vector", "q": vectors[7], "k": 5, "nprobes": 4, "refine_factor": 20})
     assert 7 in results["id"].to_pylist()
 
 
-def test_worker_failure_keeps_version_and_old_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_RQ"])
+def test_worker_failure_keeps_version_and_old_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, index_type: str
+) -> None:
     """A failing segment build aborts before the commit; the old index stays usable."""
     uri, vectors = _make_vector_dataset(tmp_path / "fail.lance", num_rows=240, rows_per_file=40, seed=9)
     create_vector_index(
         uri,
         column="vector",
-        index_type="IVF_FLAT",
+        index_type=index_type,
         num_partitions=4,
         sample_rate=32,
         name="v_idx",
@@ -298,7 +308,7 @@ def test_worker_failure_keeps_version_and_old_index(tmp_path: Path, monkeypatch:
         create_vector_index(
             uri,
             column="vector",
-            index_type="IVF_FLAT",
+            index_type=index_type,
             num_partitions=4,
             sample_rate=32,
             name="v_idx",
@@ -312,7 +322,7 @@ def test_worker_failure_keeps_version_and_old_index(tmp_path: Path, monkeypatch:
     assert len(described) == 1
     assert described[0].name == "v_idx"
     assert len(described[0].segments) == 3
-    results = ds.to_table(nearest={"column": "vector", "q": vectors[7], "k": 5})
+    results = ds.to_table(nearest={"column": "vector", "q": vectors[7], "k": 5, "nprobes": 4, "refine_factor": 20})
     assert 7 in results["id"].to_pylist()
 
 
@@ -523,7 +533,7 @@ def test_optimize_indices_covers_appended_vectors(tmp_path: Path, index_type: st
     assert np.isfinite(result["_distance"].to_numpy()).all()
 
 
-@pytest.mark.parametrize("argument", ["ivf_centroids", "pq_codebook"])
+@pytest.mark.parametrize("argument", ["ivf_centroids", "pq_codebook", "rabitq_model"])
 @pytest.mark.parametrize("value", [None, pa.FixedSizeListArray.from_arrays(pa.array([0.0] * 8, type=pa.float32()), 8)])
 def test_external_model_arguments_are_rejected(
     tmp_path: Path, argument: str, value, monkeypatch: pytest.MonkeyPatch
@@ -595,4 +605,58 @@ def test_insufficient_training_rows_raise_lance_error(
             sample_rate=sample_rate,
         )
     assert lance.dataset(uri).version == before.version
+    assert not lance.dataset(uri).describe_indices()
+
+
+@pytest.mark.parametrize("num_bits", [None, 2, 4])
+def test_rq_shared_rotation_survives_segment_merge(tmp_path: Path, num_bits: int | None) -> None:
+    """Shared RaBitQ rotations allow independently built segments to merge and remain searchable."""
+    uri, vectors = _make_vector_dataset(tmp_path / "rq.lance", dim=16, rows_per_file=512)
+    create_vector_index(
+        uri,
+        column="vector",
+        index_type="IVF_RQ",
+        num_partitions=4,
+        num_bits=num_bits,
+        sample_rate=8,
+        fragment_group_size=2,
+    )
+    ds = lance.dataset(uri)
+    segments = ds.stats.index_stats("vector_idx")["indices"]
+    assert len(segments) == 2
+    model = segments[0]["sub_index"]
+    assert model["num_bits"] == (1 if num_bits is None else num_bits)
+    assert model["code_dim"] == 16
+    assert model["fast_rotation_signs"]
+    assert all(segment["sub_index"]["fast_rotation_signs"] == model["fast_rotation_signs"] for segment in segments)
+
+    def check_query(dataset):
+        truth = set(np.argsort(((vectors - vectors[7]) ** 2).sum(axis=1))[:5].tolist())
+        result = dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": vectors[7],
+                "k": 5,
+                "nprobes": 4,
+                "refine_factor": 100,
+            }
+        )
+        assert len(set(result["id"].to_pylist()) & truth) >= 4
+        assert 7 in result["id"].to_pylist()
+
+    check_query(ds)
+    optimize_indices(uri, indices=["vector_idx"], num_indices_to_merge=2)
+    merged = lance.dataset(uri)
+    assert merged.version == ds.version + 1
+    assert len(merged.describe_indices()[0].segments) == 1
+    assert merged.describe_indices()[0].num_rows_indexed == len(vectors)
+    check_query(merged)
+
+
+def test_rq_dimension_error_preserves_dataset(tmp_path: Path) -> None:
+    uri, _ = _make_vector_dataset(tmp_path / "rq_dimension.lance", dim=10)
+    before = lance.dataset(uri).version
+    with pytest.raises(ValueError, match="divisible by 8"):
+        create_vector_index(uri, column="vector", index_type="IVF_RQ", num_partitions=4, sample_rate=8)
+    assert lance.dataset(uri).version == before
     assert not lance.dataset(uri).describe_indices()

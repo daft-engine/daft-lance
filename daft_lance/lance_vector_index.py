@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from daft_lance.namespace import DatasetOpenContext
 
 import lance
+from lance.lance import indices as lance_indices
 
 from daft_lance.lance_scalar_index import (
     _validate_segments_against_manifest,
@@ -22,8 +23,10 @@ from daft_lance.utils import distribute_fragments_balanced
 logger = logging.getLogger(__name__)
 
 # Vector index types built with the distributed segment workflow. IVF and
-# IVF_HNSW families over FLAT/PQ/SQ storage.
-VECTOR_INDEX_TYPES = frozenset({"IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ"})
+# IVF_HNSW families over FLAT/PQ/SQ storage, plus IVF_RQ.
+VECTOR_INDEX_TYPES = frozenset(
+    {"IVF_FLAT", "IVF_PQ", "IVF_SQ", "IVF_HNSW_FLAT", "IVF_HNSW_PQ", "IVF_HNSW_SQ", "IVF_RQ"}
+)
 
 # PQ variants need a codebook trained alongside the IVF centroids.
 _PQ_INDEX_TYPES = frozenset({"IVF_PQ", "IVF_HNSW_PQ"})
@@ -44,6 +47,7 @@ _HANDLER_MANAGED_KWARGS = frozenset(
         "num_bits",
         "ivf_centroids",
         "pq_codebook",
+        "rabitq_model",
         "storage_options",
         "index_uuid",
         "ivf_centroids_file",
@@ -71,7 +75,7 @@ def _validate_worker_kwargs(kwargs: dict[str, Any]) -> None:
             "create_vector_index no longer accepts fragment_ids; it builds all fragments. "
             "Use optimize_indices to index appended data."
         )
-    removed_models = sorted(set(kwargs) & {"ivf_centroids", "pq_codebook", "ivf_centroids_file"})
+    removed_models = sorted(set(kwargs) & {"ivf_centroids", "pq_codebook", "ivf_centroids_file", "rabitq_model"})
     if removed_models:
         raise TypeError(
             f"create_vector_index does not accept {removed_models}; models are trained by the build workflow."
@@ -109,7 +113,7 @@ class VectorFragmentIndexHandler:
     Each Daft worker receives a subset of Lance fragment IDs and builds one
     uncommitted vector index segment for just those fragments with Lance's
     public ``create_index_uncommitted`` API, using the IVF centroids (and PQ
-    codebook, for PQ variants) trained once on the driver so every segment
+    codebook for PQ variants, or rotation model for RQ) generated once on the driver so every segment
     shares the same model. The worker pickles the returned ``lance.Index``
     metadata back to the coordinator, which commits all segments into the
     dataset manifest atomically with ``commit_existing_index_segments``.
@@ -170,7 +174,7 @@ def create_vector_index_internal(
     metric: str = "L2",
     num_partitions: int | None = None,
     num_sub_vectors: int | None = None,
-    num_bits: int = 8,
+    num_bits: int | None = None,
     sample_rate: int = 256,
     fragment_group_size: int | None = None,
     max_concurrency: int | None = None,
@@ -188,6 +192,7 @@ def create_vector_index_internal(
        ``IndicesBuilder.train_ivf`` and, for PQ variants, the PQ codebook via
        ``IndicesBuilder.train_pq``. The user's ``sample_rate`` is passed
        unchanged; Lance validates that enough training data is available.
+       IVF_RQ builds one shared RaBitQ rotation model for all segments.
     2. Fragment batches are distributed across Daft workers, one partition per
        batch; each worker calls ``create_index_uncommitted`` with the shared
        model for its fragments and pickles the segment metadata back.
@@ -215,8 +220,10 @@ def create_vector_index_internal(
 
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
-    if index_type not in _PQ_INDEX_TYPES and num_bits != 8:
-        raise ValueError("num_bits is configurable only for IVF_PQ and IVF_HNSW_PQ.")
+    if num_bits is None:
+        num_bits = 1 if index_type == "IVF_RQ" else 8
+    if index_type not in _PQ_INDEX_TYPES and index_type != "IVF_RQ" and num_bits != 8:
+        raise ValueError("num_bits is configurable only for IVF_PQ, IVF_HNSW_PQ and IVF_RQ.")
 
     # Reject kwargs Lance's segment build would silently swallow (misspelled
     # or unsupported parameters must not build a misconfigured index).
@@ -292,6 +299,9 @@ def create_vector_index_internal(
         "num_bits": num_bits,
         "pq_codebook": pq_codebook,
     }
+
+    if index_type == "IVF_RQ":
+        model_kwargs["rabitq_model"] = lance_indices.build_rq_model(dimension=builder.dimension, num_bits=num_bits)
 
     # Phase 2: distribute fragment batches across Daft workers, one partition
     # per batch so distributed runners build the segments in parallel.
