@@ -762,7 +762,7 @@ def create_vector_index(
             parallelism here comes from ``fragment_group_size``/``max_concurrency``.
         num_sub_vectors: Number of PQ sub-vectors (PQ variants only). If None,
             Lance derives it from the vector dimension during training.
-        num_bits: Quantization bit width. None uses Lance defaults: 8 for PQ
+        num_bits: Quantization bit width. None selects 8 for PQ
             (4 and 8 supported), 1 for RQ. For RQ this is the number of bits per
             vector dimension. Configurable for ``IVF_PQ``, ``IVF_HNSW_PQ`` and
             ``IVF_RQ``; passed consistently to the shared model and every segment
