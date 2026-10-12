@@ -107,18 +107,20 @@ returns the updated dataset; for a distributed rebuild use
 ### Vector Indexing
 
 Vector indexes (`IVF_FLAT`, `IVF_PQ`, `IVF_SQ`, `IVF_HNSW_FLAT`,
-`IVF_HNSW_PQ`, `IVF_HNSW_SQ`) are built distributed in three phases: the
+`IVF_HNSW_PQ`, `IVF_HNSW_SQ`, `IVF_RQ`) are built distributed in three phases: the
 driver trains the global model once — IVF centroids (and the PQ codebook for
 PQ variants) via pylance's `IndicesBuilder` — then Daft workers each build one
 uncommitted index segment for their fragment batch with the shared model, and
 the coordinator commits all segments atomically. Segments built against the
-same centroids and codebook commit as one logical index.
+same shared model commit as one logical index. IVF_RQ also generates one shared
+RaBitQ rotation model on the coordinator and uses it in every segment.
 
 ```python
 from daft_lance import create_vector_index
 
 create_vector_index("s3://bucket/my_dataset", column="vector", index_type="IVF_PQ", num_partitions=16)
 create_vector_index("s3://bucket/my_dataset", column="embedding", index_type="IVF_FLAT", metric="cosine")
+create_vector_index("s3://bucket/my_dataset", column="vector", index_type="IVF_RQ", num_partitions=16)
 ```
 
 `replace` defaults to `False`, matching pylance's `create_index` — which,
@@ -161,6 +163,13 @@ The coordinator always trains the shared IVF centroids and, for PQ types,
 the shared codebook; user-supplied models and `ivf_centroids_file` are not supported.
 PQ builds retain `num_bits` (default 8; 4 and 8 are supported by Lance). The same
 bit width is used for shared codebook training and every segment build.
+For IVF_RQ, `num_bits` defaults to 1 bit per vector dimension. The vector dimension
+must be divisible by 8; Lance validates supported configurations. The shared
+rotation model lets independently built RQ segments use consistent encoding and
+be merged by `optimize_indices`. `rabitq_model` is managed internally and cannot
+be supplied by callers. Omitting `num_bits` preserves the existing 8-bit PQ default.
+RQ is lossy: query recall depends on bit width and data. Use Lance nearest-query
+`refine_factor` to fetch more candidates and rerank them using original vectors.
 
 Training `sample_rate` is a multiplier, not a percentage: for example,
 4 IVF partitions and `sample_rate=32` require 128 rows; 8-bit PQ requires
