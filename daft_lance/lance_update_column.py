@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -10,6 +10,7 @@ import daft
 import daft.pickle
 from daft.datatype import DataType
 from daft.dependencies import pa
+from daft.runners import get_or_create_runner
 from daft.udf import method
 from daft_lance._metadata import _is_lance_blob
 
@@ -19,12 +20,13 @@ if TYPE_CHECKING:
 
 _ROW_ADDRESS = "_rowaddr"
 _FRAGMENT_ID = "fragment_id"
-_METADATA_COLUMNS = {_ROW_ADDRESS, "_rowid", _FRAGMENT_ID}
+_METADATA_COLUMNS = {_ROW_ADDRESS, "_rowid"}
 _FRAGMENT_UPDATE_RESULT_DTYPE = DataType.struct(
     {
         "fragment_meta": DataType.binary(),
         "rows_updated": DataType.int64(),
         "fields_modified": DataType.list(DataType.int64()),
+        "updated_offsets": DataType.binary(),
     }
 )
 
@@ -33,10 +35,10 @@ _FRAGMENT_UPDATE_RESULT_DTYPE = DataType.struct(
 class UpdateColumnsResult:
     """Result of a distributed Lance column update.
 
-    ``rows_updated`` counts the rows the source submitted, not the rows Lance
-    matched. They differ when the source carries a ``_rowaddr`` that is not a
-    live row of the pinned snapshot, which is silently ignored, or the same
-    address more than once, which updates one row.
+    For ``update_columns``, ``rows_updated`` is the number of live rows matching
+    its predicate. For ``update_columns_df``, it counts the rows submitted by the
+    source, which can differ from the number Lance matches when addresses are
+    stale or repeated.
     """
 
     version: int
@@ -52,7 +54,12 @@ class _FragmentUpdateBatch:
     values: pa.Table
 
 
-def validate_update_arguments(columns: Sequence[str], max_concurrency: int | None) -> list[str]:
+def validate_update_arguments(
+    columns: Sequence[str],
+    max_concurrency: int | None,
+    *,
+    allow_fragment_id: bool = False,
+) -> list[str]:
     """Check the arguments that do not depend on the target dataset.
 
     Called before the dataset is opened so a bad argument does not first cost a
@@ -75,7 +82,7 @@ def validate_update_arguments(columns: Sequence[str], max_concurrency: int | Non
         if name in seen:
             raise ValueError(f"Duplicate column {name!r} in 'columns'.")
         seen.add(name)
-        if name == _FRAGMENT_ID:
+        if name == _FRAGMENT_ID and not allow_fragment_id:
             raise ValueError(
                 f"Cannot update {name!r}; it is the grouping key update_columns_df injects, "
                 "not a column of the target dataset."
@@ -88,29 +95,36 @@ def validate_update_arguments(columns: Sequence[str], max_concurrency: int | Non
     return resolved_columns
 
 
+def _validate_update_target_columns(
+    lance_ds: lance.LanceDataset,
+    columns: Sequence[str],
+    *,
+    operation_name: str,
+    allow_fragment_id: bool = False,
+) -> list[str]:
+    resolved_columns = validate_update_arguments(columns, None, allow_fragment_id=allow_fragment_id)
+    target_names = set(lance_ds.schema.names)
+    for name in resolved_columns:
+        if name not in target_names:
+            raise ValueError(
+                f"Cannot update non-existent column {name!r}; {operation_name} only overwrites existing columns."
+            )
+        arrow_field = lance_ds.schema.field(name)
+        if pa.types.is_struct(arrow_field.type):
+            raise ValueError(f"Struct column {name!r} is not supported by {operation_name}.")
+        if _is_lance_blob(arrow_field):
+            raise ValueError(f"Blob column {name!r} cannot be updated by {operation_name}.")
+    return resolved_columns
+
+
 def _validate_update_columns(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
     columns: Sequence[str],
     max_concurrency: int | None = None,
 ) -> list[str]:
-    resolved_columns = validate_update_arguments(columns, max_concurrency)
-
-    target_names = set(lance_ds.schema.names)
-    for name in resolved_columns:
-        if name not in target_names:
-            raise ValueError(
-                f"Cannot update non-existent column {name!r}; update_columns_df only overwrites existing columns."
-            )
-        arrow_field = lance_ds.schema.field(name)
-        if pa.types.is_struct(arrow_field.type):
-            # A source struct missing one of the target's fields casts cleanly
-            # with that field filled in as null, so a partial struct would drop
-            # data silently. Supporting structs needs an explicit field-set
-            # check first.
-            raise ValueError(f"Struct column {name!r} is not supported by update_columns_df.")
-        if _is_lance_blob(arrow_field):
-            raise ValueError(f"Blob column {name!r} cannot be updated by update_columns_df.")
+    validate_update_arguments(columns, max_concurrency)
+    resolved_columns = _validate_update_target_columns(lance_ds, columns, operation_name="update_columns_df")
 
     source_names = df.column_names
     for required in [_ROW_ADDRESS, _FRAGMENT_ID, *resolved_columns]:
@@ -177,10 +191,11 @@ def _rewrite_fragment(
         raise ValueError(f"Update columns cannot be safely cast to the target Lance schema: {exc}") from exc
 
     update_table = values.append_column(_ROW_ADDRESS, batch.row_addresses)
-    fragment_meta, fields_modified = fragment.update_columns(
+    fragment_meta, fields_modified, updated_offsets = fragment.update_columns(
         update_table,
         left_on=_ROW_ADDRESS,
         right_on=_ROW_ADDRESS,
+        with_offsets=True,
     )
     if int(fragment_meta.id) != batch.fragment_id:
         raise ValueError(f"Fragment rewrite changed fragment id: expected {batch.fragment_id}, got {fragment_meta.id}.")
@@ -189,6 +204,7 @@ def _rewrite_fragment(
         "fragment_meta": daft.pickle.dumps(fragment_meta),
         "rows_updated": len(batch.row_addresses),
         "fields_modified": [int(field_id) for field_id in fields_modified],
+        "updated_offsets": updated_offsets,
     }
 
 
@@ -224,6 +240,384 @@ class _FragmentUpdateHandler:
         ]
 
 
+def _resolve_transform_columns(
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+    columns: Sequence[str] | None,
+    max_concurrency: int | None,
+) -> list[str]:
+    if max_concurrency is not None and max_concurrency <= 0:
+        raise ValueError("max_concurrency must be a positive integer.")
+
+    inferred_columns: Sequence[str] | None = None
+    if isinstance(transform, dict):
+        for name, expression in transform.items():
+            if not isinstance(name, str):
+                raise TypeError(f"Transform column names must be strings, got {type(name).__name__}.")
+            if not isinstance(expression, str):
+                raise TypeError(f"Transform expressions must be strings, got {type(expression).__name__}.")
+        inferred_columns = list(transform)
+    elif isinstance(transform, lance.udf.BatchUDF):
+        if transform.cache is not None:
+            raise ValueError("BatchUDF checkpoint files are not supported by update_columns fragment workers.")
+        if transform.output_schema is not None:
+            inferred_columns = transform.output_schema.names
+    elif not callable(transform):
+        raise TypeError("'transform' must be a dict of Lance SQL expressions, a BatchUDF, or a callable.")
+
+    if columns is None:
+        if inferred_columns is None:
+            raise ValueError("'columns' is required for a callable transform without an output schema.")
+        return validate_update_arguments(inferred_columns, max_concurrency, allow_fragment_id=True)
+
+    resolved_columns = validate_update_arguments(columns, max_concurrency, allow_fragment_id=True)
+    if inferred_columns is not None and set(resolved_columns) != set(inferred_columns):
+        raise ValueError("'columns' must name exactly the columns produced by 'transform'.")
+    return resolved_columns
+
+
+def _validate_read_columns(lance_ds: lance.LanceDataset, read_columns: Sequence[str] | None) -> list[str] | None:
+    if read_columns is None:
+        return None
+    if isinstance(read_columns, str):
+        raise TypeError("'read_columns' must be a sequence of column names, not a bare string.")
+
+    resolved = list(read_columns)
+    seen: set[str] = set()
+    valid_names = set(lance_ds.schema.names) | {_ROW_ADDRESS, "_rowid"}
+    for name in resolved:
+        if not isinstance(name, str):
+            raise TypeError(f"'read_columns' entries must be strings, got {type(name).__name__}.")
+        if name in seen:
+            raise ValueError(f"Duplicate column {name!r} in 'read_columns'.")
+        if name not in valid_names:
+            raise ValueError(f"Read column {name!r} does not exist in the target dataset.")
+        seen.add(name)
+    return resolved
+
+
+def validate_transform_update_arguments(
+    lance_ds: lance.LanceDataset,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+    *,
+    columns: Sequence[str] | None,
+    read_columns: Sequence[str] | None,
+    where: str | None,
+    batch_size: int | None,
+    max_concurrency: int | None,
+) -> tuple[list[str], list[str] | None, str | None]:
+    """Validate a transform-driven update before any fragment writes."""
+    if batch_size is not None and batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer.")
+    resolved_columns = _resolve_transform_columns(transform, columns, max_concurrency)
+    resolved_columns = _validate_update_target_columns(
+        lance_ds,
+        resolved_columns,
+        operation_name="update_columns",
+        allow_fragment_id=True,
+    )
+    resolved_read_columns = _validate_read_columns(lance_ds, read_columns)
+
+    if where is not None:
+        if not isinstance(where, str):
+            raise TypeError("'where' must be a Lance SQL predicate string or None.")
+        where = where.strip()
+        if not where:
+            raise ValueError("'where' must be a non-empty Lance SQL predicate when provided.")
+
+    return resolved_columns, resolved_read_columns, where
+
+
+def _cast_transform_output(
+    output: pa.RecordBatch,
+    row_addresses: pa.Array[Any],
+    *,
+    columns: list[str],
+    target_schema: pa.Schema,
+    expected_rows: int,
+) -> pa.RecordBatch:
+    if not isinstance(output, pa.RecordBatch):
+        raise TypeError(f"Transform must return a pyarrow.RecordBatch, got {type(output).__name__}.")
+    if output.num_rows != expected_rows:
+        raise ValueError(
+            f"Transform changed the row count from {expected_rows} to {output.num_rows}; row-preserving output is required."
+        )
+    if len(set(output.schema.names)) != len(output.schema.names):
+        raise ValueError("Transform output contains duplicate column names.")
+    if set(output.schema.names) != set(columns):
+        raise ValueError(f"Transform must return exactly the update columns {columns!r}, got {output.schema.names!r}.")
+
+    arrays: list[pa.Array[Any]] = []
+    try:
+        for field in target_schema:
+            array = output.column(output.schema.get_field_index(field.name))
+            if not field.nullable and array.null_count:
+                raise ValueError(f"Update produced nulls for non-nullable column {field.name!r}.")
+            arrays.append(array.cast(field.type, safe=True))
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
+        raise ValueError(f"Update columns cannot be safely cast to the target Lance schema: {exc}") from exc
+
+    output_schema = pa.schema([*target_schema, pa.field(_ROW_ADDRESS, pa.uint64(), nullable=False)])
+    return pa.RecordBatch.from_arrays([*arrays, row_addresses.cast(pa.uint64(), safe=True)], schema=output_schema)
+
+
+def _transform_fragment(
+    lance_ds: lance.LanceDataset,
+    fragment_id: int,
+    *,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+    columns: list[str],
+    read_columns: list[str] | None,
+    where: str | None,
+    batch_size: int | None,
+) -> dict[str, Any]:
+    fragment = lance_ds.get_fragment(fragment_id)
+    if fragment is None:
+        raise ValueError(f"Fragment {fragment_id} does not exist in target snapshot version {lance_ds.version}.")
+
+    target_schema = pa.schema([lance_ds.schema.field(name) for name in columns])
+    if isinstance(transform, dict):
+        source_batches = fragment.to_batches(
+            columns={name: transform[name] for name in columns},
+            filter=where,
+            with_row_address=True,
+            batch_size=batch_size,
+        )
+
+        def transformed_batches() -> Iterator[pa.RecordBatch]:
+            for batch in source_batches:
+                row_addresses = batch.column(batch.schema.get_field_index(_ROW_ADDRESS))
+                output = batch.select(columns)
+                yield _cast_transform_output(
+                    output,
+                    row_addresses,
+                    columns=columns,
+                    target_schema=target_schema,
+                    expected_rows=batch.num_rows,
+                )
+
+    else:
+        requested = list(lance_ds.schema.names) if read_columns is None else read_columns
+        physical_columns = [name for name in requested if name not in {_ROW_ADDRESS, "_rowid"}]
+        source_batches = fragment.to_batches(
+            columns=physical_columns,
+            filter=where,
+            with_row_address=True,
+            with_row_id="_rowid" in requested,
+            batch_size=batch_size,
+        )
+
+        def transformed_batches() -> Iterator[pa.RecordBatch]:
+            for batch in source_batches:
+                row_addresses = batch.column(batch.schema.get_field_index(_ROW_ADDRESS))
+                transform_input = batch.select(requested)
+                output = transform(transform_input)
+                yield _cast_transform_output(
+                    output,
+                    row_addresses,
+                    columns=columns,
+                    target_schema=target_schema,
+                    expected_rows=batch.num_rows,
+                )
+
+    iterator = iter(transformed_batches())
+    first = next(iterator, None)
+    if first is None:
+        return {"fragment_meta": None, "rows_updated": 0, "fields_modified": [], "updated_offsets": None}
+
+    rows_updated = first.num_rows
+
+    def counted_batches() -> Iterator[pa.RecordBatch]:
+        nonlocal rows_updated
+        yield first
+        for batch in iterator:
+            rows_updated += batch.num_rows
+            yield batch
+
+    reader = pa.RecordBatchReader.from_batches(first.schema, counted_batches())
+    fragment_meta, fields_modified, updated_offsets = fragment.update_columns(
+        reader,
+        left_on=_ROW_ADDRESS,
+        right_on=_ROW_ADDRESS,
+        with_offsets=True,
+    )
+    if int(fragment_meta.id) != fragment_id:
+        raise ValueError(f"Fragment rewrite changed fragment id: expected {fragment_id}, got {fragment_meta.id}.")
+    return {
+        "fragment_meta": daft.pickle.dumps(fragment_meta),
+        "rows_updated": rows_updated,
+        "fields_modified": [int(field_id) for field_id in fields_modified],
+        "updated_offsets": updated_offsets,
+    }
+
+
+class _FragmentTransformUpdateHandler:
+    """Apply a row-preserving transform to matching rows in pinned fragments."""
+
+    def __init__(
+        self,
+        open_context: DatasetOpenContext,
+        transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+        columns: list[str],
+        read_columns: list[str] | None,
+        where: str | None,
+        batch_size: int | None,
+    ) -> None:
+        self.open_context = open_context
+        self.transform = transform
+        self.columns = columns
+        self.read_columns = read_columns
+        self.where = where
+        self.batch_size = batch_size
+        self._lance_ds: lance.LanceDataset | None = None
+
+    def _dataset(self) -> lance.LanceDataset:
+        if self._lance_ds is None:
+            self._lance_ds = self.open_context.open_pinned()
+        return self._lance_ds
+
+    @method.batch(return_dtype=_FRAGMENT_UPDATE_RESULT_DTYPE)
+    def __call__(self, fragment_ids: Any) -> list[dict[str, Any]]:
+        results = []
+        for scalar in _to_arrow_array(fragment_ids):
+            if not scalar.is_valid:
+                raise ValueError("fragment_id cannot be null.")
+            fragment_id = int(scalar.cast(pa.int64(), safe=True).as_py())
+            results.append(
+                _transform_fragment(
+                    self._dataset(),
+                    fragment_id,
+                    transform=self.transform,
+                    columns=self.columns,
+                    read_columns=self.read_columns,
+                    where=self.where,
+                    batch_size=self.batch_size,
+                )
+            )
+        return results
+
+
+def _make_transform_update_handler(
+    open_context: DatasetOpenContext,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+    columns: list[str],
+    read_columns: list[str] | None,
+    where: str | None,
+    batch_size: int | None,
+    *,
+    cpus: float | None,
+    gpus: float,
+    use_process: bool | None,
+    max_concurrency: int | None,
+    ray_options: dict[str, Any] | None,
+) -> Any:
+    handler_cls = daft.cls(
+        _FragmentTransformUpdateHandler,
+        cpus=cpus,
+        gpus=gpus,
+        use_process=use_process,
+        max_concurrency=max_concurrency,
+        ray_options=ray_options,
+    )
+    return handler_cls(open_context, transform, columns, read_columns, where, batch_size)
+
+
+def _commit_update_messages(
+    commit_messages: list[dict[str, Any]],
+    lance_ds: lance.LanceDataset,
+    open_context: DatasetOpenContext,
+    *,
+    commit_lock: Any | None,
+) -> UpdateColumnsResult:
+    commit_messages = [message for message in commit_messages if message["fragment_meta"] is not None]
+    if not commit_messages:
+        return UpdateColumnsResult(version=lance_ds.version, rows_updated=0)
+
+    updated_fragments = []
+    seen_fragment_ids: set[int] = set()
+    fields_modified: set[int] = set()
+    updated_fragment_offsets: dict[int, bytes] = {}
+    rows_updated = 0
+    for message in commit_messages:
+        fragment_meta = daft.pickle.loads(message["fragment_meta"])
+        fragment_id = int(fragment_meta.id)
+        if fragment_id in seen_fragment_ids:
+            raise ValueError(f"Duplicate update result for fragment {fragment_id}.")
+        seen_fragment_ids.add(fragment_id)
+        updated_fragments.append(fragment_meta)
+        fields_modified.update(int(field_id) for field_id in message["fields_modified"])
+        updated_fragment_offsets[fragment_id] = message["updated_offsets"]
+        rows_updated += int(message["rows_updated"])
+
+    operation = lance.LanceOperation.Update(
+        updated_fragments=updated_fragments,
+        fields_modified=sorted(fields_modified),
+        fields_for_preserving_frag_bitmap=[],
+        update_mode="rewrite_columns",
+        updated_fragment_offsets=updated_fragment_offsets,
+    )
+    committed = lance.LanceDataset.commit(
+        open_context.uri,
+        operation,
+        read_version=lance_ds.version,
+        commit_lock=commit_lock,
+        storage_options=open_context.storage_options,
+        **open_context.commit_kwargs,
+    )
+    return UpdateColumnsResult(version=committed.version, rows_updated=rows_updated)
+
+
+def update_columns_with_transform(
+    lance_ds: lance.LanceDataset,
+    open_context: DatasetOpenContext,
+    *,
+    transform: dict[str, str] | lance.udf.BatchUDF | Callable[[pa.RecordBatch], pa.RecordBatch],
+    columns: Sequence[str] | None,
+    read_columns: Sequence[str] | None,
+    where: str | None,
+    batch_size: int | None,
+    commit_lock: Any | None,
+    max_concurrency: int | None,
+    cpus: float | None,
+    gpus: float,
+    use_process: bool | None,
+    ray_options: dict[str, Any] | None,
+) -> UpdateColumnsResult:
+    resolved_columns, resolved_read_columns, resolved_where = validate_transform_update_arguments(
+        lance_ds,
+        transform,
+        columns=columns,
+        read_columns=read_columns,
+        where=where,
+        batch_size=batch_size,
+        max_concurrency=max_concurrency,
+    )
+    fragment_ids = [fragment.fragment_id for fragment in lance_ds.get_fragments()]
+    if not fragment_ids:
+        return UpdateColumnsResult(version=lance_ds.version, rows_updated=0)
+
+    # The control DataFrame contains only fragment ids. Split it without a
+    # hash shuffle so distributed runners can schedule fragments independently.
+    source = daft.from_pydict({_FRAGMENT_ID: fragment_ids})
+    if len(fragment_ids) > 1 and get_or_create_runner().name != "native":
+        source = source.into_partitions(len(fragment_ids))
+    handler = _make_transform_update_handler(
+        open_context,
+        transform,
+        resolved_columns,
+        resolved_read_columns,
+        resolved_where,
+        batch_size,
+        cpus=cpus,
+        gpus=gpus,
+        use_process=use_process,
+        max_concurrency=max_concurrency,
+        ray_options=ray_options,
+    )
+    results = source.with_column("commit_message", handler(source[_FRAGMENT_ID]))
+    commit_messages = results.collect().to_pydict()["commit_message"]
+    return _commit_update_messages(commit_messages, lance_ds, open_context, commit_lock=commit_lock)
+
+
 def update_columns_from_df(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
@@ -247,36 +641,4 @@ def update_columns_from_df(
         ).alias("commit_message")
     )
     commit_messages = grouped.collect().to_pydict()["commit_message"]
-    if not commit_messages:
-        return UpdateColumnsResult(version=lance_ds.version, rows_updated=0)
-
-    updated_fragments = []
-    seen_fragment_ids: set[int] = set()
-    fields_modified: set[int] = set()
-    rows_updated = 0
-    for message in commit_messages:
-        fragment_meta = daft.pickle.loads(message["fragment_meta"])
-        fragment_id = int(fragment_meta.id)
-        if fragment_id in seen_fragment_ids:
-            raise ValueError(f"Duplicate update result for fragment {fragment_id}.")
-        seen_fragment_ids.add(fragment_id)
-
-        updated_fragments.append(fragment_meta)
-        fields_modified.update(int(field_id) for field_id in message["fields_modified"])
-        rows_updated += int(message["rows_updated"])
-
-    operation = lance.LanceOperation.Update(
-        updated_fragments=updated_fragments,
-        fields_modified=sorted(fields_modified),
-        fields_for_preserving_frag_bitmap=[],
-        update_mode="rewrite_columns",
-    )
-    committed = lance.LanceDataset.commit(
-        open_context.uri,
-        operation,
-        read_version=lance_ds.version,
-        commit_lock=commit_lock,
-        storage_options=open_context.storage_options,
-        **open_context.commit_kwargs,
-    )
-    return UpdateColumnsResult(version=committed.version, rows_updated=rows_updated)
+    return _commit_update_messages(commit_messages, lance_ds, open_context, commit_lock=commit_lock)
