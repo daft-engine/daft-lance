@@ -14,6 +14,7 @@ from ._lance import (
     read_lance,
     update_columns,
     update_columns_df,
+    vector_search,
     write_lance,
 )
 from .lance_update_column import UpdateColumnsResult
@@ -31,5 +32,6 @@ __all__ = [
     "take_blobs",
     "update_columns",
     "update_columns_df",
+    "vector_search",
     "write_lance",
 ]
