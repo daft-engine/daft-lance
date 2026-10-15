@@ -13,6 +13,7 @@ from daft_lance.namespace import (
     DatasetOpenContext,
     get_namespace_commit_kwargs,
     get_namespace_kwargs,
+    get_shared_session,
     has_namespace_params,
     merge_storage_options,
     resolve_namespace_table,
@@ -214,6 +215,9 @@ def construct_lance_dataset_handle(
         dataset_uri,
         storage_options=merged_storage_options,
         version=version,
+        # The native runner plans and executes in one process, so the driver's
+        # manifest is the one every scan task reuses.
+        session=get_shared_session(),
         **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
         **kwargs,
     )

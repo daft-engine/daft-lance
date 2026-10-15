@@ -28,15 +28,79 @@ a pylance call. Three design decisions shape the code:
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 import lance
+from lance.lance import _Session as LanceSession
 from lance_namespace import DeclareTableResponse, DescribeTableResponse, LanceNamespace
 
 _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "16"))
+
+_SHARED_SESSION: LanceSession | None = None
+_SHARED_SESSION_LOCK = threading.Lock()
+
+
+def _sharing_enabled() -> bool:
+    """Whether session sharing is on; ``DAFT_LANCE_SHARE_SESSION=0`` turns it off.
+
+    An escape hatch for a process that must not pool lance's caches, and the
+    only way to get a pre-sharing baseline inside a Ray worker: a driver-side
+    monkeypatch never reaches the worker process. Read on every call rather
+    than once at import, which costs nothing next to a dataset open and lets a
+    test flip it in-process.
+    """
+    return os.environ.get("DAFT_LANCE_SHARE_SESSION", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def get_shared_session() -> LanceSession:
+    """Return this process's one lance ``Session``, creating it on first use.
+
+    Every ``lance.dataset()`` that is opened without a session builds its own:
+    its own ``Arc<Manifest>`` holding the table's whole fragment list, its own
+    index and metadata cache budgets (6 GiB and 1 GiB each, not a shared
+    process total) and its own object-store client. A table with many fragments
+    therefore costs that much again for every concurrently open dataset, and
+    Daft opens one per scan task, per maintenance UDF instance and per writer.
+
+    Only some of those overlap inside one process, which is where the saving
+    comes from. Scan tasks and writers do: ``scantask_max_parallel`` of them run
+    in the same worker, so their manifests add up. Maintenance instances do not
+    -- Daft gives each ``daft.cls`` instance a process of its own, measured on
+    both runners -- so there the shared session keeps the cost at one manifest
+    per process rather than collapsing many. An indexed table does not change
+    that: a maintenance task's open brings in the index's metadata entry only,
+    and the index data is read once on the driver, when the commit remaps it
+    onto the new fragment ids.
+
+    Sharing one session collapses that: the manifest is a metadata-cache entry
+    keyed by (uri, version, e_tag), so every open of the snapshot the driver
+    pinned hands back a clone of the same ``Arc<Manifest>``. Measured on a
+    20k-fragment table, 64 opens cost 859 MB unshared and 6 MB shared.
+
+    Created lazily, never at import: a session carries an object-store client,
+    which must not be inherited across a fork.
+    """
+    if not _sharing_enabled():
+        # One fresh session per open, which is byte-for-byte what lance does
+        # when no session is passed at all.
+        return LanceSession()
+    global _SHARED_SESSION
+    if _SHARED_SESSION is None:
+        with _SHARED_SESSION_LOCK:
+            if _SHARED_SESSION is None:
+                _SHARED_SESSION = LanceSession()
+    return _SHARED_SESSION
+
+
+def reset_shared_session() -> None:
+    """Drop the process's shared session. For tests only."""
+    global _SHARED_SESSION
+    with _SHARED_SESSION_LOCK:
+        _SHARED_SESSION = None
 
 
 def has_namespace_params(namespace_impl: str | None, table_id: list[str] | None) -> bool:
@@ -273,14 +337,20 @@ class DatasetOpenContext:
     commit as if the table were an unmanaged uri table.
 
     This context is the serializable substitute. It deliberately excludes the
-    live dataset, the namespace client, ``serialized_manifest``, ``session``,
-    ``commit_lock`` and ``asof``:
+    live dataset, the namespace client, ``serialized_manifest``, ``session``
+    (none of which pickle usefully), ``commit_lock`` and ``asof``:
 
     * the client is rebuilt per process from the triple via the ``lru_cache``;
     * the manifest is omitted so the payload stays independent of fragment
-      count -- workers pay one pinned-manifest read instead;
+      count -- workers pay one pinned-manifest read instead, and
+      :func:`get_shared_session` makes the whole process share that one read;
     * ``asof``/tags are already resolved by the driver into :attr:`version`, so
       workers cannot drift onto a different snapshot.
+
+    Because the session is shared, :attr:`index_cache_size` and
+    :attr:`metadata_cache_size_bytes` no longer size a per-dataset cache: lance
+    ignores them once a session is supplied, and the session's own budgets
+    apply to every dataset in the process.
     """
 
     uri: str
@@ -362,6 +432,7 @@ class DatasetOpenContext:
             namespace_client=get_or_create_namespace(self.namespace_impl, self.namespace_properties),
             table_id=self.table_id,
             namespace_client_managed_versioning=self.managed_versioning,
+            session=get_shared_session(),
         )
 
     def open_pinned(self) -> lance.LanceDataset:
@@ -387,6 +458,7 @@ def open_dataset_from_open_kwargs(ds_uri: str | None, open_kwargs: dict[str, Any
     namespace_impl, namespace_properties, table_id = pop_namespace_params(open_kwargs)
     return lance.dataset(
         None if has_namespace_params(namespace_impl, table_id) else ds_uri,
+        session=get_shared_session(),
         **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
         **open_kwargs,
     )

@@ -12,6 +12,7 @@ from daft.datatype import DataType
 from daft.dependencies import pa
 from daft.series import Series
 from daft_lance._metadata import LANCE_BLOB_DESCRIPTOR_TYPE
+from daft_lance.namespace import open_dataset_from_open_kwargs
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -340,13 +341,26 @@ def read_blobs(
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
 
-    # 2. Create a UDF closure over the lance dataset so we can read the blobs. The dataset
-    #    pickles with its version and manifest, so workers read the same snapshot.
+    # 2. Create a UDF closure that reopens the pinned snapshot on the worker.
+    #    Closing over ``ds`` would pickle it, and ``LanceDataset.__reduce__``
+    #    carries the whole re-encoded manifest -- one copy of the table's entire
+    #    fragment list per task, which also bypasses the shared session's
+    #    manifest cache. The uri, version and storage options are enough.
+    uri = ds.uri
+    open_kwargs: dict[str, Any] = {"version": ds.version, "storage_options": ds._storage_options}
+    worker_ds: list[lance.LanceDataset] = []
+
+    def _worker_dataset() -> lance.LanceDataset:
+        # Opened once per worker process, then reused for every batch.
+        if not worker_ds:
+            worker_ds.append(open_dataset_from_open_kwargs(uri, open_kwargs))
+        return worker_ds[0]
+
     @daft.func.batch(return_dtype=DataType.binary(), batch_size=batch_size)
     def read_blobs_udf(row_ids: Series) -> Series:
         ids = row_ids.to_pylist()
         valid = [i for i, row_id in enumerate(ids) if row_id is not None]
-        blobs = ds.read_blobs(
+        blobs = _worker_dataset().read_blobs(
             column,
             ids=[ids[i] for i in valid],
             io_buffer_size=io_buffer_size,

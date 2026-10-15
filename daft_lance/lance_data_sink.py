@@ -30,6 +30,7 @@ from daft_lance.namespace import (
     ResolvedNamespaceTable,
     get_namespace_commit_kwargs,
     get_namespace_kwargs,
+    get_shared_session,
     get_write_fragments_kwargs,
     merge_storage_options,
     resolve_namespace_table,
@@ -209,6 +210,19 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         return get_namespace_kwargs(self._namespace_impl, self._namespace_properties, self._table_id)
 
     @property
+    def _dataset_open_kwargs(self) -> dict[str, Any]:
+        """Namespace wiring plus this process's shared lance session.
+
+        Every dataset this sink opens goes through here. Without the session
+        each open builds its own ``Arc<Manifest>`` holding the table's whole
+        fragment list, so a many-fragment table costs that again per open --
+        including the one the Rust writer does inside ``write_fragments`` on
+        every buffer flush. Commits keep using ``_namespace_commit_kwargs``:
+        ``LanceDataset.commit()`` takes no session.
+        """
+        return {"session": get_shared_session(), **self._namespace_kwargs}
+
+    @property
     def _namespace_commit_kwargs(self) -> dict[str, Any]:
         return get_namespace_commit_kwargs(
             self._namespace_impl,
@@ -347,7 +361,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         dataset: lance.LanceDataset | None
         try:
             dataset = lance.dataset(
-                self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._dataset_open_kwargs
             )
         except (ValueError, FileNotFoundError, OSError) as e:
             # Pinned to the Rust message format; lance has no typed exception. See test_lance_message_format_unchanged.
@@ -430,6 +444,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         fragments = lance.fragment.write_fragments(
             wrapped,
             dataset_uri=self._table_uri,
+            # A uri destination makes the Rust writer load the dataset on every
+            # flush; the shared session turns the repeats into cache hits.
+            session=get_shared_session(),
             mode=self._write_mode,
             storage_options=self._storage_options,
             max_rows_per_file=self._max_rows_per_file,
@@ -450,7 +467,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _ensure_mem_wal_dataset(self) -> lance.LanceDataset:
         assert self._effective_pyarrow_schema is not None, "LanceDataSink.start() must run before writes"
         try:
-            ds = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+            ds = lance.dataset(
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._dataset_open_kwargs
+            )
         except (ValueError, FileNotFoundError, OSError):
             ds = None
 
@@ -465,7 +484,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 storage_options=self._storage_options,
                 data_storage_version=self._data_storage_version,
                 use_legacy_format=self._use_legacy_format,
-                **self._namespace_kwargs,
+                **self._dataset_open_kwargs,
             )
 
         details = ds.mem_wal_index_details()
@@ -631,7 +650,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if self._checkpoint is None:
             raise RuntimeError("checking a Lance checkpoint commit requires the driver-side CheckpointStore")
         self._ensure_started()
-        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+        dataset = lance.dataset(
+            self._dataset_uri_arg, storage_options=self._storage_options, **self._dataset_open_kwargs
+        )
         return self._idempotence_key_exists(dataset)
 
     def _finalize_uncheckpointed(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
@@ -679,7 +700,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             self._dataset_uri_arg,
             version=self._version,
             storage_options=self._storage_options,
-            **self._namespace_kwargs,
+            **self._dataset_open_kwargs,
         )
         open_context = DatasetOpenContext.from_dataset(
             pinned,
@@ -701,12 +722,14 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 self._overwrite_where,
             )
             dataset = lance.dataset(
-                self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._dataset_open_kwargs
             )
         return _dataset_stats(dataset)
 
     def _finalize_mem_wal(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
-        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+        dataset = lance.dataset(
+            self._dataset_uri_arg, storage_options=self._storage_options, **self._dataset_open_kwargs
+        )
 
         if self._compact_after_write:
             logger.info(
@@ -728,7 +751,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 ),
             )
             dataset = lance.dataset(
-                self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
+                self._dataset_uri_arg, storage_options=self._storage_options, **self._dataset_open_kwargs
             )
 
         return _dataset_stats(dataset)
@@ -743,7 +766,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         assert self._checkpoint is not None
         self._ensure_started()
 
-        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+        dataset = lance.dataset(
+            self._dataset_uri_arg, storage_options=self._storage_options, **self._dataset_open_kwargs
+        )
         pending_ids = self._pending_checkpoint_ids()
 
         # Check the Lance history again at finalize time. The pre-check in

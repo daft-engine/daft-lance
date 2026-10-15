@@ -414,6 +414,51 @@ Native namespace support in `daft.read_lance` / `DataFrame.write_lance` is track
 [Eventual-Inc/Daft#7282](https://github.com/Eventual-Inc/Daft/issues/7282); until that lands,
 use the `daft_lance` entry points shown above for namespace-addressed tables.
 
+## Environment Variables
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DAFT_LANCE_NAMESPACE_CACHE_SIZE` | `16` | Size of the per-(implementation, properties) namespace client cache. Read once at import time. |
+| `DAFT_LANCE_SHARE_SESSION` | `1` | Every dataset this extension opens in a process shares one lance `Session`, so a table's manifest and lance's caches are held once instead of once per scan task, maintenance UDF and writer. Set to `0` to give each open its own session (lance's own default); on a many-fragment table that costs one copy of the fragment list per concurrently open dataset. `benchmarks/lance_session_memory.py` (`make bench`) measures the difference in a real Ray worker. |
+
+### What sharing a session actually saves, per path
+
+Measured, because the three paths differ and only one of them multiplies by
+concurrency. The numbers come from a `read_lance` -> `write_parquet` pipeline in
+a Ray worker, which is the shape this matters most in: a task holds its parquet
+writer's buffers at the same time as its manifest, so what sharing frees becomes
+headroom the writer can use.
+
+| Path | Opens per worker process | What sharing changes |
+| --- | --- | --- |
+| Scans, `read_blobs`, writes | `scantask_max_parallel` concurrent opens in one process | Collapses them to one manifest. Measured: 49 MB less resident on a 4000-fragment table at concurrency 24, and 479 MB on a 100k-fragment one at concurrency 8 -- where the pipeline also finished **9.8x sooner** (610s to 62s), because each unshared task re-parsed the same 8 MB manifest. At that scale the cost of not sharing is mostly time, not memory. |
+| Indexed (`nearest`, point lookups) | One index-driven task, whatever the concurrency | The index is loaded once per process instead of once per query. Measured at 200k rows: repeated queries 1.7-2.0x faster. |
+| Maintenance (`compact_files`, `update_columns`, `merge_columns`) | One, always | Nothing to collapse: Daft gives each `daft.cls` instance a process of its own, so a maintenance worker opens the table exactly once however high the concurrency. |
+
+An index does not change the maintenance row. A maintenance task's open brings
+in the index's metadata entry and nothing else; the index data is read once, on
+the driver, when the commit remaps every entry onto the new fragment ids. The
+tests that pin both halves down are
+`tests/io/lance/test_ray_session_memory.py::test_maintenance_instances_each_get_their_own_process`
+and
+`tests/io/lance/test_shared_session.py::test_compaction_loads_the_index_in_its_commit_not_in_its_tasks`.
+
+Two knobs keep a large table affordable without weakening any of that, because
+a manifest is the table's whole fragment list and an open costs the same
+whatever its task goes on to read: `read_lance(..., fragment_group_size=N)`
+puts several fragments in one scan task, and reading only a prefix of the table
+prunes whole fragments. At 100k fragments, reading 1% through groups of ten
+turns a billion-row scan into ten million rows and 100k tasks into a hundred,
+while each of the concurrent opens still carries the same 47 MB fragment list.
+What has to survive is the overlap: enough tasks to keep the concurrency in
+flight, which `benchmarks/lance_session_memory.py` checks rather than assumes.
+
+One caveat if you measure this yourself: a `Session` reports both `size_bytes()`
+and `index_cache_size_bytes()`, and they are not the same accounting. Only
+`size_bytes()` tracks resident memory — on a 200k-row IVF_PQ index it moves by
+about 5 MB per loaded copy, matching the process's own RSS, where
+`index_cache_size_bytes()` reads 37 MB.
+
 ## Migration
 
 The migration only requires replacing `daft.io.lance` with `daft_lance`.
