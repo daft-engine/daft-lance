@@ -15,6 +15,7 @@ from daft.schema import Schema
 
 from .lance_compaction import compact_files_internal
 from .lance_data_sink import LanceDataSink
+from .lance_fragment_validation import validate_fragments_internal
 from .lance_merge_column import merge_columns_from_df, merge_columns_internal
 from .lance_scalar_index import create_scalar_index_internal, optimize_indices_internal
 from .lance_scan import LanceScanOperator
@@ -1095,6 +1096,92 @@ def optimize_indices(
         dataset_handle.worker_open_context(),
         indices=indices,
         num_indices_to_merge=num_indices_to_merge,
+    )
+
+
+@PublicAPI
+def validate_fragments(
+    uri: str | pathlib.Path | None = None,
+    io_config: IOConfig | None = None,
+    *,
+    table_id: list[str] | None = None,
+    namespace_impl: str | None = None,
+    namespace_properties: dict[str, str] | None = None,
+    storage_options: dict[str, Any] | None = None,
+    version: int | str | None = None,
+    asof: str | None = None,
+    block_size: int | None = None,
+    index_cache_size: int | None = None,
+    metadata_cache_size_bytes: int | None = None,
+    fragment_ids: Sequence[int] | None = None,
+    concurrency: int | None = None,
+) -> DataFrame:
+    """Validate selected Lance fragments without scanning table rows.
+
+    The driver resolves one dataset version and enumerates fragment metadata;
+    Daft workers reopen that pinned snapshot and call Lance's native
+    ``LanceFragment.validate()``, which checks fragment file and metadata
+    consistency, including deletion vectors. The operation is read-only: it
+    never commits, repairs, or changes the dataset version.
+
+    Args:
+        uri: The URI of the Lance table (supports remote URLs to object stores such as `s3://` or `gs://`)
+        io_config: A custom IOConfig to use when accessing Lance data. Defaults to None.
+        table_id: Table identifier within the namespace, e.g. ["catalog", "schema", "table"].
+            Mutually exclusive with ``uri``.
+        namespace_impl: Lance Namespace implementation, e.g. "dir" or "rest".
+        namespace_properties: Properties for connecting to the namespace, e.g.
+            {"root": "/data"} for "dir" or {"uri": "http://host:port"} for "rest".
+        storage_options: Extra options for storage connection.
+        version: If specified, validate a specific version of the Lance dataset.
+        asof: If specified, validate the latest version created on or earlier than the given value.
+        block_size: Block size in bytes. Provide a hint for the size of the minimal I/O request.
+        index_cache_size: Index cache size.
+        metadata_cache_size_bytes: Size of the metadata cache in bytes.
+        fragment_ids: Optional subset of fragment IDs to validate. Every worker
+            reopens the same pinned version, so validation only covers the
+            listed fragments. Duplicates are ignored; unknown IDs and an empty
+            list raise ``ValueError``. When None, every fragment in the pinned
+            manifest is validated.
+        concurrency: Maximum number of concurrent validation tasks. Defaults
+            to Daft's runner default. Must be a positive integer.
+
+    Returns:
+        DataFrame: One row per selected fragment with the columns
+            ``version`` (Int64), ``fragment_id`` (Int64), ``valid`` (Boolean),
+            and ``error`` (String). ``error`` is null for valid fragments;
+            otherwise it holds the validation exception. A table-open or
+            authentication failure on a worker is reported with a
+            ``failed to open the dataset at version ...`` prefix so it can be
+            distinguished from detected corruption.
+
+    Raises:
+        ValueError: If ``fragment_ids`` contains IDs that are not in the
+            pinned version, or if ``concurrency`` is not positive.
+
+    Note:
+        ``LanceFragment.validate`` requires PyLance >= 11; daft-lance already
+        requires a newer PyLance (>= 12).
+    """
+    dataset_handle = construct_lance_dataset_handle(
+        uri,
+        storage_options=storage_options,
+        io_config=io_config,
+        namespace_impl=namespace_impl,
+        namespace_properties=namespace_properties,
+        table_id=table_id,
+        version=version,
+        asof=asof,
+        block_size=block_size,
+        index_cache_size=index_cache_size,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
+    )
+
+    return validate_fragments_internal(
+        dataset_handle.dataset,
+        dataset_handle.worker_open_context(),
+        fragment_ids=fragment_ids,
+        concurrency=concurrency,
     )
 
 
