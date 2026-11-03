@@ -357,6 +357,37 @@ committed and the dataset version does not move, but those unreferenced files
 stay on storage until Lance cleans them up via
 `LanceDataset.cleanup_old_versions`.
 
+### Version-Range Changes
+
+`read_lance_changes` streams the rows that changed in a version range
+`(begin_version, end_version]` as a lazy DataFrame. The Arrow reader is created
+and consumed on scan workers, and both endpoints are pinned, so a commit that
+lands after planning cannot change the result.
+
+```python
+import daft_lance
+
+inserted = daft_lance.read_lance_changes(
+    "s3://bucket/my_dataset", begin_version=10, end_version=12, mode="inserted"
+)
+updated = daft_lance.read_lance_changes(
+    "s3://bucket/my_dataset", begin_version=10, end_version=12, mode="updated"
+)
+deleted = daft_lance.read_lance_changes(
+    "s3://bucket/my_dataset", begin_version=10, end_version=12, mode="deleted"
+)
+```
+
+Inserted and updated rows carry the dataset columns followed by `_rowid`,
+`_row_created_at_version`, and `_row_last_updated_at_version`; deleted rows
+carry `_rowid` only. This is a version-range result rather than an ordered
+change log: deleted IDs are rows live at `begin_version` and absent at
+`end_version`, so rows inserted and deleted inside the range are not reported,
+and compaction that leaves row visibility unchanged is invisible. The dataset
+must use stable row ids (`enable_stable_row_ids=True`) at both endpoints unless
+the range is empty. Namespace addressing works the same way as `read_lance`
+(`table_id` + `namespace_impl` + `namespace_properties`).
+
 ### Namespace Tables
 
 Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance-namespace/)
