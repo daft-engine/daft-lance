@@ -1,13 +1,82 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
 
-from daft_lance import compact_files
+from daft_lance import compact_files, create_scalar_index, create_vector_index
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "IVF_FLAT"])
+def test_distributed_index_preserves_compaction(tmp_path: Path, index_type: str) -> None:
+    """Index segments leave adjacent small fragments mergeable."""
+    uri = str(tmp_path / "indexed_compaction.lance")
+    table = pa.table(
+        {
+            "id": range(800),
+            "value": range(800),
+            "vector": pa.array([[float(i), float(i % 7)] for i in range(800)], type=pa.list_(pa.float32(), 2)),
+        }
+    )
+    dataset = lance.write_dataset(table, uri, max_rows_per_file=100, max_rows_per_group=100)
+    assert len(dataset.get_fragments()) == 8
+
+    if index_type == "BTREE":
+        # Equivalent builds on different columns must use the same boundaries.
+        for column in ["id", "value"]:
+            create_scalar_index(
+                uri,
+                column=column,
+                index_type="BTREE",
+                name=f"{column}_idx",
+                fragment_group_size=4,
+                max_concurrency=2,
+            )
+    else:
+        create_vector_index(
+            uri,
+            column="vector",
+            index_type="IVF_FLAT",
+            name="vector_idx",
+            fragment_group_size=4,
+            max_concurrency=2,
+            num_partitions=2,
+        )
+
+    dataset = lance.dataset(uri)
+    for index in dataset.describe_indices():
+        assert sorted(sorted(segment.fragment_ids) for segment in index.segments) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+    def check_query(dataset: lance.LanceDataset) -> None:
+        if index_type == "BTREE":
+            scanner = dataset.scanner(filter="id >= 120 AND value < 130", columns=["id"])
+            assert "ScalarIndexQuery" in scanner.explain_plan()
+            expected_ids = list(range(120, 130))
+        else:
+            scanner = dataset.scanner(nearest={"column": "vector", "q": [123.0, 4.0], "k": 1}, columns=["id"])
+            assert "ANNSubIndex" in scanner.explain_plan()
+            expected_ids = [123]
+        assert sorted(cast(list[int], scanner.to_table()["id"].to_pylist())) == expected_ids
+
+    check_query(dataset)
+    metrics = compact_files(
+        uri,
+        compaction_options={"target_rows_per_fragment": 1000, "num_threads": 1},
+        partition_num=2,
+        concurrency=2,
+    )
+    assert metrics is not None
+    assert metrics.fragments_removed == 8
+    assert metrics.fragments_added == 2
+
+    dataset = lance.dataset(uri)
+    assert [fragment.count_rows() for fragment in dataset.get_fragments()] == [400, 400]
+    assert dataset.to_table().sort_by("id") == table
+    check_query(dataset)
 
 
 def create_dataset_with_fragments(path: Path, fragment_data: list[pd.DataFrame]):

@@ -720,8 +720,11 @@ def create_scalar_index(
         index_cache_size: Size of the index cache.
         default_scan_options: Default scan options for the dataset.
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
-        fragment_group_size: Number of fragments to group together in each fragment batch. If None,
-            defaults to 10. Must be a positive integer.
+        fragment_group_size: Target number of fragments per index segment. Defaults to 10;
+            must be positive. Determines the segment count as ceil(fragment_count / fragment_group_size).
+            Selected fragments are grouped in dataset order, minimizing the largest group's row count;
+            this is not a hard limit on fragments per group. Contiguous coverage preserves compaction
+            opportunities within each segment.
         num_partitions: Optional number of partitions to use when repartitioning fragment batches before execution. Only values
             greater than 1 enable additional parallelism on distributed runners; values <= 1 or None will use the default partitioning.
         max_concurrency: Maximum number of concurrent tasks to use for processing fragment batches.
@@ -915,8 +918,11 @@ def create_vector_index(
         index_cache_size: Size of the index cache.
         default_scan_options: Default scan options.
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
-        fragment_group_size: Number of fragments grouped per worker task. If None,
-            defaults to 10. Each group becomes one independently built index segment.
+        fragment_group_size: Target number of fragments per index segment. Defaults to 10;
+            must be positive. Determines the segment count as ceil(fragment_count / fragment_group_size).
+            Contiguous groups in dataset order minimize the largest group's row count;
+            this is not a hard limit on fragments per group. Each group becomes one independently
+            built segment, preserving compaction opportunities within that segment.
         max_concurrency: Maximum number of concurrent tasks for fragment batches.
             If None, Daft uses its default concurrency setting.
         **kwargs: Additional keyword arguments forwarded to Lance's index segment

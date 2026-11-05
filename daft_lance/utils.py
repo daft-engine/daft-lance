@@ -89,7 +89,13 @@ class LanceDatasetHandle:
 
 
 def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int) -> list[dict[str, list[int]]]:
-    """Distribute fragments across workers using a balanced algorithm considering fragment sizes."""
+    """Partition fragments in input order into contiguous, row-balanced groups.
+
+    The group count is ceil(fragment_count / fragment_group_size).
+    Minimize the maximum row count within that count, preserving adjacency so
+    index segment coverage leaves small adjacent fragments mergeable. Identical
+    inputs produce identical boundaries, including across different columns.
+    """
     if fragment_group_size <= 0:
         raise ValueError("fragment_group_size must be a positive integer")
 
@@ -104,33 +110,44 @@ def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int
             row_count = fragment.count_rows()
             fragment_info.append({"id": fragment.fragment_id, "size": row_count})
         except Exception as e:
-            # If we can't get size info, use fragment_id as a fallback
             logger.warning(
-                "Could not get size for fragment %s: %s. Using fragment_id as size estimate.",
+                "Could not get size for fragment %s: %s. Using 1 as size estimate.",
                 fragment.fragment_id,
                 e,
             )
-            fragment_info.append({"id": fragment.fragment_id, "size": fragment.fragment_id})
+            fragment_info.append({"id": fragment.fragment_id, "size": 1})
 
-    # Sort fragments by size in descending order (largest first)
-    # This helps with better load balancing using the greedy algorithm
-    fragment_info.sort(key=lambda x: x["size"], reverse=True)
-
-    # Initialize fragment groups for each worker
-    fragment_group_list: list[list[int]] = [[] for _ in range(num_groups)]
-    group_size_list = [0] * num_groups
-
-    # Greedy assignment: assign each fragment to the worker with minimum workload
-    for frag_info in fragment_info:
-        # Find the worker with the minimum current workload
-        min_workload_idx = min(range(num_groups), key=lambda i: group_size_list[i])
-
-        # Assign fragment to this worker
-        fragment_group_list[min_workload_idx].append(frag_info["id"])
-        group_size_list[min_workload_idx] += frag_info["size"]
-
-    # Log distribution statistics for debugging
     total_size = sum(frag_info["size"] for frag_info in fragment_info)
+    # Binary search the smallest feasible maximum workload for contiguous groups.
+    lower = max(max(info["size"] for info in fragment_info), (total_size + num_groups - 1) // num_groups)
+    upper = total_size
+    while lower < upper:
+        limit = (lower + upper) // 2
+        groups_needed = 1
+        workload = 0
+        for info in fragment_info:
+            if workload + info["size"] > limit:
+                groups_needed += 1
+                workload = 0
+            workload += info["size"]
+        if groups_needed <= num_groups:
+            upper = limit
+        else:
+            lower = limit + 1
+
+    fragment_group_list: list[list[int]] = [[]]
+    group_size_list = [0]
+    for i, info in enumerate(fragment_info):
+        # Reserve a fragment for each remaining group, even for zero-row inputs.
+        if fragment_group_list[-1] and (
+            group_size_list[-1] + info["size"] > lower
+            or len(fragment_info) - i == num_groups - len(fragment_group_list)
+        ):
+            fragment_group_list.append([])
+            group_size_list.append(0)
+        fragment_group_list[-1].append(info["id"])
+        group_size_list[-1] += info["size"]
+
     logger.info(
         "Fragment distribution statistics: Total fragments=%d, Total size=%d, Fragment group size=%d, the num of Fragment group=%d",
         len(fragment_info),
@@ -149,10 +166,7 @@ def distribute_fragments_balanced(fragments: list[Any], fragment_group_size: int
             percentage,
         )
 
-    # Filter out empty batches (shouldn't happen with proper input validation)
-    non_empty_batches = [{"fragment_ids": batch} for batch in fragment_group_list if batch]
-
-    return non_empty_batches
+    return [{"fragment_ids": batch} for batch in fragment_group_list]
 
 
 def construct_lance_dataset_handle(
