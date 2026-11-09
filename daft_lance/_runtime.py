@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import json
 import os
-from collections import OrderedDict
-from collections.abc import Callable, Hashable
-from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Lock, Thread
 from time import monotonic
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import lance
 
@@ -21,108 +17,12 @@ from lance_namespace import LanceNamespace
 if TYPE_CHECKING:
     from lance.commit import CommitLock
 
-T = TypeVar("T")
-
-
-class _Cache(Generic[T]):
-    def __init__(self) -> None:
-        self.lock = Lock()
-        self.entries: OrderedDict[Hashable, tuple[T, float]] = OrderedDict()
-        self.pending: dict[Hashable, Future[T]] = {}
-        self.generation = 0
-
-    def expire(self) -> None:
-        released = []
-        with self.lock:
-            now = monotonic()
-            for key, (_, deadline) in list(self.entries.items()):
-                if deadline <= now:
-                    released.append(self.entries.pop(key))
-        # Drop native references outside the lock.
-        released.clear()
-
-    def clear(self) -> None:
-        with self.lock:
-            released = self.entries
-            self.entries = OrderedDict()
-            self.pending = {}
-            self.generation += 1
-        released.clear()
-
-    def get(self, key: Hashable, load: Callable[[], T], capacity: int, ttl: int) -> T:
-        _start_reaper()
-        self.expire()
-        with self.lock:
-            if key in self.entries:
-                value, _ = self.entries[key]
-                self.entries[key] = (value, monotonic() + ttl)
-                self.entries.move_to_end(key)
-                return value
-            future = self.pending.get(key)
-            owner = future is None
-            if future is None:
-                future = Future()
-                self.pending[key] = future
-            generation = self.generation
-        if not owner:
-            return future.result()
-        try:
-            value = load()
-        except BaseException as error:
-            with self.lock:
-                if self.pending.get(key) is future:
-                    del self.pending[key]
-            future.set_exception(error)
-            raise
-        released = []
-        with self.lock:
-            if generation == self.generation:
-                self.entries[key] = (value, monotonic() + ttl)
-                self.entries.move_to_end(key)
-                while len(self.entries) > capacity:
-                    released.append(self.entries.popitem(last=False))
-            if self.pending.get(key) is future:
-                del self.pending[key]
-        future.set_result(value)
-        released.clear()
-        return value
-
-
-_session_cache: _Cache[tuple[Session, LanceNamespace | None]] = _Cache()
-_reaper_lock = Lock()
+DatasetUri = str | Path | None
+_session: Session | None = None
+_configuration: tuple[int | None, int | None] | None = None
+_deadline = 0.0
+_session_lock = Lock()
 _reaper: Thread | None = None
-
-
-def _start_reaper() -> None:
-    global _reaper
-    with _reaper_lock:
-        if _reaper is None:
-
-            def sweep() -> None:
-                from time import sleep
-
-                while True:
-                    sleep(30)
-                    _session_cache.expire()
-
-            _reaper = Thread(target=sweep, name="daft-lance-cache-cleanup", daemon=True)
-            _reaper.start()
-
-
-def clear_caches() -> None:
-    """Release pooled Session references without closing active operations."""
-    _session_cache.clear()
-
-
-def _reset_after_fork() -> None:
-    global _session_cache, _reaper_lock, _reaper
-    _session_cache = _Cache()
-    _reaper_lock = Lock()
-    _reaper = None
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 class CacheConfigurationError(ValueError):
@@ -142,59 +42,94 @@ def _env_integer(name: str, default: int | None = None, *, minimum: int = 0) -> 
     return value
 
 
-def _retention() -> int:
-    ttl = _env_integer("DAFT_LANCE_CACHE_TTL_SECONDS", 300, minimum=1)
-    assert ttl is not None
-    return ttl
+def _expire_session() -> None:
+    global _session
+    released = None
+    with _session_lock:
+        if _session is not None and _deadline <= monotonic():
+            released, _session = _session, None
+    del released
 
 
-DatasetUri = str | Path | None
+def _sweep() -> None:
+    from time import sleep
+
+    while True:
+        sleep(30)
+        _expire_session()
+
+
+def clear_caches() -> None:
+    """Release the global Session and configuration; active operations retain it."""
+    global _session, _configuration
+    with _session_lock:
+        released, _session = _session, None
+        _configuration = None
+    del released
+
+
+def _reset_after_fork() -> None:
+    global _session, _configuration, _session_lock, _reaper, _deadline
+    _session = None
+    _configuration = None
+    _session_lock = Lock()
+    _reaper = None
+    _deadline = 0.0
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 def shared_session(
-    uri: DatasetUri,
     *,
-    storage_options: dict[str, str] | None = None,
-    base_store_params: dict[str, dict[str, str]] | None = None,
-    namespace_client: LanceNamespace | None = None,
-    table_id: list[str] | None = None,
     index_cache_size: int | None = None,
     index_cache_size_bytes: int | None = None,
     metadata_cache_size_bytes: int | None = None,
 ) -> Session:
-    """Reuse caches for the same destination, credentials and cache configuration.
+    """One automatically managed Session per process, shared by all tables.
 
-    Version is deliberately absent: Lance keys immutable metadata by version.
-    Retain the namespace client alongside the session so its identity cannot be
-    reused while the cache entry is alive. No credentials are logged.
+    The first call establishes process-wide capacities. Later unspecified sizes
+    reuse them; conflicting explicit sizes raise instead of being
+    silently ignored. Idle expiration keeps the configuration for the next open.
     """
+    global _session, _configuration, _deadline, _reaper
     index_bytes = index_cache_size_bytes
     if index_bytes is None and index_cache_size is not None:
-        # Match pylance's deprecated entry-count conversion.
         index_bytes = index_cache_size * 20 * 1024 * 1024
     metadata_bytes = metadata_cache_size_bytes
-    if index_bytes is None:
-        index_bytes = _env_integer("DAFT_LANCE_INDEX_CACHE_SIZE_BYTES")
-    if metadata_bytes is None:
-        metadata_bytes = _env_integer("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES")
-    client = namespace_client
-    key = (
-        os.getpid(),
-        None if client is not None and table_id is not None else str(uri),
-        json.dumps(storage_options, sort_keys=True),
-        json.dumps(base_store_params, sort_keys=True),
-        id(client),
-        tuple(table_id or ()),
-        index_bytes,
-        metadata_bytes,
-    )
-    ttl = _retention()
-    return _session_cache.get(
-        key,
-        lambda: (Session(index_cache_size_bytes=index_bytes, metadata_cache_size_bytes=metadata_bytes), client),
-        16,
-        ttl,
-    )[0]
+    for name, value in (("index_cache_size_bytes", index_bytes), ("metadata_cache_size_bytes", metadata_bytes)):
+        if value is not None and value < 0:
+            raise CacheConfigurationError(f"{name}={value!r}: expected a nonnegative integer")
+    ttl = _env_integer("DAFT_LANCE_CACHE_TTL_SECONDS", 300, minimum=1)
+    assert ttl is not None
+    with _session_lock:
+        if _configuration is not None:
+            for name, requested, configured in zip(
+                ("index_cache_size_bytes", "metadata_cache_size_bytes"),
+                (index_bytes, metadata_bytes),
+                _configuration,
+            ):
+                if requested is not None and requested != configured:
+                    raise CacheConfigurationError(
+                        f"{name}={requested}: global Session already configured with {configured!r} "
+                        "(None means Lance default); use consistent process-wide cache sizes"
+                    )
+            index_bytes, metadata_bytes = _configuration
+        if _configuration is None:
+            if index_bytes is None:
+                index_bytes = _env_integer("DAFT_LANCE_INDEX_CACHE_SIZE_BYTES")
+            if metadata_bytes is None:
+                metadata_bytes = _env_integer("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES")
+        if _session is None:
+            # Only Session creation is locked; dataset/network operations run outside.
+            _session = Session(index_cache_size_bytes=index_bytes, metadata_cache_size_bytes=metadata_bytes)
+            _configuration = (index_bytes, metadata_bytes)
+        _deadline = monotonic() + ttl
+        if _reaper is None:
+            _reaper = Thread(target=_sweep, name="daft-lance-cache-cleanup", daemon=True)
+            _reaper.start()
+        return _session
 
 
 @dataclass(frozen=True)
@@ -216,15 +151,10 @@ class DatasetOpenOptions:
     table_id: list[str] | None = None
     base_store_params: dict[str, dict[str, str]] | None = None
 
-    def resolve_session(self, uri: DatasetUri) -> Session:
+    def resolve_session(self) -> Session:
         if self.session is not None:
             return self.session
         return shared_session(
-            uri,
-            storage_options=self.storage_options,
-            base_store_params=self.base_store_params,
-            namespace_client=self.namespace_client,
-            table_id=self.table_id,
             index_cache_size=self.index_cache_size,
             index_cache_size_bytes=self.index_cache_size_bytes,
             metadata_cache_size_bytes=self.metadata_cache_size_bytes,
@@ -245,7 +175,7 @@ def open_dataset(uri: DatasetUri, options: DatasetOpenOptions | None = None) -> 
         metadata_cache_size_bytes=options.metadata_cache_size_bytes,
         index_cache_size_bytes=options.index_cache_size_bytes,
         read_params=options.read_params,
-        session=options.resolve_session(uri),
+        session=options.resolve_session(),
         namespace_client=options.namespace_client,
         table_id=options.table_id,
         base_store_params=options.base_store_params,

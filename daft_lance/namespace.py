@@ -356,10 +356,6 @@ class DatasetOpenContext:
         return lance.LanceDataset(
             self.uri,
             session=shared_session(
-                self.uri,
-                storage_options=self.storage_options,
-                namespace_client=get_or_create_namespace(self.namespace_impl, self.namespace_properties),
-                table_id=self.table_id,
                 index_cache_size=self.index_cache_size,
                 metadata_cache_size_bytes=self.metadata_cache_size_bytes,
             ),

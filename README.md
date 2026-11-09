@@ -416,14 +416,10 @@ use the `daft_lance` entry points shown above for namespace-addressed tables.
 
 ### Shared Lance caches
 
-Daft-Lance reuses Lance Sessions within each process for dataset opens and
-`write_fragments` calls, including repeated batches written by a sink. Tasks
-carry serializable open arguments; native Sessions are created in the worker.
-The pool retains up to 16 Sessions, separated by destination, storage options,
-namespace client/table identity, and cache sizes. Namespace addressing and
-physical-URI addressing share a Session when they carry the same namespace
-identity. Eviction releases the pool's reference; active operations retain
-their Session.
+Daft-Lance lazily creates one automatically managed Lance Session per process,
+shared by all tables for dataset opens and `write_fragments` calls. Tasks carry
+serializable open arguments; the native Session is created in the worker.
+Dataset and network operations run outside the Session initialization lock.
 
 Configure cache capacities in bytes in the driver and worker environments:
 
@@ -432,15 +428,21 @@ export DAFT_LANCE_METADATA_CACHE_SIZE_BYTES=1073741824
 export DAFT_LANCE_INDEX_CACHE_SIZE_BYTES=268435456
 ```
 
-Explicit read cache sizes take precedence over these environment defaults.
-Without either, Lance chooses its default capacities. Existing
-`index_cache_size` values retain pylance's conversion of 20 MiB per entry.
-Explicit Sessions retain their existing behavior.
+The first Session initialization fixes the process-wide capacities: explicit
+read sizes take precedence over environment defaults, then Lance defaults.
+Later calls without explicit sizes use these fixed capacities; conflicting
+explicit sizes fail clearly instead of being silently ignored. Set the same
+capacity environment variables in driver and workers before first use. Capacity
+environment changes require restarting the process or calling the internal
+`clear_caches()` helper. Legacy `index_cache_size` uses pylance's conversion of
+20 MiB per entry. Explicit externally supplied Sessions are preserved.
 
-These capacities apply per Session, not per cluster or node. Multiple workers
-and cache scopes multiply the memory budget. Cached metadata remains subject
-to Lance's cache admission and versioning rules; cache reuse does not eliminate
-the first manifest load in each worker.
+Capacities are shared across tables within a process, not multiplied per table.
+Each worker has its own budget. All users of the global Session must agree that
+a URI identifies the same dataset; identical URIs addressing different data on
+different endpoints require separate processes or explicitly isolated Sessions.
+Storage options and namespace credentials continue to be passed to each open
+and write operation.
 
 Each operation opens its own Dataset while reusing a Session. There is no
 Dataset cache or special handling for V1 manifest naming. Manifest and index
@@ -451,14 +453,14 @@ metadata-reuse path uses V2 manifest naming.
 seconds) and requires a positive integer. Byte capacities require nonnegative
 integers. Invalid settings report the variable name and value.
 
-A process-local daemon sweeps idle Sessions every 30 seconds, including when
-the worker receives no further requests. Entries can therefore remain for up to
-TTL plus one sweep interval. Eviction, expiration, and the internal
-`clear_caches()` helper release pooled references without closing objects held
-by active tasks. Native allocators may retain memory after references are
-released, so TTL is not an RSS limit. Session capacity is 16 per worker;
-concurrent creation of the same Session is coalesced without serializing
-unrelated Session creation.
+A process-local daemon sweeps the global Session every 30 seconds, including
+when the worker receives no further requests. An idle Session can remain for
+up to TTL plus one sweep interval. Cleanup drops the global reference without
+closing handles held by active tasks. A later open recreates the Session with
+the same fixed capacities; explicit `clear_caches()` also resets configuration.
+Fork resets the Session, configuration, lock, and cleanup thread. Native
+allocators may retain memory after references are released, so TTL is not an
+RSS limit. There is no Session LRU pool or per-key Future.
 
 Worker reads retain their pinned version, while operations opening latest
 still resolve the current version.

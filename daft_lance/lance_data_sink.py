@@ -431,11 +431,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         wrapped = self._blob.wrap_table(table)
         fragments = lance.fragment.write_fragments(
             wrapped,
-            session=shared_session(
-                self._table_uri,
-                storage_options=self._storage_options,
-                **get_write_fragments_kwargs(self._namespace_impl, self._namespace_properties, self._table_id),
-            ),
+            session=shared_session(),
             dataset_uri=self._table_uri,
             mode=self._write_mode,
             storage_options=self._storage_options,

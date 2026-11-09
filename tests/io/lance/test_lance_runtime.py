@@ -5,11 +5,19 @@ from concurrent.futures import ThreadPoolExecutor
 
 import lance
 import pyarrow as pa
+import pytest
 
-from daft_lance._runtime import DatasetOpenOptions, open_dataset, shared_session
+from daft_lance._runtime import CacheConfigurationError, DatasetOpenOptions, clear_caches, open_dataset, shared_session
 from daft_lance.lance_data_sink import LanceDataSink
 from daft_lance.namespace import open_dataset_from_open_kwargs
 from daft_lance.utils import construct_lance_dataset_handle
+
+
+@pytest.fixture(autouse=True)
+def reset_global_session():
+    clear_caches()
+    yield
+    clear_caches()
 
 
 def test_concurrent_opens_share_session_and_keep_snapshot(tmp_path):
@@ -29,20 +37,22 @@ def test_concurrent_opens_share_session_and_keep_snapshot(tmp_path):
     assert open_dataset(uri).to_table().to_pydict() == {"a": [99]}
 
 
-def test_cache_scope_and_capacity(tmp_path, monkeypatch):
-    uri = str(tmp_path / "scope")
-    first = shared_session(uri, storage_options={"region": "a", "endpoint": "b"})
-    assert first.is_same_as(shared_session(uri, storage_options={"endpoint": "b", "region": "a"}))
-    assert not first.is_same_as(shared_session(uri, storage_options={"region": "other"}))
-    assert not first.is_same_as(shared_session(uri, metadata_cache_size_bytes=1024))
+def test_global_session_capacity(tmp_path, monkeypatch):
     monkeypatch.setenv("DAFT_LANCE_INDEX_CACHE_SIZE_BYTES", "1048576")
-    configured = shared_session(uri)
-    assert configured.is_same_as(shared_session(uri, index_cache_size_bytes=1048576))
-    assert not configured.is_same_as(shared_session(uri, index_cache_size_bytes=2097152))
-    # Keep pylance's public entry-count option equivalent to its byte option.
-    assert shared_session(uri, index_cache_size=1).is_same_as(
-        shared_session(uri, index_cache_size_bytes=20 * 1024 * 1024)
-    )
+    first = shared_session()
+    assert first.is_same_as(shared_session(index_cache_size_bytes=1048576))
+    with pytest.raises(CacheConfigurationError, match="global Session already configured"):
+        shared_session(index_cache_size_bytes=2097152)
+    clear_caches()
+    assert shared_session(index_cache_size=1).is_same_as(shared_session(index_cache_size_bytes=20 * 1024 * 1024))
+    clear_caches()
+    datasets = []
+    for i in range(2):
+        uri = str(tmp_path / f"table-{i}")
+        lance.write_dataset(pa.table({"a": [i]}), uri)
+        datasets.append(open_dataset(uri))
+    assert datasets[0].session().is_same_as(datasets[1].session())
+    assert [ds.to_table()["a"].to_pylist() for ds in datasets] == [[0], [1]]
 
 
 def test_fragment_writes_share_worker_session_without_serializing_it(tmp_path, monkeypatch):
