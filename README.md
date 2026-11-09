@@ -107,18 +107,20 @@ returns the updated dataset; for a distributed rebuild use
 ### Vector Indexing
 
 Vector indexes (`IVF_FLAT`, `IVF_PQ`, `IVF_SQ`, `IVF_HNSW_FLAT`,
-`IVF_HNSW_PQ`, `IVF_HNSW_SQ`) are built distributed in three phases: the
+`IVF_HNSW_PQ`, `IVF_HNSW_SQ`, `IVF_RQ`) are built distributed in three phases: the
 driver trains the global model once — IVF centroids (and the PQ codebook for
 PQ variants) via pylance's `IndicesBuilder` — then Daft workers each build one
 uncommitted index segment for their fragment batch with the shared model, and
 the coordinator commits all segments atomically. Segments built against the
-same centroids and codebook commit as one logical index.
+same shared model commit as one logical index. IVF_RQ also generates one shared
+RaBitQ rotation model on the coordinator and uses it in every segment.
 
 ```python
 from daft_lance import create_vector_index
 
 create_vector_index("s3://bucket/my_dataset", column="vector", index_type="IVF_PQ", num_partitions=16)
 create_vector_index("s3://bucket/my_dataset", column="embedding", index_type="IVF_FLAT", metric="cosine")
+create_vector_index("s3://bucket/my_dataset", column="vector", index_type="IVF_RQ", num_partitions=16)
 ```
 
 `replace` defaults to `False`, matching pylance's `create_index` — which,
@@ -161,6 +163,13 @@ The coordinator always trains the shared IVF centroids and, for PQ types,
 the shared codebook; user-supplied models and `ivf_centroids_file` are not supported.
 PQ builds retain `num_bits` (default 8; 4 and 8 are supported by Lance). The same
 bit width is used for shared codebook training and every segment build.
+For IVF_RQ, `num_bits` defaults to 1 bit per vector dimension. The vector dimension
+must be divisible by 8; Lance validates supported configurations. The shared
+rotation model lets independently built RQ segments use consistent encoding and
+be merged by `optimize_indices`. `rabitq_model` is managed internally and cannot
+be supplied by callers. Omitting `num_bits` preserves the existing 8-bit PQ default.
+RQ is lossy: query recall depends on bit width and data. Use Lance nearest-query
+`refine_factor` to fetch more candidates and rerank them using original vectors.
 
 Training `sample_rate` is a multiplier, not a percentage: for example,
 4 IVF partitions and `sample_rate=32` require 128 rows; 8-bit PQ requires
@@ -220,6 +229,86 @@ later re-run, so callers should filter the input first when they need idempotent
 
 ### Column Updates
 
+Use a row-preserving transform to overwrite existing columns directly from the
+current Lance snapshot. `where` is evaluated before the transform, and Daft
+distributes work by fragment without grouping a user DataFrame:
+
+```python
+from daft_lance import update_columns
+
+result = update_columns(
+    "s3://bucket/my_dataset",
+    transform={"score": "raw_score * weight", "status": "'processed'"},
+    where="date >= DATE '2026-07-01'",
+)
+print(result.version, result.rows_updated)
+```
+
+`BatchUDF` transforms infer update columns from `output_schema`; use
+`read_columns` to restrict the source columns supplied to the UDF:
+
+```python
+import lance
+import pyarrow as pa
+from daft_lance import update_columns
+
+@lance.batch_udf(output_schema=pa.schema([pa.field("score", pa.int64())]))
+def compute_score(batch: pa.RecordBatch) -> pa.RecordBatch:
+    score = pa.compute.multiply(batch.column("raw_score"), batch.column("multiplier"))
+    return pa.record_batch([score], names=["score"])
+
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=compute_score,
+    where="status = 'new'",
+    read_columns=["raw_score", "multiplier"],
+)
+```
+
+Regular Python callables receive Arrow record batches after filtering. They
+must declare `columns`, and return exactly those existing columns with the same
+row count and order:
+
+```python
+import pyarrow as pa
+from daft_lance import update_columns
+
+def compute_average(batch: pa.RecordBatch) -> pa.RecordBatch:
+    average = pa.compute.divide(batch.column("total"), batch.column("count"))
+    return pa.record_batch([average], names=["average"])
+
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=compute_average,
+    columns=["average"],
+    read_columns=["total", "count"],
+    batch_size=8192,
+)
+```
+
+For a GPU-backed version of the callable above, request resources for each
+Daft transform worker. The actual worker count remains bounded by Ray's
+available resources. Include custom `ray_options` only when the Ray cluster
+advertises the named resource:
+
+```python
+update_columns(
+    "s3://bucket/my_dataset",
+    transform=compute_average,
+    columns=["average"],
+    read_columns=["total", "count"],
+    gpus=1,
+    cpus=2,
+    use_process=True,
+    max_concurrency=8,
+    ray_options={"resources": {"gpu_type_a10": 0.001}},
+)
+```
+
+`cpus=None`, `gpus=0`, `use_process=None`, and `ray_options=None` preserve
+Daft's defaults. These options apply only to transform workers; they are not
+needed by `update_columns_df`, whose input values have already been computed.
+
 Use a prepared Daft DataFrame to overwrite existing Lance columns while
 preserving row addresses and untouched column files:
 
@@ -253,14 +342,14 @@ left-outer join on `_rowaddr` and both failures are expressible in it: an
 address matching no live row updates nothing, and a repeated address updates
 its row once with one of the submitted values, chosen by row order rather than
 by any rule. Both are silent, and both still count towards `rows_updated`.
-Read the source from the snapshot you are updating (pass the same `version` if
-you pin one) rather than replaying an address list produced against an older
-snapshot, and make sure an upstream join cannot fan a row address out. The
-update itself is committed atomically using Lance `RewriteColumns`.
+Read the source immediately before updating rather than replaying an address
+list produced against an older snapshot, and make sure an upstream join cannot
+fan a row address out. The update itself is committed atomically using Lance
+`RewriteColumns`.
 
-Stable-row-ID datasets are rejected before any fragments are written because
-current pylance bindings cannot propagate the offsets required to advance
-`_row_last_updated_at_version` and keep CDF metadata correct.
+Stable-row-ID datasets are supported: each fragment rewrite propagates its
+matched physical offsets so Lance updates `_row_last_updated_at_version` and
+CDF metadata only for rows that actually changed.
 
 Fragments are rewritten in parallel, so a per-fragment failure can surface
 after other fragments have already written their new column files. Nothing is
@@ -274,7 +363,7 @@ Address Lance tables through a [Lance Namespace](https://lancedb.github.io/lance
 (catalog) instead of a raw URI. Pass `namespace_impl` + `namespace_properties` + `table_id`
 in place of `uri` — the namespace resolves the table's storage location and vends any storage
 credentials. This works across `read_lance`, `write_lance`, `merge_columns_df`,
-`update_columns_df`, `create_scalar_index`, and `compact_files`.
+`update_columns`, `update_columns_df`, `create_scalar_index`, and `compact_files`.
 
 ```python
 import daft
@@ -334,6 +423,9 @@ use the `daft_lance` entry points shown above for namespace-addressed tables.
 
 ### What sharing a session actually saves, per path
 
+The performance numbers below are from the original PR measurements; the
+implementation update did not rerun the large-table benchmark.
+
 Measured, because the three paths differ and only one of them multiplies by
 concurrency. The numbers come from a `read_lance` -> `write_parquet` pipeline in
 a Ray worker, which is the shape this matters most in: a task holds its parquet
@@ -369,6 +461,60 @@ and `index_cache_size_bytes()`, and they are not the same accounting. Only
 `size_bytes()` tracks resident memory — on a 200k-row IVF_PQ index it moves by
 about 5 MB per loaded copy, matching the process's own RSS, where
 `index_cache_size_bytes()` reads 37 MB.
+
+
+### Shared Lance caches
+
+Daft-Lance lazily creates one automatically managed Lance Session per process,
+shared by all tables for dataset opens and `write_fragments` calls. Tasks carry
+serializable open arguments; the native Session is created in the worker.
+Dataset and network operations run outside the Session initialization lock.
+Set `DAFT_LANCE_SHARE_SESSION=0` (also `false` or `no`) to disable sharing
+across all opens and fragment writes; each call then receives a fresh Session.
+
+Configure cache capacities in bytes in the driver and worker environments:
+
+```bash
+export DAFT_LANCE_METADATA_CACHE_SIZE_BYTES=1073741824
+export DAFT_LANCE_INDEX_CACHE_SIZE_BYTES=268435456
+```
+
+The first Session initialization fixes the process-wide capacities: explicit
+read sizes take precedence over environment defaults, then Lance defaults.
+Later calls without explicit sizes use these fixed capacities; conflicting
+explicit sizes fail clearly instead of being silently ignored. Set the same
+capacity environment variables in driver and workers before first use. Capacity
+environment changes require restarting the process or calling the internal
+`clear_caches()` helper. Legacy `index_cache_size` uses pylance's conversion of
+20 MiB per entry. Explicit externally supplied Sessions are preserved.
+
+Capacities are shared across tables within a process, not multiplied per table.
+Each worker has its own budget. All users of the global Session must agree that
+a URI identifies the same dataset; identical URIs addressing different data on
+different endpoints require separate processes or explicitly isolated Sessions.
+Storage options and namespace credentials continue to be passed to each open
+and write operation.
+
+Each operation opens its own Dataset while reusing a Session. There is no
+Dataset cache or special handling for V1 manifest naming. Manifest and index
+cache admission, identity, and eviction are managed by Lance itself; the intended
+metadata-reuse path uses V2 manifest naming.
+
+`DAFT_LANCE_CACHE_TTL_SECONDS` controls idle Session retention (default 300
+seconds) and requires a positive integer. Byte capacities require nonnegative
+integers. Invalid settings report the variable name and value.
+
+A process-local daemon sweeps the global Session every 30 seconds, including
+when the worker receives no further requests. An idle Session can remain for
+up to TTL plus one sweep interval. Cleanup drops the global reference without
+closing handles held by active tasks. A later open recreates the Session with
+the same fixed capacities; explicit `clear_caches()` also resets configuration.
+Fork resets the Session, configuration, lock, and cleanup thread. Native
+allocators may retain memory after references are released, so TTL is not an
+RSS limit. There is no Session LRU pool or per-key Future.
+
+Worker reads retain their pinned version, while operations opening latest
+still resolve the current version.
 
 ## Migration
 

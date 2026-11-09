@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+import inspect
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,6 +11,7 @@ import pytest
 
 import daft
 import daft_lance
+import daft_lance.lance_update_column as update_column
 from daft.dependencies import pa
 from daft_lance.lance_update_column import _FragmentUpdateHandler
 
@@ -29,6 +31,240 @@ def _read_update_source(path: str) -> daft.DataFrame:
         default_scan_options={"with_row_address": True},
         include_fragment_id=True,
     )
+
+
+def test_update_columns_public_api_parameters() -> None:
+    for operation in [daft_lance.update_columns, daft_lance.update_columns_df]:
+        parameters = inspect.signature(cast(Callable[..., Any], operation)).parameters
+        assert "version" not in parameters
+        assert "asof" not in parameters
+        assert "default_scan_options" not in parameters
+
+    transform_parameters = inspect.signature(daft_lance.update_columns).parameters
+    assert {"cpus", "gpus", "use_process", "ray_options"} <= set(transform_parameters)
+    assert transform_parameters["cpus"].default is None
+    assert transform_parameters["gpus"].default == 0
+    assert transform_parameters["use_process"].default is None
+    assert transform_parameters["ray_options"].default is None
+
+    dataframe_parameters = inspect.signature(daft_lance.update_columns_df).parameters
+    assert {"cpus", "gpus", "use_process", "ray_options"}.isdisjoint(dataframe_parameters)
+
+
+def test_transform_handler_forwards_resource_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+    open_context = object()
+    transform = {"value": "value + 1"}
+
+    def fake_cls(class_: type, **kwargs: Any) -> Callable[..., dict[str, Any]]:
+        captured["class"] = class_
+        captured.update(kwargs)
+        return lambda *args: {"args": args}
+
+    monkeypatch.setattr(daft, "cls", fake_cls)
+
+    handler = update_column._make_transform_update_handler(
+        cast(Any, open_context),
+        transform,
+        ["value"],
+        ["value"],
+        "id > 0",
+        128,
+        cpus=2,
+        gpus=1,
+        use_process=True,
+        max_concurrency=4,
+        ray_options={"resources": {"gpu_type_a10": 0.001}},
+    )
+
+    assert captured == {
+        "class": update_column._FragmentTransformUpdateHandler,
+        "cpus": 2,
+        "gpus": 1,
+        "use_process": True,
+        "max_concurrency": 4,
+        "ray_options": {"resources": {"gpu_type_a10": 0.001}},
+    }
+    assert handler["args"] == (open_context, transform, ["value"], ["value"], "id > 0", 128)
+
+
+def test_update_columns_sql_transform_with_where(tmp_path: Path) -> None:
+    path = str(tmp_path / "transform-where.lance")
+    daft.from_pydict(
+        {"id": list(range(6)), "value": [value * 10 for value in range(6)], "score": list(range(6))}
+    ).write_lance(path, max_rows_per_file=2)
+    before_version = lance.dataset(path).version
+    before_files = _fragment_files(path)
+
+    result = daft_lance.update_columns(
+        path,
+        transform={"value": "value + 100", "score": "score * 2"},
+        where="id >= 2 AND id < 4",
+        max_concurrency=2,
+    )
+
+    assert result == daft_lance.UpdateColumnsResult(version=before_version + 1, rows_updated=2)
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict() == {
+        "id": list(range(6)),
+        "value": [0, 10, 120, 130, 40, 50],
+        "score": [0, 1, 4, 6, 4, 5],
+    }
+    after_files = _fragment_files(path)
+    assert {fragment_id for fragment_id in before_files if before_files[fragment_id] != after_files[fragment_id]} == {1}
+
+
+def test_update_columns_callable_receives_only_filtered_rows(tmp_path: Path) -> None:
+    path = str(tmp_path / "callable-where.lance")
+    daft.from_pydict({"id": [1, 2, 3], "value": [10, 20, 30]}).write_lance(path)
+
+    def transform(batch: pa.RecordBatch) -> pa.RecordBatch:
+        assert batch.schema.names == ["id", "value"]
+        assert all(value is not None and value >= 2 for value in batch.column("id").to_pylist())
+        return pa.record_batch([pa.compute.multiply(batch.column("value"), 10)], names=["value"])
+
+    result = daft_lance.update_columns(
+        path,
+        transform=transform,
+        columns=["value"],
+        read_columns=["id", "value"],
+        where="id >= 2",
+        batch_size=1,
+    )
+
+    assert result.rows_updated == 2
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3],
+        "value": [10, 200, 300],
+    }
+
+
+def test_update_columns_batch_udf_infers_columns(tmp_path: Path) -> None:
+    path = str(tmp_path / "batch-udf.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
+
+    @lance.batch_udf(output_schema=pa.schema([pa.field("value", pa.int64())]))
+    def transform(batch: pa.RecordBatch) -> pa.RecordBatch:
+        return pa.record_batch([pa.compute.add(batch.column("value"), 5)], names=["value"])
+
+    result = daft_lance.update_columns(path, transform=transform, read_columns=["value"])
+
+    assert result.rows_updated == 2
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict()["value"] == [15, 25]
+
+
+def test_update_columns_no_matches_is_noop(tmp_path: Path) -> None:
+    path = str(tmp_path / "transform-noop.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path, max_rows_per_file=1)
+    version = lance.dataset(path).version
+
+    result = daft_lance.update_columns(path, transform={"value": "value + 1"}, where="id > 100")
+
+    assert result == daft_lance.UpdateColumnsResult(version=version, rows_updated=0)
+    assert lance.dataset(path).version == version
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"transform": {"value": "value + 1"}, "where": "   "}, "non-empty"),
+        ({"transform": {"value": "value ==== 1"}}, "sql parser error"),
+        ({"transform": lambda batch: batch}, "columns.*required"),
+        ({"transform": {"missing": "value + 1"}}, "non-existent"),
+        ({"transform": {"value": "value + 1"}, "batch_size": 0}, "batch_size"),
+        ({"transform": {"value": "value + 1"}, "max_concurrency": 0}, "max_concurrency"),
+    ],
+)
+def test_update_columns_validates_before_writing(tmp_path: Path, kwargs: dict[str, Any], message: str) -> None:
+    path = str(tmp_path / "invalid-transform.lance")
+    daft.from_pydict({"id": [1], "value": [10]}).write_lance(path)
+    version = lance.dataset(path).version
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        daft_lance.update_columns(path, **kwargs)
+
+    assert lance.dataset(path).version == version
+
+
+def test_update_columns_rejects_non_row_preserving_transform(tmp_path: Path) -> None:
+    path = str(tmp_path / "row-count.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
+    version = lance.dataset(path).version
+
+    def transform(batch: pa.RecordBatch) -> pa.RecordBatch:
+        return batch.select(["value"]).slice(0, max(0, batch.num_rows - 1))
+
+    with pytest.raises(Exception, match="row count"):
+        daft_lance.update_columns(path, transform=transform, columns=["value"], read_columns=["value"])
+
+    assert lance.dataset(path).version == version
+
+
+def test_update_columns_updates_stable_row_id_metadata(tmp_path: Path) -> None:
+    path = str(tmp_path / "transform-stable-row-ids.lance")
+    lance.write_dataset(
+        pa.table({"id": [1, 2, 3], "value": [10, 20, 30]}),
+        path,
+        enable_stable_row_ids=True,
+    )
+    base_version = lance.dataset(path).version
+
+    result = daft_lance.update_columns(
+        path,
+        transform={"value": "value + 100"},
+        where="id IN (1, 3)",
+    )
+
+    assert result.rows_updated == 2
+    table = lance.dataset(path).to_table(columns=["id", "value", "_row_last_updated_at_version"]).sort_by("id")
+    assert table.column("value").to_pylist() == [110, 20, 130]
+    assert table.column("_row_last_updated_at_version").to_pylist() == [
+        result.version,
+        base_version,
+        result.version,
+    ]
+
+
+def test_update_columns_can_update_business_fragment_id_column(tmp_path: Path) -> None:
+    path = str(tmp_path / "business-fragment-id.lance")
+    lance.write_dataset(pa.table({"id": [1, 2], "fragment_id": [10, 20]}), path)
+
+    result = daft_lance.update_columns(
+        path,
+        transform={"fragment_id": "fragment_id + 1"},
+    )
+
+    assert result.rows_updated == 2
+    assert lance.dataset(path).to_table().sort_by("id").column("fragment_id").to_pylist() == [11, 21]
+
+
+def test_update_columns_uses_current_snapshot(tmp_path: Path) -> None:
+    path = str(tmp_path / "transform-occ.lance")
+    daft.from_pydict({"id": [1, 2], "value": [10, 20]}).write_lance(path)
+    lance.dataset(path).update({"value": "999"}, where="id = 1")
+    competing_version = lance.dataset(path).version
+
+    result = daft_lance.update_columns(path, transform={"value": "value + 100"})
+
+    assert result == daft_lance.UpdateColumnsResult(version=competing_version + 1, rows_updated=2)
+    assert lance.dataset(path).to_table().sort_by("id").to_pydict()["value"] == [1099, 120]
+
+
+def test_update_columns_namespace_roundtrip(tmp_path: Path) -> None:
+    namespace: dict[str, Any] = {
+        "namespace_impl": "dir",
+        "namespace_properties": {"root": str(tmp_path)},
+        "table_id": ["transform_updates"],
+    }
+    daft_lance.write_lance(
+        daft.from_pydict({"id": [1, 2], "value": [10, 20]}),
+        mode="create",
+        **namespace,
+    ).collect()
+
+    result = daft_lance.update_columns(transform={"value": "value * 10"}, where="id = 2", **namespace)
+
+    assert result.rows_updated == 1
+    assert daft_lance.read_lance(**namespace).sort("id").to_pydict()["value"] == [10, 200]
 
 
 def test_fragment_update_handler_reuses_pinned_dataset() -> None:
@@ -258,24 +494,22 @@ def test_update_columns_df_safe_casts_to_target_type(tmp_path: Path) -> None:
     assert table.column("value").to_pylist() == [123, 123]
 
 
-def test_update_columns_df_rejects_stable_row_ids_before_writing(tmp_path: Path) -> None:
+def test_update_columns_df_updates_stable_row_id_metadata(tmp_path: Path) -> None:
     path = str(tmp_path / "stable-row-ids.lance")
     lance.write_dataset(
         pa.table({"id": [1, 2], "value": [10, 20]}),
         path,
         enable_stable_row_ids=True,
     )
-    source = _read_update_source(path).with_column("value", daft.col("value") + 1)
-    before = lance.dataset(path)
-    before_version = before.version
-    before_values = before.to_table().column("value").to_pylist()
+    source = _read_update_source(path).where("id = 1").with_column("value", daft.col("value") + 1)
+    base_version = lance.dataset(path).version
 
-    with pytest.raises(NotImplementedError, match="does not support datasets with stable row IDs"):
-        daft_lance.update_columns_df(source, path, columns=["value"])
+    result = daft_lance.update_columns_df(source, path, columns=["value"])
 
-    after = lance.dataset(path)
-    assert after.version == before_version
-    assert after.to_table().column("value").to_pylist() == before_values
+    assert result.rows_updated == 1
+    table = lance.dataset(path).to_table(columns=["id", "value", "_row_last_updated_at_version"]).sort_by("id")
+    assert table.column("value").to_pylist() == [11, 20]
+    assert table.column("_row_last_updated_at_version").to_pylist() == [result.version, base_version]
 
 
 def test_update_columns_df_uses_commit_lock(tmp_path: Path) -> None:

@@ -9,11 +9,11 @@ import lance
 from daft.dependencies import pa
 from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.schema import Schema as DaftSchema
+from daft_lance._runtime import DatasetOpenOptions, open_dataset
 from daft_lance.namespace import (
     DatasetOpenContext,
     get_namespace_commit_kwargs,
     get_namespace_kwargs,
-    get_shared_session,
     has_namespace_params,
     merge_storage_options,
     resolve_namespace_table,
@@ -211,15 +211,14 @@ def construct_lance_dataset_handle(
         kwargs["default_scan_options"] = original_default_scan_options
 
     dataset_uri = None if has_namespace_params(namespace_impl, table_id) else resolved_uri
-    dataset = lance.dataset(
+    dataset = open_dataset(
         dataset_uri,
-        storage_options=merged_storage_options,
-        version=version,
-        # The native runner plans and executes in one process, so the driver's
-        # manifest is the one every scan task reuses.
-        session=get_shared_session(),
-        **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
-        **kwargs,
+        DatasetOpenOptions(
+            storage_options=merged_storage_options,
+            version=version,
+            **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
+            **kwargs,
+        ),
     )
 
     effective_kwargs = {
