@@ -414,6 +414,45 @@ Native namespace support in `daft.read_lance` / `DataFrame.write_lance` is track
 [Eventual-Inc/Daft#7282](https://github.com/Eventual-Inc/Daft/issues/7282); until that lands,
 use the `daft_lance` entry points shown above for namespace-addressed tables.
 
+### Shared Lance caches
+
+Daft-Lance reuses Lance Sessions within each process for dataset opens and
+`write_fragments` calls, including repeated batches written by a sink. Tasks
+carry serializable open arguments; native Sessions are created in the worker.
+The pool retains up to 16 Sessions, separated by destination, storage options,
+namespace client/table identity, and cache sizes. Namespace addressing and
+physical-URI addressing share a Session when they carry the same namespace identity. Eviction releases the pool's
+reference; active operations retain their Session.
+
+Configure cache capacities in bytes in the driver and worker environments:
+
+```bash
+export DAFT_LANCE_METADATA_CACHE_SIZE_BYTES=1073741824
+export DAFT_LANCE_INDEX_CACHE_SIZE_BYTES=268435456
+```
+
+Explicit read cache sizes take precedence over these environment defaults.
+Without either, Lance chooses its default capacities. Existing
+`index_cache_size` values retain pylance's conversion of 20 MiB per entry.
+Explicit Sessions and the deprecated `metadata_cache_size` option retain their
+existing behavior.
+
+These capacities apply per Session, not per cluster or node. Multiple workers
+and cache scopes multiply the memory budget. Cached metadata remains subject
+to Lance's cache admission and versioning rules; cache reuse does not eliminate
+the first manifest load in each worker.
+
+Scan/count tasks additionally retain one pinned Dataset per worker process.
+This avoids repeated manifest decoding for V1 manifest paths, which Lance's
+Session cache bypasses for explicit-version opens. A query-specific scope and
+open options identify the snapshot; a new query never reuses another query's
+Dataset. Concurrent cache misses are coalesced. Maintenance/writing operations
+continue to open their own Dataset objects, using shared Sessions. Alternating
+between queries can evict the retained snapshot and require another open.
+
+Worker reads retain their pinned
+version, while operations opening latest still resolve the current version.
+
 ## Migration
 
 The migration only requires replacing `daft.io.lance` with `daft_lance`.

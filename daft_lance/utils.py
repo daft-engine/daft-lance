@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -9,6 +10,7 @@ import lance
 from daft.dependencies import pa
 from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.schema import Schema as DaftSchema
+from daft_lance._runtime import open_dataset
 from daft_lance.namespace import (
     DatasetOpenContext,
     get_namespace_commit_kwargs,
@@ -210,7 +212,7 @@ def construct_lance_dataset_handle(
         kwargs["default_scan_options"] = original_default_scan_options
 
     dataset_uri = None if has_namespace_params(namespace_impl, table_id) else resolved_uri
-    dataset = lance.dataset(
+    dataset = open_dataset(
         dataset_uri,
         storage_options=merged_storage_options,
         version=version,
@@ -235,6 +237,7 @@ def construct_lance_dataset_handle(
     # further is redundant at best. (pylance lets ``version`` win when both are
     # passed, so this is belt-and-braces.)
     effective_kwargs.pop("asof", None)
+    effective_kwargs["_daft_read_scope"] = uuid.uuid4().hex
     return LanceDatasetHandle(
         dataset=dataset,
         uri=resolved_uri,

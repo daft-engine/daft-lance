@@ -26,6 +26,7 @@ from daft_lance._blob import (
     detect_blob_v2_columns,
     resolve_storage_version,
 )
+from daft_lance._runtime import open_dataset, shared_session
 from daft_lance.namespace import (
     ResolvedNamespaceTable,
     get_namespace_commit_kwargs,
@@ -346,7 +347,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         """
         dataset: lance.LanceDataset | None
         try:
-            dataset = lance.dataset(
+            dataset = open_dataset(
                 self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
             )
         except (ValueError, FileNotFoundError, OSError) as e:
@@ -429,6 +430,11 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         wrapped = self._blob.wrap_table(table)
         fragments = lance.fragment.write_fragments(
             wrapped,
+            session=shared_session(
+                self._table_uri,
+                storage_options=self._storage_options,
+                **get_write_fragments_kwargs(self._namespace_impl, self._namespace_properties, self._table_id),
+            ),
             dataset_uri=self._table_uri,
             mode=self._write_mode,
             storage_options=self._storage_options,
@@ -450,7 +456,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _ensure_mem_wal_dataset(self) -> lance.LanceDataset:
         assert self._effective_pyarrow_schema is not None, "LanceDataSink.start() must run before writes"
         try:
-            ds = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+            ds = open_dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
         except (ValueError, FileNotFoundError, OSError):
             ds = None
 
@@ -631,7 +637,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if self._checkpoint is None:
             raise RuntimeError("checking a Lance checkpoint commit requires the driver-side CheckpointStore")
         self._ensure_started()
-        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+        dataset = open_dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
         return self._idempotence_key_exists(dataset)
 
     def _finalize_uncheckpointed(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
@@ -654,7 +660,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             operation = lance.LanceOperation.Append(fragments)
 
         assert self._table_uri is not None, "LanceDataSink.start() must run before finalize"
-        # Unlike lance.dataset(), commit() requires a str base_uri even when a
+        # Unlike open_dataset(), commit() requires a str base_uri even when a
         # namespace client is passed; the namespace kwargs only register the commit.
         dataset = lance.LanceDataset.commit(
             self._table_uri,
@@ -675,7 +681,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         # Pinned to the version start() read: the deletions describe that snapshot,
         # and the commit declares it as its read version.
-        pinned = lance.dataset(
+        pinned = open_dataset(
             self._dataset_uri_arg,
             version=self._version,
             storage_options=self._storage_options,
@@ -700,13 +706,13 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 "insert_overwrite matched no rows and wrote no data for predicate %r; no version created",
                 self._overwrite_where,
             )
-            dataset = lance.dataset(
+            dataset = open_dataset(
                 self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
             )
         return _dataset_stats(dataset)
 
     def _finalize_mem_wal(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
-        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+        dataset = open_dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
 
         if self._compact_after_write:
             logger.info(
@@ -727,7 +733,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                     storage_options=self._storage_options,
                 ),
             )
-            dataset = lance.dataset(
+            dataset = open_dataset(
                 self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs
             )
 
@@ -743,7 +749,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         assert self._checkpoint is not None
         self._ensure_started()
 
-        dataset = lance.dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
+        dataset = open_dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
         pending_ids = self._pending_checkpoint_ids()
 
         # Check the Lance history again at finalize time. The pre-check in
