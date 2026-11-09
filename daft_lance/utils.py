@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -41,7 +40,6 @@ class LanceDatasetHandle:
     dataset: lance.LanceDataset
     uri: str
     open_kwargs: dict[str, Any] = field(repr=False)
-    read_scope: str = field(default_factory=lambda: uuid.uuid4().hex)
     managed_versioning: bool = False
     default_scan_options: dict[str, Any] | None = field(default=None, repr=False)
 

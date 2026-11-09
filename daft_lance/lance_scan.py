@@ -34,7 +34,6 @@ def _lance_table_factory_function(
     limit: int | None = None,
     include_fragment_id: bool | None = False,
     nearest: dict[str, Any] | None = None,
-    read_scope: str | None = None,
 ) -> Iterator[PyRecordBatch]:
     if fragment_ids is not None and nearest is not None:
         raise ValueError(
@@ -43,7 +42,7 @@ def _lance_table_factory_function(
             "Use nearest with fragment_ids=None for index-driven global vector search."
         )
 
-    ds = open_dataset_from_open_kwargs(ds_uri, open_kwargs, read_scope=read_scope)
+    ds = open_dataset_from_open_kwargs(ds_uri, open_kwargs)
 
     def _iter_batches() -> Iterator[PyRecordBatch]:
         # Iterate fragments individually; append a fragment_id column only when requested
@@ -118,10 +117,9 @@ def _lance_count_result_function(
     open_kwargs: dict[Any, Any] | None,
     required_column: str,
     filter: pa.compute.Expression | None = None,
-    read_scope: str | None = None,
 ) -> Iterator[PyRecordBatch]:
     """Use Lance's API to count rows and return a record batch with the count result."""
-    ds = open_dataset_from_open_kwargs(ds_uri, open_kwargs, read_scope=read_scope)
+    ds = open_dataset_from_open_kwargs(ds_uri, open_kwargs)
     logger.debug("Using metadata for counting all rows")
     count = ds.count_rows(filter=filter)
 
@@ -160,10 +158,8 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
         include_fragment_id: bool | None = False,
         open_kwargs: dict[str, Any] | None = None,
         default_scan_options: dict[str, Any] | None = None,
-        read_scope: str | None = None,
     ):
         self._ds = ds
-        self._read_scope = read_scope
         self._open_kwargs = dict(open_kwargs or {})
         self._default_scan_options = default_scan_options
         self._pushed_filters: list[PyExpr] | None = None
@@ -288,7 +284,7 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
         yield ScanTask.python_factory_func_scan_task(
             module=_lancedb_count_result_function.__module__,
             func_name=_lancedb_count_result_function.__name__,
-            func_args=(self._ds.uri, self._open_kwargs, fields[0], self._combine_filters_to_arrow(), self._read_scope),
+            func_args=(self._ds.uri, self._open_kwargs, fields[0], self._combine_filters_to_arrow()),
             schema=new_schema._schema,
             num_rows=1,
             size_bytes=None,
@@ -335,7 +331,6 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
                         rows_to_scan,
                         self._include_fragment_id,
                         None,
-                        self._read_scope,
                     ),
                     schema=task_schema._schema,
                     num_rows=rows_to_scan,
@@ -370,7 +365,6 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
                     self._compute_limit_pushdown_with_filter(pushdowns),
                     self._include_fragment_id,
                     nearest_option,
-                    self._read_scope,
                 ),
                 schema=self.schema()._schema,
                 num_rows=num_rows,

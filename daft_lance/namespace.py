@@ -36,7 +36,7 @@ from urllib.parse import unquote, urlparse
 import lance
 from lance_namespace import DeclareTableResponse, DescribeTableResponse, LanceNamespace
 
-from ._runtime import DatasetOpenOptions, open_read_dataset, shared_session
+from ._runtime import DatasetOpenOptions, open_dataset, shared_session
 
 _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "16"))
 
@@ -387,9 +387,7 @@ class DatasetOpenContext:
         return self._open(None)
 
 
-def open_dataset_from_open_kwargs(
-    ds_uri: str | None, open_kwargs: dict[str, Any] | None, *, read_scope: str | None = None
-) -> lance.LanceDataset:
+def open_dataset_from_open_kwargs(ds_uri: str | None, open_kwargs: dict[str, Any] | None) -> lance.LanceDataset:
     """Re-open a dataset on a worker from serialized open arguments.
 
     The namespace client is not picklable, so only the (impl, properties, table_id)
@@ -397,8 +395,7 @@ def open_dataset_from_open_kwargs(
     """
     open_kwargs = dict(open_kwargs or {})
     namespace_impl, namespace_properties, table_id = pop_namespace_params(open_kwargs)
-    return open_read_dataset(
+    return open_dataset(
         None if has_namespace_params(namespace_impl, table_id) else ds_uri,
         DatasetOpenOptions(**get_namespace_kwargs(namespace_impl, namespace_properties, table_id), **open_kwargs),
-        read_scope=read_scope,
     )

@@ -5,7 +5,7 @@ import os
 from collections import OrderedDict
 from collections.abc import Callable, Hashable
 from concurrent.futures import Future
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Lock, Thread
@@ -89,7 +89,6 @@ class _Cache(Generic[T]):
 
 
 _session_cache: _Cache[tuple[Session, LanceNamespace | None]] = _Cache()
-_dataset_cache: _Cache[tuple[lance.LanceDataset, Session]] = _Cache()
 _reaper_lock = Lock()
 _reaper: Thread | None = None
 
@@ -104,7 +103,6 @@ def _start_reaper() -> None:
 
                 while True:
                     sleep(30)
-                    _dataset_cache.expire()
                     _session_cache.expire()
 
             _reaper = Thread(target=sweep, name="daft-lance-cache-cleanup", daemon=True)
@@ -112,15 +110,13 @@ def _start_reaper() -> None:
 
 
 def clear_caches() -> None:
-    """Release retained references without closing datasets used by active tasks."""
-    _dataset_cache.clear()
+    """Release pooled Session references without closing active operations."""
     _session_cache.clear()
 
 
 def _reset_after_fork() -> None:
-    global _session_cache, _dataset_cache, _reaper_lock, _reaper
+    global _session_cache, _reaper_lock, _reaper
     _session_cache = _Cache()
-    _dataset_cache = _Cache()
     _reaper_lock = Lock()
     _reaper = None
 
@@ -146,11 +142,10 @@ def _env_integer(name: str, default: int | None = None, *, minimum: int = 0) -> 
     return value
 
 
-def _retention() -> tuple[int, int]:
-    capacity = _env_integer("DAFT_LANCE_DATASET_CACHE_SIZE", 4, minimum=1)
+def _retention() -> int:
     ttl = _env_integer("DAFT_LANCE_CACHE_TTL_SECONDS", 300, minimum=1)
-    assert capacity is not None and ttl is not None
-    return capacity, ttl
+    assert ttl is not None
+    return ttl
 
 
 DatasetUri = str | Path | None
@@ -193,7 +188,7 @@ def shared_session(
         index_bytes,
         metadata_bytes,
     )
-    _, ttl = _retention()
+    ttl = _retention()
     return _session_cache.get(
         key,
         lambda: (Session(index_cache_size_bytes=index_bytes, metadata_cache_size_bytes=metadata_bytes), client),
@@ -255,47 +250,3 @@ def open_dataset(uri: DatasetUri, options: DatasetOpenOptions | None = None) -> 
         table_id=options.table_id,
         base_store_params=options.base_store_params,
     )
-
-
-def open_read_dataset(
-    uri: DatasetUri, options: DatasetOpenOptions, *, read_scope: str | None = None
-) -> lance.LanceDataset:
-    """Reuse one immutable scan snapshot, including V1 manifests uncached by Lance.
-
-    A driver-generated scope separates independent queries even if a table is
-    deleted and recreated at the same URI/version. Full open options separate
-    different credentials and scanner defaults within a scope. Only numeric
-    pinned versions are eligible; maintenance and latest opens never use this.
-    """
-    if read_scope is None or not isinstance(options.version, int):
-        return open_dataset(uri, options)
-    serializable = {
-        field.name: getattr(options, field.name)
-        for field in fields(options)
-        if field.name not in {"namespace_client", "session"}
-    }
-    try:
-        key = json.dumps([read_scope, str(uri), id(options.namespace_client), serializable], sort_keys=True)
-    except (TypeError, ValueError):
-        # Custom scanner defaults/callbacks need not be JSON serializable.
-        return open_dataset(uri, options)
-    capacity, ttl = _retention()
-    index_bytes = options.index_cache_size_bytes
-    if index_bytes is None and options.session is None:
-        index_bytes = (
-            options.index_cache_size * 20 * 1024 * 1024
-            if options.index_cache_size is not None
-            else _env_integer("DAFT_LANCE_INDEX_CACHE_SIZE_BYTES")
-        )
-    metadata_bytes = options.metadata_cache_size_bytes
-    if metadata_bytes is None and options.session is None:
-        metadata_bytes = _env_integer("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES")
-    # Automatic Session pool eviction must not invalidate a retained Dataset.
-    # Explicit sessions remain isolated by identity and are retained in the value.
-    key += f"/{index_bytes}/{metadata_bytes}/{id(options.session) if options.session is not None else 'managed'}"
-
-    def load() -> tuple[lance.LanceDataset, Session]:
-        session = options.resolve_session(uri)
-        return open_dataset(uri, replace(options, session=session)), session
-
-    return _dataset_cache.get(key, load, capacity, ttl)[0]

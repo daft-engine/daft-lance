@@ -172,7 +172,6 @@ def read_lance(
         fragment_group_size=fragment_group_size,
         include_fragment_id=include_fragment_id,
         open_kwargs=dataset_handle.open_kwargs,
-        read_scope=dataset_handle.read_scope,
         default_scan_options=dataset_handle.default_scan_options,
     )
 

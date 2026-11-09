@@ -442,27 +442,23 @@ and cache scopes multiply the memory budget. Cached metadata remains subject
 to Lance's cache admission and versioning rules; cache reuse does not eliminate
 the first manifest load in each worker.
 
-Scan/count tasks retain up to four pinned Datasets per worker process in an
-LRU cache. This avoids repeated manifest decoding for V1 explicit-version
-opens. Query scope is carried separately from open arguments; independent
-queries keep separate Dataset objects. Same-key concurrent loads share one
-result, while different keys can open in parallel. Dataset cache hits survive
-automatic Session-pool eviction. Maintenance and writes keep independent
-Dataset objects and share Sessions.
+Each operation opens its own Dataset while reusing a Session. There is no
+Dataset cache or special handling for V1 manifest naming. Manifest and index
+cache admission, identity, and eviction are managed by Lance itself; the intended
+metadata-reuse path uses V2 manifest naming.
 
-`DAFT_LANCE_DATASET_CACHE_SIZE` controls Dataset capacity (default 4).
-`DAFT_LANCE_CACHE_TTL_SECONDS` controls idle retention for both caches (default
-300 seconds). Both require positive integers; byte capacities require
-nonnegative integers. Explicit cache capacities take precedence over environment
-variables. Invalid settings report the variable name and value.
+`DAFT_LANCE_CACHE_TTL_SECONDS` controls idle Session retention (default 300
+seconds) and requires a positive integer. Byte capacities require nonnegative
+integers. Invalid settings report the variable name and value.
 
-A process-local daemon sweeps idle entries every 30 seconds, including when the
-worker receives no further requests. Entries can therefore remain for up to
+A process-local daemon sweeps idle Sessions every 30 seconds, including when
+the worker receives no further requests. Entries can therefore remain for up to
 TTL plus one sweep interval. Eviction, expiration, and the internal
-`clear_caches()` helper release cache references without closing objects held
-by active tasks. Queries do not trigger immediate cleanup on completion; native
-allocators may retain memory after references are released, so TTL is not an
-RSS limit. Session capacity remains 16 per worker.
+`clear_caches()` helper release pooled references without closing objects held
+by active tasks. Native allocators may retain memory after references are
+released, so TTL is not an RSS limit. Session capacity is 16 per worker;
+concurrent creation of the same Session is coalesced without serializing
+unrelated Session creation.
 
 Worker reads retain their pinned version, while operations opening latest
 still resolve the current version.
