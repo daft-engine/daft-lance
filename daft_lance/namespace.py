@@ -387,7 +387,9 @@ class DatasetOpenContext:
         return self._open(None)
 
 
-def open_dataset_from_open_kwargs(ds_uri: str | None, open_kwargs: dict[str, Any] | None) -> lance.LanceDataset:
+def open_dataset_from_open_kwargs(
+    ds_uri: str | None, open_kwargs: dict[str, Any] | None, *, read_scope: str | None = None
+) -> lance.LanceDataset:
     """Re-open a dataset on a worker from serialized open arguments.
 
     The namespace client is not picklable, so only the (impl, properties, table_id)
@@ -395,7 +397,6 @@ def open_dataset_from_open_kwargs(ds_uri: str | None, open_kwargs: dict[str, Any
     """
     open_kwargs = dict(open_kwargs or {})
     namespace_impl, namespace_properties, table_id = pop_namespace_params(open_kwargs)
-    read_scope = open_kwargs.pop("_daft_read_scope", None)
     return open_read_dataset(
         None if has_namespace_params(namespace_impl, table_id) else ds_uri,
         DatasetOpenOptions(**get_namespace_kwargs(namespace_impl, namespace_properties, table_id), **open_kwargs),

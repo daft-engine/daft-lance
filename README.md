@@ -421,8 +421,9 @@ Daft-Lance reuses Lance Sessions within each process for dataset opens and
 carry serializable open arguments; native Sessions are created in the worker.
 The pool retains up to 16 Sessions, separated by destination, storage options,
 namespace client/table identity, and cache sizes. Namespace addressing and
-physical-URI addressing share a Session when they carry the same namespace identity. Eviction releases the pool's
-reference; active operations retain their Session.
+physical-URI addressing share a Session when they carry the same namespace
+identity. Eviction releases the pool's reference; active operations retain
+their Session.
 
 Configure cache capacities in bytes in the driver and worker environments:
 
@@ -441,16 +442,30 @@ and cache scopes multiply the memory budget. Cached metadata remains subject
 to Lance's cache admission and versioning rules; cache reuse does not eliminate
 the first manifest load in each worker.
 
-Scan/count tasks additionally retain one pinned Dataset per worker process.
-This avoids repeated manifest decoding for V1 manifest paths, which Lance's
-Session cache bypasses for explicit-version opens. A query-specific scope and
-open options identify the snapshot; a new query never reuses another query's
-Dataset. Concurrent cache misses are coalesced. Maintenance/writing operations
-continue to open their own Dataset objects, using shared Sessions. Alternating
-between queries can evict the retained snapshot and require another open.
+Scan/count tasks retain up to four pinned Datasets per worker process in an
+LRU cache. This avoids repeated manifest decoding for V1 explicit-version
+opens. Query scope is carried separately from open arguments; independent
+queries keep separate Dataset objects. Same-key concurrent loads share one
+result, while different keys can open in parallel. Dataset cache hits survive
+automatic Session-pool eviction. Maintenance and writes keep independent
+Dataset objects and share Sessions.
 
-Worker reads retain their pinned
-version, while operations opening latest still resolve the current version.
+`DAFT_LANCE_DATASET_CACHE_SIZE` controls Dataset capacity (default 4).
+`DAFT_LANCE_CACHE_TTL_SECONDS` controls idle retention for both caches (default
+300 seconds). Both require positive integers; byte capacities require
+nonnegative integers. Explicit cache capacities take precedence over environment
+variables. Invalid settings report the variable name and value.
+
+A process-local daemon sweeps idle entries every 30 seconds, including when the
+worker receives no further requests. Entries can therefore remain for up to
+TTL plus one sweep interval. Eviction, expiration, and the internal
+`clear_caches()` helper release cache references without closing objects held
+by active tasks. Queries do not trigger immediate cleanup on completion; native
+allocators may retain memory after references are released, so TTL is not an
+RSS limit. Session capacity remains 16 per worker.
+
+Worker reads retain their pinned version, while operations opening latest
+still resolve the current version.
 
 ## Migration
 

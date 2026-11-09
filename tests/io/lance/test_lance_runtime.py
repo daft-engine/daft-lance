@@ -17,12 +17,16 @@ def test_concurrent_opens_share_session_and_keep_snapshot(tmp_path):
     lance.write_dataset(pa.table({"a": [1, 2]}), uri)
     handle = construct_lance_dataset_handle(uri, metadata_cache_size_bytes=32 * 1024 * 1024)
     with ThreadPoolExecutor(max_workers=4) as executor:
-        datasets = list(executor.map(lambda _: open_dataset_from_open_kwargs(uri, handle.open_kwargs), range(8)))
+        datasets = list(
+            executor.map(
+                lambda _: open_dataset_from_open_kwargs(uri, handle.open_kwargs, read_scope=handle.read_scope), range(8)
+            )
+        )
     assert all(ds.session().is_same_as(datasets[0].session()) for ds in datasets)
     assert datasets[0].session().is_same_as(handle.dataset.session())
 
     lance.write_dataset(pa.table({"a": [99]}), uri, mode="overwrite")
-    pinned = open_dataset_from_open_kwargs(uri, handle.open_kwargs)
+    pinned = open_dataset_from_open_kwargs(uri, handle.open_kwargs, read_scope=handle.read_scope)
     assert pinned.version == handle.dataset.version
     assert pinned.to_table().to_pydict() == {"a": [1, 2]}
     assert open_dataset(uri).to_table().to_pydict() == {"a": [99]}
@@ -103,13 +107,17 @@ def test_v1_scan_snapshot_opens_once_per_query(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runtime.lance, "dataset", track_open)
     with ThreadPoolExecutor(max_workers=4) as executor:
-        datasets = list(executor.map(lambda _: open_dataset_from_open_kwargs(uri, handle.open_kwargs), range(8)))
+        datasets = list(
+            executor.map(
+                lambda _: open_dataset_from_open_kwargs(uri, handle.open_kwargs, read_scope=handle.read_scope), range(8)
+            )
+        )
     assert len(opens) == 1
     assert all(ds is datasets[0] for ds in datasets)
     assert datasets[0].to_table().to_pydict() == {"a": [1, 2]}
     # A new query must resolve its own snapshot, even at the same version.
     another = construct_lance_dataset_handle(uri)
-    assert open_dataset_from_open_kwargs(uri, another.open_kwargs) is not datasets[0]
+    assert open_dataset_from_open_kwargs(uri, another.open_kwargs, read_scope=another.read_scope) is not datasets[0]
     # Maintenance code never gets the mutable Dataset shared with scanners.
     assert handle.worker_open_context().open_pinned() is not datasets[0]
 

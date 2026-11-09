@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 from collections import OrderedDict
+from collections.abc import Callable, Hashable
+from concurrent.futures import Future
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
-from typing import TYPE_CHECKING, Any
+from threading import Lock, Thread
+from time import monotonic
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 import lance
 
@@ -18,25 +21,136 @@ from lance_namespace import LanceNamespace
 if TYPE_CHECKING:
     from lance.commit import CommitLock
 
-# Keep native handles in the executing process, never in serialized task state.
-_SESSION_LIMIT = 16
-_sessions: OrderedDict[tuple[Any, ...], tuple[Session, Any]] = OrderedDict()
-_session_lock = Lock()
-# Scan/count consumers never mutate these datasets. Keep only one query snapshot.
-_read_datasets: OrderedDict[str, tuple[lance.LanceDataset, Session]] = OrderedDict()
-_read_lock = Lock()
+T = TypeVar("T")
+
+
+class _Cache(Generic[T]):
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.entries: OrderedDict[Hashable, tuple[T, float]] = OrderedDict()
+        self.pending: dict[Hashable, Future[T]] = {}
+        self.generation = 0
+
+    def expire(self) -> None:
+        released = []
+        with self.lock:
+            now = monotonic()
+            for key, (_, deadline) in list(self.entries.items()):
+                if deadline <= now:
+                    released.append(self.entries.pop(key))
+        # Drop native references outside the lock.
+        released.clear()
+
+    def clear(self) -> None:
+        with self.lock:
+            released = self.entries
+            self.entries = OrderedDict()
+            self.pending = {}
+            self.generation += 1
+        released.clear()
+
+    def get(self, key: Hashable, load: Callable[[], T], capacity: int, ttl: int) -> T:
+        _start_reaper()
+        self.expire()
+        with self.lock:
+            if key in self.entries:
+                value, _ = self.entries[key]
+                self.entries[key] = (value, monotonic() + ttl)
+                self.entries.move_to_end(key)
+                return value
+            future = self.pending.get(key)
+            owner = future is None
+            if future is None:
+                future = Future()
+                self.pending[key] = future
+            generation = self.generation
+        if not owner:
+            return future.result()
+        try:
+            value = load()
+        except BaseException as error:
+            with self.lock:
+                if self.pending.get(key) is future:
+                    del self.pending[key]
+            future.set_exception(error)
+            raise
+        released = []
+        with self.lock:
+            if generation == self.generation:
+                self.entries[key] = (value, monotonic() + ttl)
+                self.entries.move_to_end(key)
+                while len(self.entries) > capacity:
+                    released.append(self.entries.popitem(last=False))
+            if self.pending.get(key) is future:
+                del self.pending[key]
+        future.set_result(value)
+        released.clear()
+        return value
+
+
+_session_cache: _Cache[tuple[Session, LanceNamespace | None]] = _Cache()
+_dataset_cache: _Cache[tuple[lance.LanceDataset, Session]] = _Cache()
+_reaper_lock = Lock()
+_reaper: Thread | None = None
+
+
+def _start_reaper() -> None:
+    global _reaper
+    with _reaper_lock:
+        if _reaper is None:
+
+            def sweep() -> None:
+                from time import sleep
+
+                while True:
+                    sleep(30)
+                    _dataset_cache.expire()
+                    _session_cache.expire()
+
+            _reaper = Thread(target=sweep, name="daft-lance-cache-cleanup", daemon=True)
+            _reaper.start()
+
+
+def clear_caches() -> None:
+    """Release retained references without closing datasets used by active tasks."""
+    _dataset_cache.clear()
+    _session_cache.clear()
 
 
 def _reset_after_fork() -> None:
-    global _sessions, _session_lock, _read_datasets, _read_lock
-    _sessions = OrderedDict()
-    _session_lock = Lock()
-    _read_datasets = OrderedDict()
-    _read_lock = Lock()
+    global _session_cache, _dataset_cache, _reaper_lock, _reaper
+    _session_cache = _Cache()
+    _dataset_cache = _Cache()
+    _reaper_lock = Lock()
+    _reaper = None
 
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_after_fork)
+
+
+class CacheConfigurationError(ValueError):
+    """Invalid runtime configuration; never a missing-table signal."""
+
+
+def _env_integer(name: str, default: int | None = None, *, minimum: int = 0) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+        if value < minimum:
+            raise ValueError
+    except ValueError:
+        raise CacheConfigurationError(f"{name}={raw!r}: expected an integer >= {minimum}") from None
+    return value
+
+
+def _retention() -> tuple[int, int]:
+    capacity = _env_integer("DAFT_LANCE_DATASET_CACHE_SIZE", 4, minimum=1)
+    ttl = _env_integer("DAFT_LANCE_CACHE_TTL_SECONDS", 300, minimum=1)
+    assert capacity is not None and ttl is not None
+    return capacity, ttl
 
 
 DatasetUri = str | Path | None
@@ -65,11 +179,9 @@ def shared_session(
         index_bytes = index_cache_size * 20 * 1024 * 1024
     metadata_bytes = metadata_cache_size_bytes
     if index_bytes is None:
-        value = os.environ.get("DAFT_LANCE_INDEX_CACHE_SIZE_BYTES")
-        index_bytes = int(value) if value is not None else None
+        index_bytes = _env_integer("DAFT_LANCE_INDEX_CACHE_SIZE_BYTES")
     if metadata_bytes is None:
-        value = os.environ.get("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES")
-        metadata_bytes = int(value) if value is not None else None
+        metadata_bytes = _env_integer("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES")
     client = namespace_client
     key = (
         os.getpid(),
@@ -81,18 +193,13 @@ def shared_session(
         index_bytes,
         metadata_bytes,
     )
-    # lru_cache can invoke its factory twice on concurrent misses. Serialize the
-    # lookup and creation so concurrent tasks actually share the first session.
-    with _session_lock:
-        if key not in _sessions:
-            _sessions[key] = (
-                Session(index_cache_size_bytes=index_bytes, metadata_cache_size_bytes=metadata_bytes),
-                client,
-            )
-            if len(_sessions) > _SESSION_LIMIT:
-                _sessions.popitem(last=False)
-        _sessions.move_to_end(key)
-        return _sessions[key][0]
+    _, ttl = _retention()
+    return _session_cache.get(
+        key,
+        lambda: (Session(index_cache_size_bytes=index_bytes, metadata_cache_size_bytes=metadata_bytes), client),
+        16,
+        ttl,
+    )[0]
 
 
 @dataclass(frozen=True)
@@ -172,11 +279,23 @@ def open_read_dataset(
     except (TypeError, ValueError):
         # Custom scanner defaults/callbacks need not be JSON serializable.
         return open_dataset(uri, options)
-    session = options.resolve_session(uri)
-    key += f"/{id(session)}"
-    with _read_lock:
-        if key not in _read_datasets:
-            _read_datasets[key] = (open_dataset(uri, replace(options, session=session)), session)
-            if len(_read_datasets) > 1:
-                _read_datasets.popitem(last=False)
-        return _read_datasets[key][0]
+    capacity, ttl = _retention()
+    index_bytes = options.index_cache_size_bytes
+    if index_bytes is None and options.session is None:
+        index_bytes = (
+            options.index_cache_size * 20 * 1024 * 1024
+            if options.index_cache_size is not None
+            else _env_integer("DAFT_LANCE_INDEX_CACHE_SIZE_BYTES")
+        )
+    metadata_bytes = options.metadata_cache_size_bytes
+    if metadata_bytes is None and options.session is None:
+        metadata_bytes = _env_integer("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES")
+    # Automatic Session pool eviction must not invalidate a retained Dataset.
+    # Explicit sessions remain isolated by identity and are retained in the value.
+    key += f"/{index_bytes}/{metadata_bytes}/{id(options.session) if options.session is not None else 'managed'}"
+
+    def load() -> tuple[lance.LanceDataset, Session]:
+        session = options.resolve_session(uri)
+        return open_dataset(uri, replace(options, session=session)), session
+
+    return _dataset_cache.get(key, load, capacity, ttl)[0]
