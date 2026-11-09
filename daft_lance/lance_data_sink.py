@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import threading
 import uuid
 import warnings
 from itertools import chain
@@ -53,6 +54,24 @@ logger = logging.getLogger(__name__)
 # mode fails silently (see resolve_storage_version, which would skip the
 # storage-version compatibility check entirely).
 LancePhysicalWriteMode = Literal["create", "append", "overwrite"]
+
+# Lance resolves a URI write destination by loading the latest manifest on every
+# write_fragments call, which costs O(fragments) per batch. Workers instead reuse
+# one dataset handle per process, pinned to the version start() read on the driver.
+# One entry per URI keeps a long-lived worker from holding every old manifest.
+_WRITE_TARGETS: dict[str, tuple[tuple[Any, ...], lance.LanceDataset]] = {}
+_WRITE_TARGETS_LOCK = threading.Lock()
+
+
+def _cached_write_target(uri: str, version: int, storage_options: dict[str, str] | None) -> lance.LanceDataset:
+    key = (version, tuple(sorted((storage_options or {}).items())))
+    with _WRITE_TARGETS_LOCK:
+        cached = _WRITE_TARGETS.get(uri)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        dataset = lance.dataset(uri, version=version, storage_options=storage_options)
+        _WRITE_TARGETS[uri] = (key, dataset)
+        return dataset
 
 
 def _dataset_stats(dataset: lance.LanceDataset) -> MicroPartition:
@@ -424,12 +443,19 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             return input_table.cast(target_schema)
         return pa.Table.from_batches(input_table.to_batches(), target_schema)
 
-    def _write_arrow_table(self, table: pa.Table) -> WriteResult[list[FragmentMetadata]]:
+    def _write_target(self) -> str | lance.LanceDataset:
         assert self._table_uri is not None, "LanceDataSink.start() must run before writes"
+        # create targets a missing dataset, where Lance's per-call lookup is a cheap NotFound.
+        # Namespace tables keep the URI path so the namespace client stays in charge of access.
+        if self._table_schema is None or self._dataset_uri_arg is None:
+            return self._table_uri
+        return _cached_write_target(self._table_uri, self._version, self._storage_options)
+
+    def _write_arrow_table(self, table: pa.Table) -> WriteResult[list[FragmentMetadata]]:
         wrapped = self._blob.wrap_table(table)
         fragments = lance.fragment.write_fragments(
             wrapped,
-            dataset_uri=self._table_uri,
+            dataset_uri=self._write_target(),
             mode=self._write_mode,
             storage_options=self._storage_options,
             max_rows_per_file=self._max_rows_per_file,
