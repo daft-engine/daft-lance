@@ -434,8 +434,7 @@ export DAFT_LANCE_INDEX_CACHE_SIZE_BYTES=268435456
 Explicit read cache sizes take precedence over these environment defaults.
 Without either, Lance chooses its default capacities. Existing
 `index_cache_size` values retain pylance's conversion of 20 MiB per entry.
-Explicit Sessions and the deprecated `metadata_cache_size` option retain their
-existing behavior.
+Explicit Sessions retain their existing behavior.
 
 These capacities apply per Session, not per cluster or node. Multiple workers
 and cache scopes multiply the memory budget. Cached metadata remains subject
