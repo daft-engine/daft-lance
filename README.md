@@ -419,7 +419,7 @@ use the `daft_lance` entry points shown above for namespace-addressed tables.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `DAFT_LANCE_NAMESPACE_CACHE_SIZE` | `16` | Size of the per-(implementation, properties) namespace client cache. Read once at import time. |
-| `DAFT_LANCE_SHARE_SESSION` | `1` | Every dataset this extension opens in a process shares one lance `Session`, so a table's manifest and lance's caches are held once instead of once per scan task, maintenance UDF and writer. Set to `0` to give each open its own session (lance's own default); on a many-fragment table that costs one copy of the fragment list per concurrently open dataset. `benchmarks/lance_session_memory.py` (`make bench`) measures the difference in a real Ray worker. |
+| `DAFT_LANCE_SHARE_SESSION` | `1` | Every dataset this extension opens in a process shares one lance `Session`, so a table's manifest and lance's caches are held once instead of once per scan task, maintenance UDF and writer. Set to `0` to give each open its own session (lance's own default); on a many-fragment table that costs one copy of the fragment list per concurrently open dataset. |
 
 ### What sharing a session actually saves, per path
 
@@ -454,7 +454,7 @@ prunes whole fragments. At 100k fragments, reading 1% through groups of ten
 turns a billion-row scan into ten million rows and 100k tasks into a hundred,
 while each of the concurrent opens still carries the same 47 MB fragment list.
 What has to survive is the overlap: enough tasks to keep the concurrency in
-flight, which `benchmarks/lance_session_memory.py` checks rather than assumes.
+flight.
 
 One caveat if you measure this yourself: a `Session` reports both `size_bytes()`
 and `index_cache_size_bytes()`, and they are not the same accounting. Only

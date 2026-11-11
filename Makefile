@@ -27,10 +27,6 @@ test: sync  ## Run tests
 	# interpreter from the raylet regardless.
 	DAFT_ANALYTICS_ENABLED=0 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 uv run pytest tests/ -v $(EXTRA_ARGS)
 
-.PHONY: bench
-bench: sync  ## Measure lance session memory in a real Ray run
-	DAFT_ANALYTICS_ENABLED=0 uv run --group ray python benchmarks/lance_session_memory.py $(EXTRA_ARGS)
-
 .PHONY: format
 format: sync  ## Format Python code
 	uv run ruff format daft_lance tests

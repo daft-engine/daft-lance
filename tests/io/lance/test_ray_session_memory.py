@@ -11,8 +11,8 @@ So these ask the worker itself. A plain batch UDF is fused into the scan's own
 the very process that opened the datasets. ``size_bytes()`` is used rather than
 RSS on purpose: it is exact, it needs no large table, and it is zero for any open
 that did not go through the process session -- which is exactly what the
-pre-sharing behavior looks like. ``benchmarks/lance_session_memory.py`` is the
-counterpart that puts megabytes on it.
+pre-sharing behavior looks like. These tests validate cache reuse rather than
+RSS or timing thresholds.
 
 The last two tests cover the maintenance path, which behaves differently enough
 to be worth stating: its opens do not multiply by concurrency, because Daft runs

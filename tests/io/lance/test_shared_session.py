@@ -204,5 +204,5 @@ def test_compaction_loads_the_index_in_its_commit_not_in_its_tasks(tmp_path_fact
     assert commit_growth > 3 * task_growth, (
         f"the {plan.num_tasks()} compaction tasks grew the index cache by {task_growth} bytes and the commit by "
         f"{commit_growth}; the index is no longer remapped in the commit, so a maintenance task's index cost may "
-        "now multiply by the concurrency and benchmarks/lance_session_memory.py needs revisiting"
+        "now multiply by the concurrency and the memory assumptions need revisiting"
     )
