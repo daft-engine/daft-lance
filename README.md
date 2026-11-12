@@ -425,33 +425,22 @@ use the `daft_lance` entry points shown above for namespace-addressed tables.
 
 ### Shared Lance caches
 
-Default opens reuse one Session per process across tables. Explicit Sessions are
-preserved. If any cache-size argument is explicitly supplied (including zero),
-Lance creates an independent Session using those arguments; earlier opens cannot
-constrain later calls. Legacy `index_cache_size` is interpreted by Lance.
+Daft-Lance shares one Lance Session per process by default. To compare behavior
+or troubleshoot, set `DAFT_LANCE_SESSION_SHARING=false`; set it to `true` (the
+default) to enable sharing.
 
-Capacity environment variables affect only the default shared Session and must be
-nonnegative integers. Set them in driver and worker environments before first use.
-The Session lives until process exit; tests can reset its internal reference.
-Reset releases the global reference; existing Dataset handles remain usable and keep
-their Session. The next default open reads the current environment settings.
-There is no TTL or cleanup thread. Fork resets the global Session reference and lock;
-this does not make Lance itself fork-safe. Use Lance-supported process startup modes.
+`DAFT_LANCE_METADATA_CACHE_SIZE_BYTES` and
+`DAFT_LANCE_INDEX_CACHE_SIZE_BYTES` set the corresponding cache capacities for
+the shared Session. Values must be nonnegative integers. Set them in both the
+driver and worker environments before the first dataset open. Each process has
+its own cache budget, shared across tables.
 
-Opens and network I/O run outside the initialization lock. Each process has its own
-cache budget, shared across tables. A URI must identify the same underlying dataset;
-identical URIs addressing different endpoint data require isolated Sessions.
-Lance controls cache admission and eviction. Metadata reuse depends on cache capacity
-and Lance's loading path; no V1-manifest workaround or process-wide Dataset cache is added.
-Pinned reads retain their version; latest opens still resolve the current version.
+These environment settings apply to default opens. Passing an explicit Lance
+Session or cache-size argument to an open uses that configuration independently.
 
-`read_blobs` retains a Dataset only within each UDF closure instance. For namespace
-Datasets, optionally pass the originating handle's `worker_open_context()` as
-`open_context` to preserve namespace credential refresh when reopening on workers.
-Without this context, namespace inputs retain the original Dataset closure behavior,
-including Lance's limitations when serializing namespace clients. Bare Dataset inputs preserve the storage,
-read, default-scan, and base-store options exposed by Lance; options Lance does not
-retain cannot be reconstructed. A supplied context must match the Dataset URI and version.
+Use separate Sessions or processes if the same URI can refer to different data
+through different endpoints. Lance controls cache admission and eviction; reuse
+depends on the table's manifest format and available cache capacity.
 
 ## Migration
 
@@ -511,6 +500,11 @@ data = df.select("blob_column").to_pydict()["blob_column"][0]  # bytes
 `read_blobs` reads blobs in batches of `batch_size` rows (default 16) and holds a
 whole batch in memory. Filter rows before calling it, and raise `batch_size` only
 when blobs are small.
+For namespace datasets on distributed runners, pass the originating handle's
+`worker_open_context()` as `open_context` to preserve namespace credential refresh
+when the worker reopens the pinned dataset. Without it, `read_blobs` keeps the
+original Dataset closure behavior, including Lance's namespace-client serialization
+limitations.
 
 For large blobs where you only need part of each one on the native runner, use
 `take_blobs` and call `.read()` (or seek and read a range) on each handle:
