@@ -15,20 +15,16 @@ _session: Session | None = None
 _session_lock = Lock()
 
 
-class CacheConfigurationError(ValueError):
-    """Invalid runtime configuration; never a missing-table signal."""
-
-
-def _env_integer(name: str, default: int | None = None, *, minimum: int = 0) -> int | None:
+def _env_integer(name: str) -> int | None:
     raw = os.environ.get(name)
     if raw is None:
-        return default
+        return None
     try:
         value = int(raw)
-        if value < minimum:
-            raise ValueError
     except ValueError:
-        raise CacheConfigurationError(f"{name}={raw!r}: expected an integer >= {minimum}") from None
+        raise ValueError(f"{name}={raw!r}: expected a nonnegative integer") from None
+    if value < 0:
+        raise ValueError(f"{name}={raw!r}: expected a nonnegative integer")
     return value
 
 

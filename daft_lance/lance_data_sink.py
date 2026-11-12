@@ -26,7 +26,7 @@ from daft_lance._blob import (
     detect_blob_v2_columns,
     resolve_storage_version,
 )
-from daft_lance._runtime import CacheConfigurationError, open_dataset, session_for_open
+from daft_lance._runtime import open_dataset, session_for_open
 from daft_lance.namespace import (
     ResolvedNamespaceTable,
     get_namespace_commit_kwargs,
@@ -354,7 +354,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             )
         except (ValueError, FileNotFoundError, OSError) as e:
             # Pinned to the Rust message format; lance has no typed exception. See test_lance_message_format_unchanged.
-            if not isinstance(e, CacheConfigurationError) and "was not found" in str(e):
+            if "was not found" in str(e):
                 dataset = None
             else:
                 # Re-raise other errors (permissions, network, etc.)
@@ -460,7 +460,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 **self._namespace_kwargs,
             )
         except (ValueError, FileNotFoundError, OSError) as error:
-            if isinstance(error, CacheConfigurationError) or "was not found" not in str(error):
+            if "was not found" not in str(error):
                 raise
             ds = None
 

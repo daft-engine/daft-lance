@@ -7,7 +7,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from daft_lance._runtime import CacheConfigurationError, clear_caches, open_dataset, shared_session
+from daft_lance._runtime import clear_caches, open_dataset, shared_session
 from daft_lance.lance_data_sink import LanceDataSink
 from daft_lance.namespace import open_dataset_from_open_kwargs
 from daft_lance.utils import construct_lance_dataset_handle
@@ -56,7 +56,7 @@ def test_invalid_shared_configuration_and_reset(tmp_path, monkeypatch):
     uri = str(tmp_path / "table")
     lance.write_dataset(pa.table({"a": [1]}), uri)
     monkeypatch.setenv("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES", "1GiB")
-    with pytest.raises(CacheConfigurationError, match="DAFT_LANCE_METADATA_CACHE_SIZE_BYTES"):
+    with pytest.raises(ValueError, match="DAFT_LANCE_METADATA_CACHE_SIZE_BYTES"):
         open_dataset(uri)
     custom = open_dataset(uri, metadata_cache_size_bytes=1024)
     assert custom.to_table().num_rows == 1
