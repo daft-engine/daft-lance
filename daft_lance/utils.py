@@ -9,7 +9,7 @@ import lance
 from daft.dependencies import pa
 from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.schema import Schema as DaftSchema
-from daft_lance._runtime import DatasetOpenOptions, open_dataset
+from daft_lance._runtime import open_dataset
 from daft_lance.namespace import (
     DatasetOpenContext,
     get_namespace_commit_kwargs,
@@ -213,12 +213,10 @@ def construct_lance_dataset_handle(
     dataset_uri = None if has_namespace_params(namespace_impl, table_id) else resolved_uri
     dataset = open_dataset(
         dataset_uri,
-        DatasetOpenOptions(
-            storage_options=merged_storage_options,
-            version=version,
-            **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
-            **kwargs,
-        ),
+        storage_options=merged_storage_options,
+        version=version,
+        **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
+        **kwargs,
     )
 
     effective_kwargs = {

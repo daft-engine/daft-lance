@@ -36,7 +36,7 @@ from urllib.parse import unquote, urlparse
 import lance
 from lance_namespace import DeclareTableResponse, DescribeTableResponse, LanceNamespace
 
-from ._runtime import DatasetOpenOptions, Session, clear_caches, open_dataset, shared_session
+from ._runtime import Session, clear_caches, open_dataset, shared_session
 
 _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "16"))
 
@@ -403,5 +403,6 @@ def open_dataset_from_open_kwargs(ds_uri: str | None, open_kwargs: dict[str, Any
     namespace_impl, namespace_properties, table_id = pop_namespace_params(open_kwargs)
     return open_dataset(
         None if has_namespace_params(namespace_impl, table_id) else ds_uri,
-        DatasetOpenOptions(**get_namespace_kwargs(namespace_impl, namespace_properties, table_id), **open_kwargs),
+        **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
+        **open_kwargs,
     )

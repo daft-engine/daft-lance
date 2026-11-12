@@ -7,7 +7,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from daft_lance._runtime import CacheConfigurationError, DatasetOpenOptions, clear_caches, open_dataset, shared_session
+from daft_lance._runtime import CacheConfigurationError, clear_caches, open_dataset, shared_session
 from daft_lance.lance_data_sink import LanceDataSink
 from daft_lance.namespace import open_dataset_from_open_kwargs
 from daft_lance.utils import construct_lance_dataset_handle
@@ -82,7 +82,7 @@ def test_explicit_session_is_preserved(tmp_path):
     uri = str(tmp_path / "explicit")
     lance.write_dataset(pa.table({"a": [1]}), uri)
     session = lance.Session(metadata_cache_size_bytes=1024)
-    assert open_dataset(uri, DatasetOpenOptions(session=session)).session().is_same_as(session)
+    assert open_dataset(uri, session=session).session().is_same_as(session)
 
 
 def test_maintenance_context_reuses_session_and_latest_still_advances(tmp_path):

@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from threading import Lock, Thread
 from time import monotonic
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import lance
 
 # pylance exposes this public alias at runtime but omits its stub export.
 from lance import Session as Session  # type: ignore[attr-defined]
-from lance_namespace import LanceNamespace
-
-if TYPE_CHECKING:
-    from lance.commit import CommitLock
 
 DatasetUri = str | Path | None
 _session: Session | None = None
@@ -139,51 +133,12 @@ def shared_session(
         return _session
 
 
-@dataclass(frozen=True)
-class DatasetOpenOptions:
-    """Typed pylance open parameters; live handles stay in the current process."""
-
-    version: int | str | None = None
-    asof: str | datetime | None = None
-    block_size: int | None = None
-    commit_lock: CommitLock | None = None
-    index_cache_size: int | None = None
-    storage_options: dict[str, str] | None = None
-    default_scan_options: dict[str, Any] | None = None
-    metadata_cache_size_bytes: int | None = None
-    index_cache_size_bytes: int | None = None
-    read_params: dict[str, Any] | None = None
-    session: Session | None = None
-    namespace_client: LanceNamespace | None = None
-    table_id: list[str] | None = None
-    base_store_params: dict[str, dict[str, str]] | None = None
-
-    def resolve_session(self) -> Session:
-        if self.session is not None:
-            return self.session
-        return shared_session(
-            index_cache_size=self.index_cache_size,
-            index_cache_size_bytes=self.index_cache_size_bytes,
-            metadata_cache_size_bytes=self.metadata_cache_size_bytes,
+def open_dataset(uri: DatasetUri, **kwargs: Any) -> lance.LanceDataset:
+    """Open through the process Session, forwarding all other options to Lance."""
+    if kwargs.get("session") is None:
+        kwargs["session"] = shared_session(
+            index_cache_size=kwargs.get("index_cache_size"),
+            index_cache_size_bytes=kwargs.get("index_cache_size_bytes"),
+            metadata_cache_size_bytes=kwargs.get("metadata_cache_size_bytes"),
         )
-
-
-def open_dataset(uri: DatasetUri, options: DatasetOpenOptions | None = None) -> lance.LanceDataset:
-    options = options if options is not None else DatasetOpenOptions()
-    return lance.dataset(
-        uri,
-        version=options.version,
-        asof=options.asof,
-        block_size=options.block_size,
-        commit_lock=options.commit_lock,
-        index_cache_size=options.index_cache_size,
-        storage_options=options.storage_options,
-        default_scan_options=options.default_scan_options,
-        metadata_cache_size_bytes=options.metadata_cache_size_bytes,
-        index_cache_size_bytes=options.index_cache_size_bytes,
-        read_params=options.read_params,
-        session=options.resolve_session(),
-        namespace_client=options.namespace_client,
-        table_id=options.table_id,
-        base_store_params=options.base_store_params,
-    )
+    return lance.dataset(uri, **kwargs)

@@ -26,7 +26,7 @@ from daft_lance._blob import (
     detect_blob_v2_columns,
     resolve_storage_version,
 )
-from daft_lance._runtime import CacheConfigurationError, DatasetOpenOptions, open_dataset, shared_session
+from daft_lance._runtime import CacheConfigurationError, open_dataset, shared_session
 from daft_lance.namespace import (
     ResolvedNamespaceTable,
     get_namespace_commit_kwargs,
@@ -349,7 +349,8 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         try:
             dataset = open_dataset(
                 self._dataset_uri_arg,
-                DatasetOpenOptions(storage_options=self._storage_options, **self._namespace_kwargs),
+                storage_options=self._storage_options,
+                **self._namespace_kwargs,
             )
         except (ValueError, FileNotFoundError, OSError) as e:
             # Pinned to the Rust message format; lance has no typed exception. See test_lance_message_format_unchanged.
@@ -455,7 +456,8 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         try:
             ds = open_dataset(
                 self._dataset_uri_arg,
-                DatasetOpenOptions(storage_options=self._storage_options, **self._namespace_kwargs),
+                storage_options=self._storage_options,
+                **self._namespace_kwargs,
             )
         except (ValueError, FileNotFoundError, OSError) as error:
             if isinstance(error, CacheConfigurationError) or "was not found" not in str(error):
@@ -639,9 +641,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if self._checkpoint is None:
             raise RuntimeError("checking a Lance checkpoint commit requires the driver-side CheckpointStore")
         self._ensure_started()
-        dataset = open_dataset(
-            self._dataset_uri_arg, DatasetOpenOptions(storage_options=self._storage_options, **self._namespace_kwargs)
-        )
+        dataset = open_dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
         return self._idempotence_key_exists(dataset)
 
     def _finalize_uncheckpointed(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
@@ -687,7 +687,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         # and the commit declares it as its read version.
         pinned = open_dataset(
             self._dataset_uri_arg,
-            DatasetOpenOptions(version=self._version, storage_options=self._storage_options, **self._namespace_kwargs),
+            version=self._version,
+            storage_options=self._storage_options,
+            **self._namespace_kwargs,
         )
         open_context = DatasetOpenContext.from_dataset(
             pinned,
@@ -710,14 +712,13 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             )
             dataset = open_dataset(
                 self._dataset_uri_arg,
-                DatasetOpenOptions(storage_options=self._storage_options, **self._namespace_kwargs),
+                storage_options=self._storage_options,
+                **self._namespace_kwargs,
             )
         return _dataset_stats(dataset)
 
     def _finalize_mem_wal(self, write_results: list[WriteResult[list[FragmentMetadata]]]) -> MicroPartition:
-        dataset = open_dataset(
-            self._dataset_uri_arg, DatasetOpenOptions(storage_options=self._storage_options, **self._namespace_kwargs)
-        )
+        dataset = open_dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
 
         if self._compact_after_write:
             logger.info(
@@ -740,7 +741,8 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
             )
             dataset = open_dataset(
                 self._dataset_uri_arg,
-                DatasetOpenOptions(storage_options=self._storage_options, **self._namespace_kwargs),
+                storage_options=self._storage_options,
+                **self._namespace_kwargs,
             )
 
         return _dataset_stats(dataset)
@@ -755,9 +757,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         assert self._checkpoint is not None
         self._ensure_started()
 
-        dataset = open_dataset(
-            self._dataset_uri_arg, DatasetOpenOptions(storage_options=self._storage_options, **self._namespace_kwargs)
-        )
+        dataset = open_dataset(self._dataset_uri_arg, storage_options=self._storage_options, **self._namespace_kwargs)
         pending_ids = self._pending_checkpoint_ids()
 
         # Check the Lance history again at finalize time. The pre-check in
