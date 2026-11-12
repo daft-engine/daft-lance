@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import lance
@@ -317,6 +318,26 @@ def take_blobs(df: DataFrame, ds: lance.LanceDataset, column: str) -> DataFrame:
     return df.with_column(column, take_blobs_udf(df["_rowid"]))
 
 
+class _WorkerDataset:
+    """Lazy Dataset owned by one deserialized UDF instance, never process-global."""
+
+    def __init__(self, uri: str, open_kwargs: dict[str, Any]) -> None:
+        self._uri = uri
+        self._open_kwargs = dict(open_kwargs)
+        self._dataset: lance.LanceDataset | None = None
+        self._lock = Lock()
+
+    def __reduce__(self) -> tuple[type[_WorkerDataset], tuple[str, dict[str, Any]]]:
+        # Every deserialized instance starts unopened with its own lock.
+        return type(self), (self._uri, self._open_kwargs)
+
+    def get(self) -> lance.LanceDataset:
+        with self._lock:
+            if self._dataset is None:
+                self._dataset = open_dataset_from_open_kwargs(self._uri, self._open_kwargs)
+            return self._dataset
+
+
 def read_blobs(
     df: DataFrame,
     ds: lance.LanceDataset,
@@ -348,19 +369,13 @@ def read_blobs(
     #    manifest cache. The uri, version and storage options are enough.
     uri = ds.uri
     open_kwargs: dict[str, Any] = {"version": ds.version, "storage_options": ds._storage_options}
-    worker_ds: list[lance.LanceDataset] = []
-
-    def _worker_dataset() -> lance.LanceDataset:
-        # Opened once per worker process, then reused for every batch.
-        if not worker_ds:
-            worker_ds.append(open_dataset_from_open_kwargs(uri, open_kwargs))
-        return worker_ds[0]
+    worker_dataset = _WorkerDataset(uri, open_kwargs)
 
     @daft.func.batch(return_dtype=DataType.binary(), batch_size=batch_size)
     def read_blobs_udf(row_ids: Series) -> Series:
         ids = row_ids.to_pylist()
         valid = [i for i, row_id in enumerate(ids) if row_id is not None]
-        blobs = _worker_dataset().read_blobs(
+        blobs = worker_dataset.get().read_blobs(
             column,
             ids=[ids[i] for i in valid],
             io_buffer_size=io_buffer_size,
