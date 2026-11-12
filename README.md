@@ -453,8 +453,6 @@ including Lance's limitations when serializing namespace clients. Bare Dataset i
 read, default-scan, and base-store options exposed by Lance; options Lance does not
 retain cannot be reconstructed. A supplied context must match the Dataset URI and version.
 
-See [performance observations](docs/session-performance.md) for benchmark results and limitations.
-
 ## Migration
 
 The migration only requires replacing `daft.io.lance` with `daft_lance`.
