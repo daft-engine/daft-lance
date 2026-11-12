@@ -26,7 +26,7 @@ from daft_lance._blob import (
     detect_blob_v2_columns,
     resolve_storage_version,
 )
-from daft_lance._runtime import CacheConfigurationError, open_dataset, shared_session
+from daft_lance._runtime import CacheConfigurationError, open_dataset, session_for_open
 from daft_lance.namespace import (
     ResolvedNamespaceTable,
     get_namespace_commit_kwargs,
@@ -432,7 +432,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         wrapped = self._blob.wrap_table(table)
         fragments = lance.fragment.write_fragments(
             wrapped,
-            session=shared_session(),
+            session=session_for_open(),
             dataset_uri=self._table_uri,
             mode=self._write_mode,
             storage_options=self._storage_options,

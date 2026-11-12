@@ -418,103 +418,40 @@ use the `daft_lance` entry points shown above for namespace-addressed tables.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `DAFT_LANCE_NAMESPACE_CACHE_SIZE` | `16` | Size of the per-(implementation, properties) namespace client cache. Read once at import time. |
-| `DAFT_LANCE_SHARE_SESSION` | `1` | Every dataset this extension opens in a process shares one lance `Session`, so a table's manifest and lance's caches are held once instead of once per scan task, maintenance UDF and writer. Set to `0` to give each open its own session (lance's own default); on a many-fragment table that costs one copy of the fragment list per concurrently open dataset. |
-
-### What sharing a session actually saves, per path
-
-The performance numbers below are from the original PR measurements; the
-implementation update did not rerun the large-table benchmark.
-
-Measured, because the three paths differ and only one of them multiplies by
-concurrency. The numbers come from a `read_lance` -> `write_parquet` pipeline in
-a Ray worker, which is the shape this matters most in: a task holds its parquet
-writer's buffers at the same time as its manifest, so what sharing frees becomes
-headroom the writer can use.
-
-| Path | Opens per worker process | What sharing changes |
-| --- | --- | --- |
-| Scans, `read_blobs`, writes | `scantask_max_parallel` concurrent opens in one process | Collapses them to one manifest. Measured: 49 MB less resident on a 4000-fragment table at concurrency 24, and 479 MB on a 100k-fragment one at concurrency 8 -- where the pipeline also finished **9.8x sooner** (610s to 62s), because each unshared task re-parsed the same 8 MB manifest. At that scale the cost of not sharing is mostly time, not memory. |
-| Indexed (`nearest`, point lookups) | One index-driven task, whatever the concurrency | The index is loaded once per process instead of once per query. Measured at 200k rows: repeated queries 1.7-2.0x faster. |
-| Maintenance (`compact_files`, `update_columns`, `merge_columns`) | One, always | Nothing to collapse: Daft gives each `daft.cls` instance a process of its own, so a maintenance worker opens the table exactly once however high the concurrency. |
-
-An index does not change the maintenance row. A maintenance task's open brings
-in the index's metadata entry and nothing else; the index data is read once, on
-the driver, when the commit remaps every entry onto the new fragment ids. The
-tests that pin both halves down are
-`tests/io/lance/test_ray_session_memory.py::test_maintenance_instances_each_get_their_own_process`
-and
-`tests/io/lance/test_shared_session.py::test_compaction_loads_the_index_in_its_commit_not_in_its_tasks`.
-
-Two knobs keep a large table affordable without weakening any of that, because
-a manifest is the table's whole fragment list and an open costs the same
-whatever its task goes on to read: `read_lance(..., fragment_group_size=N)`
-puts several fragments in one scan task, and reading only a prefix of the table
-prunes whole fragments. At 100k fragments, reading 1% through groups of ten
-turns a billion-row scan into ten million rows and 100k tasks into a hundred,
-while each of the concurrent opens still carries the same 47 MB fragment list.
-What has to survive is the overlap: enough tasks to keep the concurrency in
-flight.
-
-One caveat if you measure this yourself: a `Session` reports both `size_bytes()`
-and `index_cache_size_bytes()`, and they are not the same accounting. Only
-`size_bytes()` tracks resident memory — on a 200k-row IVF_PQ index it moves by
-about 5 MB per loaded copy, matching the process's own RSS, where
-`index_cache_size_bytes()` reads 37 MB.
-
+| `DAFT_LANCE_NAMESPACE_CACHE_SIZE` | `16` | Namespace client cache size, read at import time. |
+| `DAFT_LANCE_SHARE_SESSION` | `1` | Share a process-local Lance Session for default opens and fragment writes. `0`, `false`, or `no` restores Lance's per-open behavior. |
+| `DAFT_LANCE_METADATA_CACHE_SIZE_BYTES` | Lance default | Metadata capacity of the default shared Session, in bytes. |
+| `DAFT_LANCE_INDEX_CACHE_SIZE_BYTES` | Lance default | Index capacity of the default shared Session, in bytes. |
 
 ### Shared Lance caches
 
-Daft-Lance lazily creates one automatically managed Lance Session per process,
-shared by all tables for dataset opens and `write_fragments` calls. Tasks carry
-serializable open arguments; the native Session is created in the worker.
-Dataset and network operations run outside the Session initialization lock.
-Set `DAFT_LANCE_SHARE_SESSION=0` (also `false` or `no`) to disable sharing
-across all opens and fragment writes; each call then receives a fresh Session.
+Default opens reuse one Session per process across tables. Explicit Sessions are
+preserved. If any cache-size argument is explicitly supplied (including zero),
+Lance creates an independent Session using those arguments; earlier opens cannot
+constrain later calls. Legacy `index_cache_size` is interpreted by Lance.
 
-Configure cache capacities in bytes in the driver and worker environments:
+Capacity environment variables affect only the default shared Session and must be
+nonnegative integers. Set them in driver and worker environments before first use.
+The Session lives until process exit or explicit `daft_lance.namespace.reset_shared_session()`.
+Reset releases the global reference; existing Dataset handles remain usable and keep
+their Session. The next default open reads the current environment settings.
+There is no TTL or cleanup thread. Fork resets the global Session reference and lock;
+this does not make Lance itself fork-safe. Use Lance-supported process startup modes.
 
-```bash
-export DAFT_LANCE_METADATA_CACHE_SIZE_BYTES=1073741824
-export DAFT_LANCE_INDEX_CACHE_SIZE_BYTES=268435456
-```
+Opens and network I/O run outside the initialization lock. Each process has its own
+cache budget, shared across tables. A URI must identify the same underlying dataset;
+identical URIs addressing different endpoint data require isolated Sessions.
+Lance controls cache admission and eviction. Metadata reuse depends on cache capacity
+and Lance's loading path; no V1-manifest workaround or process-wide Dataset cache is added.
+Pinned reads retain their version; latest opens still resolve the current version.
 
-The first Session initialization fixes the process-wide capacities: explicit
-read sizes take precedence over environment defaults, then Lance defaults.
-Later calls without explicit sizes use these fixed capacities; conflicting
-explicit sizes fail clearly instead of being silently ignored. Set the same
-capacity environment variables in driver and workers before first use. Capacity
-environment changes require restarting the process or calling the internal
-`clear_caches()` helper. Legacy `index_cache_size` uses pylance's conversion of
-20 MiB per entry. Explicit externally supplied Sessions are preserved.
+`read_blobs` retains a Dataset only within each UDF closure instance. For namespace
+Datasets, pass the originating handle's `worker_open_context()` as `open_context` to
+preserve namespace credential refresh. Bare Dataset inputs preserve the storage,
+read, default-scan, and base-store options exposed by Lance; options Lance does not
+retain cannot be reconstructed. A supplied context must match the Dataset URI and version.
 
-Capacities are shared across tables within a process, not multiplied per table.
-Each worker has its own budget. All users of the global Session must agree that
-a URI identifies the same dataset; identical URIs addressing different data on
-different endpoints require separate processes or explicitly isolated Sessions.
-Storage options and namespace credentials continue to be passed to each open
-and write operation.
-
-Each operation opens its own Dataset while reusing a Session. There is no
-Dataset cache or special handling for V1 manifest naming. Manifest and index
-cache admission, identity, and eviction are managed by Lance itself; the intended
-metadata-reuse path uses V2 manifest naming.
-
-`DAFT_LANCE_CACHE_TTL_SECONDS` controls idle Session retention (default 300
-seconds) and requires a positive integer. Byte capacities require nonnegative
-integers. Invalid settings report the variable name and value.
-
-A process-local daemon sweeps the global Session every 30 seconds, including
-when the worker receives no further requests. An idle Session can remain for
-up to TTL plus one sweep interval. Cleanup drops the global reference without
-closing handles held by active tasks. A later open recreates the Session with
-the same fixed capacities; explicit `clear_caches()` also resets configuration.
-Fork resets the Session, configuration, lock, and cleanup thread. Native
-allocators may retain memory after references are released, so TTL is not an
-RSS limit. There is no Session LRU pool or per-key Future.
-
-Worker reads retain their pinned version, while operations opening latest
-still resolve the current version.
+See [performance observations](docs/session-performance.md) for benchmark results and limitations.
 
 ## Migration
 

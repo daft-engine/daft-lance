@@ -23,7 +23,7 @@ def reset_global_session():
 def test_concurrent_opens_share_session_and_keep_snapshot(tmp_path):
     uri = str(tmp_path / "table")
     lance.write_dataset(pa.table({"a": [1, 2]}), uri)
-    handle = construct_lance_dataset_handle(uri, metadata_cache_size_bytes=32 * 1024 * 1024)
+    handle = construct_lance_dataset_handle(uri)
     with ThreadPoolExecutor(max_workers=4) as executor:
         datasets = list(executor.map(lambda _: open_dataset_from_open_kwargs(uri, handle.open_kwargs), range(8)))
     assert len({id(ds) for ds in datasets}) == len(datasets)
@@ -37,22 +37,45 @@ def test_concurrent_opens_share_session_and_keep_snapshot(tmp_path):
     assert open_dataset(uri).to_table().to_pydict() == {"a": [99]}
 
 
-def test_global_session_capacity(tmp_path, monkeypatch):
-    monkeypatch.setenv("DAFT_LANCE_INDEX_CACHE_SIZE_BYTES", "1048576")
-    first = shared_session()
-    assert first.is_same_as(shared_session(index_cache_size_bytes=1048576))
-    with pytest.raises(CacheConfigurationError, match="global Session already configured"):
-        shared_session(index_cache_size_bytes=2097152)
+@pytest.mark.parametrize("option", ["metadata_cache_size_bytes", "index_cache_size_bytes", "index_cache_size"])
+@pytest.mark.parametrize("size", [0, 1048576])
+def test_explicit_capacity_is_independent(tmp_path, option, size):
+    uri = str(tmp_path / "table")
+    lance.write_dataset(pa.table({"a": [1]}), uri)
+    default = open_dataset(uri)
+    custom = open_dataset(uri, **{option: size})
+    assert not custom.session().is_same_as(default.session())
+    assert open_dataset(uri).session().is_same_as(default.session())
+    assert custom.to_table().to_pydict() == {"a": [1]}
     clear_caches()
-    assert shared_session(index_cache_size=1).is_same_as(shared_session(index_cache_size_bytes=20 * 1024 * 1024))
+    custom_first = open_dataset(uri, **{option: size})
+    assert not open_dataset(uri).session().is_same_as(custom_first.session())
+
+
+def test_invalid_shared_configuration_and_reset(tmp_path, monkeypatch):
+    uri = str(tmp_path / "table")
+    lance.write_dataset(pa.table({"a": [1]}), uri)
+    monkeypatch.setenv("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES", "1GiB")
+    with pytest.raises(CacheConfigurationError, match="DAFT_LANCE_METADATA_CACHE_SIZE_BYTES"):
+        open_dataset(uri)
+    custom = open_dataset(uri, metadata_cache_size_bytes=1024)
+    assert custom.to_table().num_rows == 1
+    monkeypatch.setenv("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES", "1048576")
+    first = open_dataset(uri)
     clear_caches()
-    datasets = []
-    for i in range(2):
-        uri = str(tmp_path / f"table-{i}")
-        lance.write_dataset(pa.table({"a": [i]}), uri)
-        datasets.append(open_dataset(uri))
-    assert datasets[0].session().is_same_as(datasets[1].session())
-    assert [ds.to_table()["a"].to_pylist() for ds in datasets] == [[0], [1]]
+    assert not first.session().is_same_as(open_dataset(uri).session())
+    assert first.to_table().num_rows == 1
+
+
+def test_maintenance_explicit_capacity_is_independent(tmp_path):
+    uri = str(tmp_path / "maintenance-custom")
+    lance.write_dataset(pa.table({"a": [1]}), uri)
+    default = shared_session()
+    handle = construct_lance_dataset_handle(uri, metadata_cache_size_bytes=1024)
+    worker = handle.worker_open_context().open_pinned()
+    assert not worker.session().is_same_as(default)
+    assert not worker.session().is_same_as(handle.dataset.session())
+    assert worker.to_table().to_pydict() == {"a": [1]}
 
 
 def test_fragment_writes_share_worker_session_without_serializing_it(tmp_path, monkeypatch):

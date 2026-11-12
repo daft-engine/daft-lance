@@ -13,7 +13,7 @@ from daft.datatype import DataType
 from daft.dependencies import pa
 from daft.series import Series
 from daft_lance._metadata import LANCE_BLOB_DESCRIPTOR_TYPE
-from daft_lance.namespace import open_dataset_from_open_kwargs
+from daft_lance.namespace import DatasetOpenContext
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -321,20 +321,19 @@ def take_blobs(df: DataFrame, ds: lance.LanceDataset, column: str) -> DataFrame:
 class _WorkerDataset:
     """Lazy Dataset owned by one deserialized UDF instance, never process-global."""
 
-    def __init__(self, uri: str, open_kwargs: dict[str, Any]) -> None:
-        self._uri = uri
-        self._open_kwargs = dict(open_kwargs)
+    def __init__(self, context: DatasetOpenContext) -> None:
+        self._context = context
         self._dataset: lance.LanceDataset | None = None
         self._lock = Lock()
 
-    def __reduce__(self) -> tuple[type[_WorkerDataset], tuple[str, dict[str, Any]]]:
+    def __reduce__(self) -> tuple[type[_WorkerDataset], tuple[DatasetOpenContext]]:
         # Every deserialized instance starts unopened with its own lock.
-        return type(self), (self._uri, self._open_kwargs)
+        return type(self), (self._context,)
 
     def get(self) -> lance.LanceDataset:
         with self._lock:
             if self._dataset is None:
-                self._dataset = open_dataset_from_open_kwargs(self._uri, self._open_kwargs)
+                self._dataset = self._context.open_pinned()
             return self._dataset
 
 
@@ -345,6 +344,7 @@ def read_blobs(
     *,
     batch_size: int = 16,
     io_buffer_size: int | None = None,
+    open_context: DatasetOpenContext | None = None,
 ) -> DataFrame:
     """Replace the blob descriptor column with the full blob payloads as binary.
 
@@ -355,7 +355,8 @@ def read_blobs(
     Each UDF call reads up to ``batch_size`` rows and holds all of their blobs in
     memory at once. The small default keeps memory bounded for large blobs such as
     videos; raise it for small blobs. ``io_buffer_size`` is forwarded to Lance's
-    blob reader.
+    blob reader. For namespace datasets, pass the originating handle's
+    ``worker_open_context()`` as ``open_context`` to preserve credential refresh.
     """
     # (1) Validate that we can actually materialize the blobs
     _validate_blob_column(df, column)
@@ -366,10 +367,18 @@ def read_blobs(
     #    Closing over ``ds`` would pickle it, and ``LanceDataset.__reduce__``
     #    carries the whole re-encoded manifest -- one copy of the table's entire
     #    fragment list per task, which also bypasses the shared session's
-    #    manifest cache. The uri, version and storage options are enough.
-    uri = ds.uri
-    open_kwargs: dict[str, Any] = {"version": ds.version, "storage_options": ds._storage_options}
-    worker_dataset = _WorkerDataset(uri, open_kwargs)
+    #    manifest cache. The context preserves the pinned worker open parameters.
+    if open_context is None:
+        if ds._namespace_client is not None:
+            raise ValueError(
+                "read_blobs requires open_context for namespace datasets; pass handle.worker_open_context()"
+            )
+        open_context = DatasetOpenContext.from_dataset(ds, ds.uri)
+    elif open_context.uri != ds.uri or open_context.version != ds.version:
+        raise ValueError("open_context must identify the same URI and pinned version as ds")
+    if ds._namespace_client is not None and (open_context.namespace_impl is None or open_context.table_id is None):
+        raise ValueError("open_context must preserve the namespace implementation and table_id")
+    worker_dataset = _WorkerDataset(open_context)
 
     @daft.func.batch(return_dtype=DataType.binary(), batch_size=batch_size)
     def read_blobs_udf(row_ids: Series) -> Series:

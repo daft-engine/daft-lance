@@ -82,6 +82,7 @@ class LanceDatasetHandle:
             managed_versioning=self.managed_versioning,
             block_size=self.open_kwargs.get("block_size"),
             index_cache_size=self.open_kwargs.get("index_cache_size"),
+            index_cache_size_bytes=self.open_kwargs.get("index_cache_size_bytes"),
             metadata_cache_size_bytes=self.open_kwargs.get("metadata_cache_size_bytes"),
             # The stripped variant that was actually handed to pylance; the
             # unstripped copy on this handle is for Daft planning only.
