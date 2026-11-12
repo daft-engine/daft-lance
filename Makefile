@@ -18,10 +18,7 @@ build: sync  ## Build sdist and wheel packages
 
 .PHONY: test
 test: sync  ## Run tests
-	# Disable Ray's uv-run environment replication: workers already inherit the
-	# raylet interpreter, so packaging the workspace and rebuilding a venv per
-	# worker is unnecessary and can prevent actor startup.
-	DAFT_ANALYTICS_ENABLED=0 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 uv run pytest tests/ -v $(EXTRA_ARGS)
+	DAFT_ANALYTICS_ENABLED=0 uv run pytest tests/ -v $(EXTRA_ARGS)
 
 .PHONY: format
 format: sync  ## Format Python code
