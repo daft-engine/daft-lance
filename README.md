@@ -446,8 +446,10 @@ and Lance's loading path; no V1-manifest workaround or process-wide Dataset cach
 Pinned reads retain their version; latest opens still resolve the current version.
 
 `read_blobs` retains a Dataset only within each UDF closure instance. For namespace
-Datasets, pass the originating handle's `worker_open_context()` as `open_context` to
-preserve namespace credential refresh. Bare Dataset inputs preserve the storage,
+Datasets, optionally pass the originating handle's `worker_open_context()` as
+`open_context` to preserve namespace credential refresh when reopening on workers.
+Without this context, namespace inputs retain the original Dataset closure behavior,
+including Lance's limitations when serializing namespace clients. Bare Dataset inputs preserve the storage,
 read, default-scan, and base-store options exposed by Lance; options Lance does not
 retain cannot be reconstructed. A supplied context must match the Dataset URI and version.
 

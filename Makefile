@@ -18,13 +18,9 @@ build: sync  ## Build sdist and wheel packages
 
 .PHONY: test
 test: sync  ## Run tests
-	# RAY_ENABLE_UV_RUN_RUNTIME_ENV=0: Ray walks the driver's process tree, sees
-	# the `uv run` below, and then replicates that environment to every worker --
-	# packaging the whole working directory and rebuilding the venv per worker.
-	# Under DAFT_RUNNER=ray that makes worker startup fail once the suite has
-	# created enough actors: 277 tests died with ActorUnschedulableError, and the
-	# same suite passes in 46s with it off. Workers inherit this venv's
-	# interpreter from the raylet regardless.
+	# Disable Ray's uv-run environment replication: workers already inherit the
+	# raylet interpreter, so packaging the workspace and rebuilding a venv per
+	# worker is unnecessary and can prevent actor startup.
 	DAFT_ANALYTICS_ENABLED=0 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 uv run pytest tests/ -v $(EXTRA_ARGS)
 
 .PHONY: format

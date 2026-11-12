@@ -356,35 +356,34 @@ def read_blobs(
     memory at once. The small default keeps memory bounded for large blobs such as
     videos; raise it for small blobs. ``io_buffer_size`` is forwarded to Lance's
     blob reader. For namespace datasets, pass the originating handle's
-    ``worker_open_context()`` as ``open_context`` to preserve credential refresh.
+    ``worker_open_context()`` as ``open_context`` to preserve credential refresh
+    when reopening on workers. Without it, namespace inputs retain the original
+    Dataset closure behavior, including Lance's serialization limitations.
     """
     # (1) Validate that we can actually materialize the blobs
     _validate_blob_column(df, column)
     if batch_size < 1:
         raise ValueError(f"batch_size must be at least 1, got {batch_size}")
 
-    # 2. Create a UDF closure that reopens the pinned snapshot on the worker.
-    #    Closing over ``ds`` would pickle it, and ``LanceDataset.__reduce__``
-    #    carries the whole re-encoded manifest -- one copy of the table's entire
-    #    fragment list per task, which also bypasses the shared session's
-    #    manifest cache. The context preserves the pinned worker open parameters.
+    # Prefer serializable reopen state. A namespace Dataset alone does not
+    # expose its client's construction arguments, so preserve the original
+    # Dataset closure when the caller has not supplied that context.
     if open_context is None:
-        if ds._namespace_client is not None:
-            raise ValueError(
-                "read_blobs requires open_context for namespace datasets; pass handle.worker_open_context()"
-            )
-        open_context = DatasetOpenContext.from_dataset(ds, ds.uri)
-    elif open_context.uri != ds.uri or open_context.version != ds.version:
-        raise ValueError("open_context must identify the same URI and pinned version as ds")
-    if ds._namespace_client is not None and (open_context.namespace_impl is None or open_context.table_id is None):
-        raise ValueError("open_context must preserve the namespace implementation and table_id")
-    worker_dataset = _WorkerDataset(open_context)
+        if ds._namespace_client is None:
+            open_context = DatasetOpenContext.from_dataset(ds, ds.uri)
+    else:
+        if open_context.uri != ds.uri or open_context.version != ds.version:
+            raise ValueError("open_context must identify the same URI and pinned version as ds")
+        if ds._namespace_client is not None and (open_context.namespace_impl is None or open_context.table_id is None):
+            raise ValueError("open_context must preserve the namespace implementation and table_id")
+    reader = _WorkerDataset(open_context) if open_context is not None else ds
 
     @daft.func.batch(return_dtype=DataType.binary(), batch_size=batch_size)
     def read_blobs_udf(row_ids: Series) -> Series:
         ids = row_ids.to_pylist()
         valid = [i for i, row_id in enumerate(ids) if row_id is not None]
-        blobs = worker_dataset.get().read_blobs(
+        dataset = reader.get() if isinstance(reader, _WorkerDataset) else reader
+        blobs = dataset.read_blobs(
             column,
             ids=[ids[i] for i in valid],
             io_buffer_size=io_buffer_size,

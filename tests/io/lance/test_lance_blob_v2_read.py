@@ -384,3 +384,127 @@ def test_read_blobs_batch_size_bounds_reads(
     assert sum(n for n, _ in calls) == 40
     assert max(n for n, _ in calls) <= expected_max
     assert {buf for _, buf in calls} == {1 << 20}
+
+
+@pytest.mark.parametrize("with_context", [False, True])
+def test_namespace_blob_read_preserves_old_call_and_optional_context(tmp_path: Path, with_context: bool) -> None:
+    import pickle
+
+    import lance_namespace
+
+    from daft_lance.namespace import DatasetOpenContext
+
+    uri = str(tmp_path / "blobs.lance")
+    payloads = [b"hello", b"world"]
+    lance.write_dataset(pa.table({"id": [0, 1], "blob": lance.blob_array(payloads)}), uri, data_storage_version="2.2")
+    # Construct directly through Lance: callers need not own a Daft-Lance handle.
+    properties = {"root": str(tmp_path)}
+    client = lance_namespace.connect("dir", properties)
+    dataset = lance.LanceDataset(uri, namespace_client=client, table_id=["blobs"])
+    assert [payload for _, payload in dataset.read_blobs("blob", ids=[0, 1])] == payloads
+    context = None
+    if with_context:
+        context = DatasetOpenContext.from_dataset(
+            dataset, uri, namespace_impl="dir", namespace_properties=properties, table_id=["blobs"]
+        )
+        context = pickle.loads(pickle.dumps(context))
+        reopened = context.open_pinned()
+        assert reopened._namespace_client is not None
+        assert reopened._table_id == ["blobs"]
+        assert [payload for _, payload in reopened.read_blobs("blob", ids=[0, 1])] == payloads
+    df = daft.read_lance(uri, default_scan_options={"with_row_id": True})
+    if with_context:
+        actual = read_blobs(df, dataset, "blob", open_context=context)
+    else:
+        actual = read_blobs(df, dataset, "blob")
+    assert actual.sort("id").to_pydict()["blob"] == payloads
+
+
+@pytest.mark.parametrize("mismatch", ["uri", "version", "namespace"])
+def test_blob_rejects_mismatched_explicit_context(tmp_path: Path, mismatch: str) -> None:
+    from dataclasses import replace
+
+    import lance_namespace
+
+    from daft_lance.namespace import DatasetOpenContext
+
+    uri = str(tmp_path / "blobs.lance")
+    lance.write_dataset(pa.table({"blob": lance.blob_array([b"hello"])}), uri, data_storage_version="2.2")
+    properties = {"root": str(tmp_path)}
+    dataset = lance.LanceDataset(uri, namespace_client=lance_namespace.connect("dir", properties), table_id=["blobs"])
+    context = DatasetOpenContext.from_dataset(
+        dataset, uri, namespace_impl="dir", namespace_properties=properties, table_id=["blobs"]
+    )
+    if mismatch == "uri":
+        context = replace(context, uri=uri + "-other")
+    elif mismatch == "version":
+        context = replace(context, version=dataset.version + 1)
+    else:
+        context = replace(context, namespace_impl=None)
+    df = daft.read_lance(uri, default_scan_options={"with_row_id": True})
+    with pytest.raises(ValueError, match="open_context must"):
+        read_blobs(df, dataset, "blob", open_context=context)
+
+
+def test_blob_worker_preserves_open_parameters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pickle
+
+    from daft_lance._blob import _WorkerDataset
+    from daft_lance.namespace import DatasetOpenContext
+
+    uri = str(tmp_path / "blobs.lance")
+    lance.write_dataset(pa.table({"blob": lance.blob_array([b"hello"])}), uri, data_storage_version="2.2")
+    # This checks forwarding to the real constructor, not remote authentication.
+    base_options = {"s3://unused-test-base/": {"region": "us-east-1"}}
+    read_params = {"block_size": 8192}
+    dataset = lance.dataset(uri, base_store_params=base_options, read_params=read_params)
+    context = DatasetOpenContext.from_dataset(dataset, uri)
+    constructor = lance.LanceDataset
+    calls: list[dict[str, Any]] = []
+
+    def capture(*args: Any, **kwargs: Any) -> lance.LanceDataset:
+        calls.append(kwargs)
+        return constructor(*args, **kwargs)
+
+    monkeypatch.setattr("daft_lance.namespace.lance.LanceDataset", capture)
+    worker = pickle.loads(pickle.dumps(_WorkerDataset(context)))
+    assert not calls
+    reopened = worker.get()
+    assert calls[0]["base_store_params"] == base_options
+    assert calls[0]["read_params"] == read_params
+    assert reopened._base_store_params == base_options
+    assert [payload for _, payload in reopened.read_blobs("blob", ids=[0])] == [b"hello"]
+
+
+def test_blob_worker_opens_once_per_deserialized_instance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import pickle
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Lock
+
+    from daft_lance._blob import _WorkerDataset
+    from daft_lance.namespace import DatasetOpenContext
+
+    uri = str(tmp_path / "blobs.lance")
+    dataset = lance.write_dataset(pa.table({"blob": lance.blob_array([b"hello"])}), uri, data_storage_version="2.2")
+    context = DatasetOpenContext.from_dataset(dataset, uri)
+    original = DatasetOpenContext.open_pinned
+    calls = 0
+    counter_lock = Lock()
+
+    def capture(self: DatasetOpenContext) -> lance.LanceDataset:
+        nonlocal calls
+        with counter_lock:
+            calls += 1
+        return original(self)
+
+    monkeypatch.setattr(DatasetOpenContext, "open_pinned", capture)
+    worker = pickle.loads(pickle.dumps(_WorkerDataset(context)))
+    assert calls == 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        opened = list(pool.map(lambda _: worker.get(), range(32)))
+    assert calls == 1
+    assert all(ds is opened[0] for ds in opened)
+    second = pickle.loads(pickle.dumps(worker))
+    assert calls == 1
+    assert second.get() is not opened[0]
+    assert calls == 2
