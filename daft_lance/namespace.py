@@ -36,7 +36,7 @@ from urllib.parse import unquote, urlparse
 import lance
 from lance_namespace import DeclareTableResponse, DescribeTableResponse, LanceNamespace
 
-from ._runtime import Session, _reset_session, open_dataset, session_for_open, shared_session
+from ._runtime import Session, open_dataset, session_for_open, shared_session
 
 _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "16"))
 

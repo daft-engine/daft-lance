@@ -12,8 +12,8 @@ import pytest
 from pytest import TempPathFactory
 
 import daft
-from daft_lance._runtime import _reset_session
 from daft_lance._blob import read_blobs
+from daft_lance._runtime import _reset_session
 from daft_lance.namespace import (
     DatasetOpenContext,
     get_shared_session,
