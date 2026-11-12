@@ -419,7 +419,7 @@ use the `daft_lance` entry points shown above for namespace-addressed tables.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `DAFT_LANCE_NAMESPACE_CACHE_SIZE` | `16` | Namespace client cache size, read at import time. |
-| `DAFT_LANCE_SHARE_SESSION` | `1` | Share a process-local Lance Session for default opens and fragment writes. `0`, `false`, or `no` restores Lance's per-open behavior. |
+| `DAFT_LANCE_SESSION_SHARING` | `true` | Share a process-local Lance Session for default opens and fragment writes. Set to `false` to restore Lance's per-open behavior. |
 | `DAFT_LANCE_METADATA_CACHE_SIZE_BYTES` | Lance default | Metadata capacity of the default shared Session, in bytes. |
 | `DAFT_LANCE_INDEX_CACHE_SIZE_BYTES` | Lance default | Index capacity of the default shared Session, in bytes. |
 

@@ -47,14 +47,14 @@ if hasattr(os, "register_at_fork"):
 
 
 def _sharing_enabled() -> bool:
-    return os.environ.get("DAFT_LANCE_SHARE_SESSION", "1").strip().lower() not in {"0", "false", "no"}
+    value = os.environ.get("DAFT_LANCE_SESSION_SHARING", "true").strip().lower()
+    if value not in {"true", "false"}:
+        raise ValueError(f"DAFT_LANCE_SESSION_SHARING={value!r}: expected 'true' or 'false'")
+    return value == "true"
 
 
-def shared_session() -> Session:
-    """Return the process Session, or a fresh Lance-default Session when disabled."""
+def _get_shared_session() -> Session:
     global _session
-    if not _sharing_enabled():
-        return Session()
     with _session_lock:
         if _session is None:
             _session = Session(
@@ -62,6 +62,13 @@ def shared_session() -> Session:
                 metadata_cache_size_bytes=_env_integer("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES"),
             )
         return _session
+
+
+def shared_session() -> Session:
+    """Return the process Session, or a fresh Lance-default Session when disabled."""
+    if not _sharing_enabled():
+        return Session()
+    return _get_shared_session()
 
 
 def session_for_open(
@@ -78,7 +85,7 @@ def session_for_open(
         size is not None for size in (index_cache_size, index_cache_size_bytes, metadata_cache_size_bytes)
     ):
         return None
-    return shared_session()
+    return _get_shared_session()
 
 
 def open_dataset(uri: DatasetUri, **kwargs: Any) -> lance.LanceDataset:

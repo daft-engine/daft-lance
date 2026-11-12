@@ -42,7 +42,7 @@ _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "1
 
 
 def get_shared_session() -> Session:
-    """Return the runtime's process Session, honoring DAFT_LANCE_SHARE_SESSION."""
+    """Return the runtime's process Session, honoring DAFT_LANCE_SESSION_SHARING."""
     return shared_session()
 
 

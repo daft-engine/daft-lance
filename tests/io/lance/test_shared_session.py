@@ -58,16 +58,16 @@ def test_internal_reset_builds_a_new_session() -> None:
 
 
 def test_kill_switch_gives_every_open_its_own_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``DAFT_LANCE_SHARE_SESSION=0`` restores lance's per-open sessions.
+    """``DAFT_LANCE_SESSION_SHARING=false`` restores lance's per-open sessions.
 
     This is the only way to get pre-sharing behavior inside a Ray worker, so
     the A/B benchmark depends on it: a driver-side patch never reaches there.
     """
-    monkeypatch.setenv("DAFT_LANCE_SHARE_SESSION", "0")
+    monkeypatch.setenv("DAFT_LANCE_SESSION_SHARING", "false")
     unshared = get_shared_session()
     assert not same_session(get_shared_session(), unshared)
 
-    monkeypatch.delenv("DAFT_LANCE_SHARE_SESSION")
+    monkeypatch.delenv("DAFT_LANCE_SESSION_SHARING")
     shared = get_shared_session()
     assert same_session(get_shared_session(), shared)
     assert not same_session(shared, unshared)

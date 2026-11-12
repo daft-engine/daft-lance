@@ -34,9 +34,9 @@ def test_worker_opens_honor_session_sharing(tmp_path: Path, sharing: bool) -> No
         from daft_lance.namespace import open_dataset_from_open_kwargs
 
         assert os.getpid() != driver_pid
-        previous = os.environ.get("DAFT_LANCE_SHARE_SESSION")
+        previous = os.environ.get("DAFT_LANCE_SESSION_SHARING")
         try:
-            os.environ["DAFT_LANCE_SHARE_SESSION"] = "1" if sharing else "0"
+            os.environ["DAFT_LANCE_SESSION_SHARING"] = "true" if sharing else "false"
             _reset_session()
             first = open_dataset_from_open_kwargs(uri, open_kwargs)
             second = open_dataset_from_open_kwargs(uri, open_kwargs)
@@ -49,9 +49,9 @@ def test_worker_opens_honor_session_sharing(tmp_path: Path, sharing: bool) -> No
             return [True] * len(column)
         finally:
             if previous is None:
-                os.environ.pop("DAFT_LANCE_SHARE_SESSION", None)
+                os.environ.pop("DAFT_LANCE_SESSION_SHARING", None)
             else:
-                os.environ["DAFT_LANCE_SHARE_SESSION"] = previous
+                os.environ["DAFT_LANCE_SESSION_SHARING"] = previous
             _reset_session()
 
     result = daft.from_pydict({"x": [0]}).select(check(daft.col("x")).alias("ok")).to_pydict()
