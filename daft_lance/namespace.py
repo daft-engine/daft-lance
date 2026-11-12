@@ -36,7 +36,14 @@ from urllib.parse import unquote, urlparse
 import lance
 from lance_namespace import DeclareTableResponse, DescribeTableResponse, LanceNamespace
 
+from ._runtime import Session, open_dataset, session_for_open, shared_session
+
 _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "16"))
+
+
+def get_shared_session() -> Session:
+    """Return the runtime's process Session, honoring DAFT_LANCE_SESSION_SHARING."""
+    return shared_session()
 
 
 def has_namespace_params(namespace_impl: str | None, table_id: list[str] | None) -> bool:
@@ -296,6 +303,9 @@ class DatasetOpenContext:
     index_cache_size: int | None = None
     metadata_cache_size_bytes: int | None = None
     default_scan_options: dict[str, Any] | None = field(default=None, repr=False)
+    read_params: dict[str, Any] | None = field(default=None, repr=False)
+    base_store_params: dict[str, dict[str, str]] | None = field(default=None, repr=False)
+    index_cache_size_bytes: int | None = None
 
     @classmethod
     def from_dataset(
@@ -311,13 +321,14 @@ class DatasetOpenContext:
         block_size: int | None = None,
         index_cache_size: int | None = None,
         metadata_cache_size_bytes: int | None = None,
+        index_cache_size_bytes: int | None = None,
         default_scan_options: dict[str, Any] | None = None,
     ) -> DatasetOpenContext:
         """Derive a context from the snapshot the driver actually opened."""
         return cls(
             uri=uri,
             version=dataset.version,
-            storage_options=storage_options,
+            storage_options=storage_options if storage_options is not None else dataset._storage_options,
             namespace_impl=namespace_impl,
             namespace_properties=namespace_properties,
             table_id=table_id,
@@ -325,7 +336,12 @@ class DatasetOpenContext:
             block_size=block_size,
             index_cache_size=index_cache_size,
             metadata_cache_size_bytes=metadata_cache_size_bytes,
-            default_scan_options=default_scan_options,
+            default_scan_options=default_scan_options
+            if default_scan_options is not None
+            else dataset._default_scan_options,
+            read_params=dataset._read_params,
+            base_store_params=dataset._base_store_params,
+            index_cache_size_bytes=index_cache_size_bytes,
         )
 
     @property
@@ -353,12 +369,20 @@ class DatasetOpenContext:
         """
         return lance.LanceDataset(
             self.uri,
+            session=session_for_open(
+                index_cache_size=self.index_cache_size,
+                index_cache_size_bytes=self.index_cache_size_bytes,
+                metadata_cache_size_bytes=self.metadata_cache_size_bytes,
+            ),
             version=version,
             storage_options=self.storage_options,
             block_size=self.block_size,
             index_cache_size=self.index_cache_size,
             metadata_cache_size_bytes=self.metadata_cache_size_bytes,
             default_scan_options=self.default_scan_options,
+            read_params=self.read_params,
+            base_store_params=self.base_store_params,
+            index_cache_size_bytes=self.index_cache_size_bytes,
             namespace_client=get_or_create_namespace(self.namespace_impl, self.namespace_properties),
             table_id=self.table_id,
             namespace_client_managed_versioning=self.managed_versioning,
@@ -385,7 +409,7 @@ def open_dataset_from_open_kwargs(ds_uri: str | None, open_kwargs: dict[str, Any
     """
     open_kwargs = dict(open_kwargs or {})
     namespace_impl, namespace_properties, table_id = pop_namespace_params(open_kwargs)
-    return lance.dataset(
+    return open_dataset(
         None if has_namespace_params(namespace_impl, table_id) else ds_uri,
         **get_namespace_kwargs(namespace_impl, namespace_properties, table_id),
         **open_kwargs,

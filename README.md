@@ -414,6 +414,34 @@ Native namespace support in `daft.read_lance` / `DataFrame.write_lance` is track
 [Eventual-Inc/Daft#7282](https://github.com/Eventual-Inc/Daft/issues/7282); until that lands,
 use the `daft_lance` entry points shown above for namespace-addressed tables.
 
+## Environment Variables
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DAFT_LANCE_NAMESPACE_CACHE_SIZE` | `16` | Namespace client cache size, read at import time. |
+| `DAFT_LANCE_SESSION_SHARING` | `true` | Share a process-local Lance Session for default opens and fragment writes. Set to `false` to restore Lance's per-open behavior. |
+| `DAFT_LANCE_METADATA_CACHE_SIZE_BYTES` | Lance default | Metadata capacity of the default shared Session, in bytes. |
+| `DAFT_LANCE_INDEX_CACHE_SIZE_BYTES` | Lance default | Index capacity of the default shared Session, in bytes. |
+
+### Shared Lance caches
+
+Daft-Lance shares one Lance Session per process by default. To compare behavior
+or troubleshoot, set `DAFT_LANCE_SESSION_SHARING=false`; set it to `true` (the
+default) to enable sharing.
+
+`DAFT_LANCE_METADATA_CACHE_SIZE_BYTES` and
+`DAFT_LANCE_INDEX_CACHE_SIZE_BYTES` set the corresponding cache capacities for
+the shared Session. Values must be nonnegative integers. Set them in both the
+driver and worker environments before the first dataset open. Each process has
+its own cache budget, shared across tables.
+
+These environment settings apply to default opens. Passing an explicit Lance
+Session or cache-size argument to an open uses that configuration independently.
+
+Use separate Sessions or processes if the same URI can refer to different data
+through different endpoints. Lance controls cache admission and eviction; reuse
+depends on the table's manifest format and available cache capacity.
+
 ## Migration
 
 The migration only requires replacing `daft.io.lance` with `daft_lance`.
@@ -472,6 +500,11 @@ data = df.select("blob_column").to_pydict()["blob_column"][0]  # bytes
 `read_blobs` reads blobs in batches of `batch_size` rows (default 16) and holds a
 whole batch in memory. Filter rows before calling it, and raise `batch_size` only
 when blobs are small.
+For namespace datasets on distributed runners, pass the originating handle's
+`worker_open_context()` as `open_context` to preserve namespace credential refresh
+when the worker reopens the pinned dataset. Without it, `read_blobs` keeps the
+original Dataset closure behavior, including Lance's namespace-client serialization
+limitations.
 
 For large blobs where you only need part of each one on the native runner, use
 `take_blobs` and call `.read()` (or seek and read a range) on each handle:

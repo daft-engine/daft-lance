@@ -9,6 +9,7 @@ import lance
 from daft.dependencies import pa
 from daft.io.object_store_options import io_config_to_storage_options
 from daft.logical.schema import Schema as DaftSchema
+from daft_lance._runtime import open_dataset
 from daft_lance.namespace import (
     DatasetOpenContext,
     get_namespace_commit_kwargs,
@@ -81,6 +82,7 @@ class LanceDatasetHandle:
             managed_versioning=self.managed_versioning,
             block_size=self.open_kwargs.get("block_size"),
             index_cache_size=self.open_kwargs.get("index_cache_size"),
+            index_cache_size_bytes=self.open_kwargs.get("index_cache_size_bytes"),
             metadata_cache_size_bytes=self.open_kwargs.get("metadata_cache_size_bytes"),
             # The stripped variant that was actually handed to pylance; the
             # unstripped copy on this handle is for Daft planning only.
@@ -210,7 +212,7 @@ def construct_lance_dataset_handle(
         kwargs["default_scan_options"] = original_default_scan_options
 
     dataset_uri = None if has_namespace_params(namespace_impl, table_id) else resolved_uri
-    dataset = lance.dataset(
+    dataset = open_dataset(
         dataset_uri,
         storage_options=merged_storage_options,
         version=version,
