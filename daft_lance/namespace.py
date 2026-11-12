@@ -36,7 +36,7 @@ from urllib.parse import unquote, urlparse
 import lance
 from lance_namespace import DeclareTableResponse, DescribeTableResponse, LanceNamespace
 
-from ._runtime import Session, clear_caches, open_dataset, session_for_open, shared_session
+from ._runtime import Session, _reset_session, open_dataset, session_for_open, shared_session
 
 _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "16"))
 
@@ -44,11 +44,6 @@ _NAMESPACE_CACHE_SIZE = int(os.environ.get("DAFT_LANCE_NAMESPACE_CACHE_SIZE", "1
 def get_shared_session() -> Session:
     """Return the runtime's process Session, honoring DAFT_LANCE_SHARE_SESSION."""
     return shared_session()
-
-
-def reset_shared_session() -> None:
-    """Release the runtime Session reference (primarily for tests)."""
-    clear_caches()
 
 
 def has_namespace_params(namespace_impl: str | None, table_id: list[str] | None) -> bool:

@@ -432,7 +432,7 @@ constrain later calls. Legacy `index_cache_size` is interpreted by Lance.
 
 Capacity environment variables affect only the default shared Session and must be
 nonnegative integers. Set them in driver and worker environments before first use.
-The Session lives until process exit or explicit `daft_lance.namespace.reset_shared_session()`.
+The Session lives until process exit; tests can reset its internal reference.
 Reset releases the global reference; existing Dataset handles remain usable and keep
 their Session. The next default open reads the current environment settings.
 There is no TTL or cleanup thread. Fork resets the global Session reference and lock;

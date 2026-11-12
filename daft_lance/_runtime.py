@@ -28,7 +28,7 @@ def _env_integer(name: str) -> int | None:
     return value
 
 
-def clear_caches() -> None:
+def _reset_session() -> None:
     """Release the global reference; active Dataset handles retain their Session."""
     global _session
     with _session_lock:

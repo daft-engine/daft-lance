@@ -7,7 +7,7 @@ import lance
 import pyarrow as pa
 import pytest
 
-from daft_lance._runtime import clear_caches, open_dataset, shared_session
+from daft_lance._runtime import _reset_session, open_dataset, shared_session
 from daft_lance.lance_data_sink import LanceDataSink
 from daft_lance.namespace import open_dataset_from_open_kwargs
 from daft_lance.utils import construct_lance_dataset_handle
@@ -15,9 +15,9 @@ from daft_lance.utils import construct_lance_dataset_handle
 
 @pytest.fixture(autouse=True)
 def reset_global_session():
-    clear_caches()
+    _reset_session()
     yield
-    clear_caches()
+    _reset_session()
 
 
 def test_concurrent_opens_share_session_and_keep_snapshot(tmp_path):
@@ -47,7 +47,7 @@ def test_explicit_capacity_is_independent(tmp_path, option, size):
     assert not custom.session().is_same_as(default.session())
     assert open_dataset(uri).session().is_same_as(default.session())
     assert custom.to_table().to_pydict() == {"a": [1]}
-    clear_caches()
+    _reset_session()
     custom_first = open_dataset(uri, **{option: size})
     assert not open_dataset(uri).session().is_same_as(custom_first.session())
 
@@ -62,7 +62,7 @@ def test_invalid_shared_configuration_and_reset(tmp_path, monkeypatch):
     assert custom.to_table().num_rows == 1
     monkeypatch.setenv("DAFT_LANCE_METADATA_CACHE_SIZE_BYTES", "1048576")
     first = open_dataset(uri)
-    clear_caches()
+    _reset_session()
     assert not first.session().is_same_as(open_dataset(uri).session())
     assert first.to_table().num_rows == 1
 

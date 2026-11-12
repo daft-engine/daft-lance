@@ -12,12 +12,12 @@ import pytest
 from pytest import TempPathFactory
 
 import daft
+from daft_lance._runtime import _reset_session
 from daft_lance._blob import read_blobs
 from daft_lance.namespace import (
     DatasetOpenContext,
     get_shared_session,
     open_dataset_from_open_kwargs,
-    reset_shared_session,
 )
 from daft_lance.utils import construct_lance_dataset_handle
 
@@ -42,7 +42,7 @@ def many_fragment_uri(tmp_path_factory: TempPathFactory) -> str:
 
 @pytest.fixture(autouse=True)
 def fresh_session() -> None:
-    reset_shared_session()
+    _reset_session()
 
 
 def test_get_shared_session_returns_one_session_per_process() -> None:
@@ -51,9 +51,9 @@ def test_get_shared_session_returns_one_session_per_process() -> None:
     assert same_session(first, get_shared_session())
 
 
-def test_reset_shared_session_builds_a_new_one() -> None:
+def test_internal_reset_builds_a_new_session() -> None:
     first = get_shared_session()
-    reset_shared_session()
+    _reset_session()
     assert not same_session(get_shared_session(), first)
 
 

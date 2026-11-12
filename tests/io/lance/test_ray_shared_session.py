@@ -30,13 +30,14 @@ def test_worker_opens_honor_session_sharing(tmp_path: Path, sharing: bool) -> No
 
     @daft.func.batch(return_dtype=daft.DataType.bool())
     def check(column: daft.Series) -> list[bool]:
-        from daft_lance.namespace import open_dataset_from_open_kwargs, reset_shared_session
+        from daft_lance._runtime import _reset_session
+        from daft_lance.namespace import open_dataset_from_open_kwargs
 
         assert os.getpid() != driver_pid
         previous = os.environ.get("DAFT_LANCE_SHARE_SESSION")
         try:
             os.environ["DAFT_LANCE_SHARE_SESSION"] = "1" if sharing else "0"
-            reset_shared_session()
+            _reset_session()
             first = open_dataset_from_open_kwargs(uri, open_kwargs)
             second = open_dataset_from_open_kwargs(uri, open_kwargs)
             maintenance = context.open_pinned()
@@ -51,7 +52,7 @@ def test_worker_opens_honor_session_sharing(tmp_path: Path, sharing: bool) -> No
                 os.environ.pop("DAFT_LANCE_SHARE_SESSION", None)
             else:
                 os.environ["DAFT_LANCE_SHARE_SESSION"] = previous
-            reset_shared_session()
+            _reset_session()
 
     result = daft.from_pydict({"x": [0]}).select(check(daft.col("x")).alias("ok")).to_pydict()
     assert result == {"ok": [True]}
