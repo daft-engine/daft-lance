@@ -1,13 +1,111 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
 
-from daft_lance import compact_files
+from daft_lance import compact_files, create_scalar_index, create_vector_index
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "IVF_FLAT"])
+@pytest.mark.parametrize(
+    "fragment_rows, fragment_group_size, expected_groups, expected_compacted_rows",
+    [
+        ([100] * 8, 4, [[0, 1, 2, 3], [4, 5, 6, 7]], [400, 400]),
+        ([5000] + [100] * 9, 2, [[0], [1, 2, 3], [4, 5], [6, 7], [8, 9]], [200, 200, 200, 300, 5000]),
+    ],
+    ids=["equal-fragments", "large-fragment-with-small-appends"],
+)
+def test_distributed_index_preserves_compaction(
+    tmp_path: Path,
+    index_type: str,
+    fragment_rows: list[int],
+    fragment_group_size: int,
+    expected_groups: list[list[int]],
+    expected_compacted_rows: list[int],
+) -> None:
+    """Index segments leave adjacent small fragments mergeable."""
+    uri = str(tmp_path / "indexed_compaction.lance")
+    total_rows = sum(fragment_rows)
+    table = pa.table(
+        {
+            "id": range(total_rows),
+            "value": range(total_rows),
+            "vector": pa.array([[float(i), float(i % 7)] for i in range(total_rows)], type=pa.list_(pa.float32(), 2)),
+        }
+    )
+    offset = 0
+    for rows in fragment_rows:
+        dataset = lance.write_dataset(
+            table.slice(offset, rows),
+            uri,
+            mode="create" if offset == 0 else "append",
+            max_rows_per_file=rows,
+            max_rows_per_group=rows,
+        )
+        offset += rows
+    assert [fragment.count_rows() for fragment in dataset.get_fragments()] == fragment_rows
+
+    if index_type == "BTREE":
+        # Equivalent builds on different columns must use the same boundaries.
+        for column in ["id", "value"]:
+            create_scalar_index(
+                uri,
+                column=column,
+                index_type="BTREE",
+                name=f"{column}_idx",
+                fragment_group_size=fragment_group_size,
+                max_concurrency=2,
+            )
+    else:
+        create_vector_index(
+            uri,
+            column="vector",
+            index_type="IVF_FLAT",
+            name="vector_idx",
+            fragment_group_size=fragment_group_size,
+            max_concurrency=2,
+            num_partitions=2,
+        )
+
+    dataset = lance.dataset(uri)
+    for index in dataset.describe_indices():
+        assert sorted(sorted(segment.fragment_ids) for segment in index.segments) == expected_groups
+
+    query_id = fragment_rows[0] + 23
+
+    def check_query(dataset: lance.LanceDataset) -> None:
+        if index_type == "BTREE":
+            scanner = dataset.scanner(filter=f"id >= {query_id} AND value < {query_id + 10}", columns=["id"])
+            assert "ScalarIndexQuery" in scanner.explain_plan()
+            expected_ids = list(range(query_id, query_id + 10))
+        else:
+            scanner = dataset.scanner(
+                nearest={"column": "vector", "q": [float(query_id), float(query_id % 7)], "k": 1}, columns=["id"]
+            )
+            assert "ANNSubIndex" in scanner.explain_plan()
+            expected_ids = [query_id]
+        assert sorted(cast(list[int], scanner.to_table()["id"].to_pylist())) == expected_ids
+
+    check_query(dataset)
+    metrics = compact_files(
+        uri,
+        compaction_options={"target_rows_per_fragment": 1000, "num_threads": 1},
+        partition_num=2,
+        concurrency=2,
+    )
+    assert metrics is not None
+    assert metrics.fragments_removed == sum(len(group) for group in expected_groups if len(group) > 1)
+    assert metrics.fragments_added == sum(len(group) > 1 for group in expected_groups)
+
+    dataset = lance.dataset(uri)
+    assert sorted(fragment.count_rows() for fragment in dataset.get_fragments()) == expected_compacted_rows
+    assert dataset.to_table().sort_by("id") == table
+    check_query(dataset)
 
 
 def create_dataset_with_fragments(path: Path, fragment_data: list[pd.DataFrame]):
