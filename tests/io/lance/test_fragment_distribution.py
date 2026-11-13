@@ -27,6 +27,36 @@ def test_equal_fragments_form_contiguous_groups() -> None:
 
 
 @pytest.mark.parametrize(
+    "rows, fragment_group_size, expected_lengths",
+    [
+        ([5000] + [100] * 9, 2, [1, 3, 2, 2, 2]),
+        ([1_000_000] + [1000] * 99, 10, [1, 7, 6, 12, 13, 12, 13, 12, 12, 12]),
+        ([0] * 8, 2, [2, 2, 2, 2]),
+    ],
+)
+def test_missing_groups_split_heaviest_run(
+    rows: list[int], fragment_group_size: int, expected_lengths: list[int]
+) -> None:
+    fragments = [_Fragment(i, count) for i, count in enumerate(rows)]
+
+    groups = distribute_fragments_balanced(fragments, fragment_group_size)
+
+    assert [len(group["fragment_ids"]) for group in groups] == expected_lengths
+    assert [fid for group in groups for fid in group["fragment_ids"]] == list(range(len(rows)))
+
+
+def test_fragment_ids_determine_order_without_mutating_input() -> None:
+    fragments = [_Fragment(i, 100) for i in [20, 3, 10, 0, 30, 7]]
+
+    assert distribute_fragments_balanced(fragments, 2) == [
+        {"fragment_ids": [0, 3]},
+        {"fragment_ids": [7, 10]},
+        {"fragment_ids": [20, 30]},
+    ]
+    assert [fragment.fragment_id for fragment in fragments] == [20, 3, 10, 0, 30, 7]
+
+
+@pytest.mark.parametrize(
     "rows",
     [
         [],
@@ -37,12 +67,13 @@ def test_equal_fragments_form_contiguous_groups() -> None:
         [10, 1, 1, 1, 1, 10],
         [2, 3, 8, 1, 6],
         [2**60, 2**60 + 1, 0, 1],
+        [5000] + [100] * 9,
+        [0, 0, 10000, 0, 0, 0, 0, 0],
     ],
 )
 @pytest.mark.parametrize("fragment_group_size", [1, 2, 3, 4, 8, 10])
 def test_contiguous_groups_minimize_maximum_rows(rows: list[int], fragment_group_size: int) -> None:
-    # Dataset order determines adjacency, not numerical fragment ID order.
-    fragments = [_Fragment(100 - i * 3, count) for i, count in enumerate(rows)]
+    fragments = [_Fragment(10 + i * 3, count) for i, count in enumerate(rows)]
     groups = distribute_fragments_balanced(fragments, fragment_group_size)
     batches = [group["fragment_ids"] for group in groups]
 

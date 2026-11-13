@@ -722,7 +722,7 @@ def create_scalar_index(
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
         fragment_group_size: Target number of fragments per index segment. Defaults to 10;
             must be positive. Determines the segment count as ceil(fragment_count / fragment_group_size).
-            Selected fragments are grouped in dataset order, minimizing the largest group's row count;
+            Selected fragments are sorted by fragment ID (dataset order), minimizing the largest group's row count;
             this is not a hard limit on fragments per group. Contiguous coverage preserves compaction
             opportunities within each segment.
         num_partitions: Optional number of partitions to use when repartitioning fragment batches before execution. Only values
@@ -920,7 +920,7 @@ def create_vector_index(
         metadata_cache_size_bytes: Size of the metadata cache in bytes.
         fragment_group_size: Target number of fragments per index segment. Defaults to 10;
             must be positive. Determines the segment count as ceil(fragment_count / fragment_group_size).
-            Contiguous groups in dataset order minimize the largest group's row count;
+            Contiguous groups sorted by fragment ID (dataset order) minimize the largest group's row count;
             this is not a hard limit on fragments per group. Each group becomes one independently
             built segment, preserving compaction opportunities within that segment.
         max_concurrency: Maximum number of concurrent tasks for fragment batches.

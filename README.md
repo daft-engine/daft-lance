@@ -46,12 +46,17 @@ transaction as the new ones (the index type may change on a full rebuild;
 the column may not — drop the index or use a different name for that).
 `replace=False` rejects an existing name.
 
-Scalar and vector index builds partition the selected fragments in dataset
-order into `ceil(fragment_count / fragment_group_size)` non-empty segments
+Scalar and vector index builds partition the selected fragments by ascending
+fragment ID (dataset order) into `ceil(fragment_count / fragment_group_size)` non-empty segments
 (`fragment_group_size` defaults to 10). Within this fixed segment count,
 contiguous groups minimize the largest group's row count; the parameter is
-not a hard limit on fragments per group. Identical ordered fragments, row
-counts, and group sizes produce identical boundaries across index builds.
+not a hard limit on fragments per group. If the initial partition has fewer
+segments, the heaviest splittable segment is repeatedly split near half its
+rows to avoid leaving a tail of single-fragment segments. To align boundaries
+across multiple indexes, build from the same dataset state with the same
+selected fragments and grouping parameters. Too many segments can increase
+index loading and query overhead, so avoid setting `fragment_group_size`
+too small.
 This preserves opportunities to compact adjacent small fragments within a
 segment, although compaction still cannot cross different index-coverage
 boundaries. Partial scalar builds may leave gaps between selected fragments.
