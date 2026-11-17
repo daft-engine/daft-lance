@@ -43,8 +43,8 @@ single-node indexing.
 `replace=True` (the default) atomically swaps an existing index of the same
 name: the segment commit retires the old overlapped segments in the same
 transaction as the new ones (the index type may change on a full rebuild;
-the column may not — drop the index or use a different name for that).
-`replace=False` rejects an existing name.
+the column may not — drop the index with `drop_index` or use a different
+name for that). `replace=False` rejects an existing name.
 
 #### Partial Builds and Incremental Backfill
 
@@ -192,6 +192,24 @@ incompatible old SQ segments.
 Training runs in the coordinator process. Its memory footprint grows with
 `num_partitions * sample_rate * dimension` for IVF and
 `2**num_bits * sample_rate * dimension` for PQ.
+
+### Dropping Indexes
+
+`drop_index` removes one index by name and works for scalar and vector
+indexes alike. Dropping is a single driver-side atomic commit — queries on
+the indexed column fall back to full scans afterwards. Index names are not
+column names: generated names follow pylance's convention (`<column>_idx`),
+and `dataset.describe_indices()` lists the actual ones.
+
+```python
+from daft_lance import drop_index
+
+updated = drop_index("s3://bucket/my_dataset", name="name_idx")
+```
+
+An unknown name raises `ValueError` listing the available indexes. Pass
+`if_missing=True` to treat a missing index as a no-op that commits no new
+version — useful for idempotent cleanup.
 
 
 ### Column Merging
