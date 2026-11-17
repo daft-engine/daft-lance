@@ -5,9 +5,11 @@ except ImportError:
 
 from ._blob import read_blobs, take_blobs
 from ._lance import (
+    cleanup_old_versions,
     compact_files,
     create_scalar_index,
     create_vector_index,
+    drop_index,
     merge_columns,
     merge_columns_df,
     optimize_indices,
@@ -20,9 +22,11 @@ from .lance_update_column import UpdateColumnsResult
 
 __all__ = [
     "UpdateColumnsResult",
+    "cleanup_old_versions",
     "compact_files",
     "create_scalar_index",
     "create_vector_index",
+    "drop_index",
     "merge_columns",
     "merge_columns_df",
     "optimize_indices",
