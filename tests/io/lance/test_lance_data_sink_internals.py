@@ -188,3 +188,21 @@ def test_prepare_arrow_table_missing_column_rejected(tmp_path):
     missing_col = pa.table({"a": pa.array([2], type=pa.int64())})
     with pytest.raises(Exception):  # any error is fine; the redesign currently relies on the cast to fail
         sink._prepare_arrow_table(missing_col)
+
+
+def test_append_or_create_missing_resolves_to_create(tmp_path):
+    """append_or_create with no existing dataset resolves to a physical create."""
+    schema = pa.schema([("a", pa.int64())])
+    sink = LanceDataSink(uri=str(tmp_path / f"missing-{uuid.uuid4()}"), schema=schema, mode="append_or_create")
+    sink.start()
+    assert sink._write_mode == "create"
+
+
+def test_append_or_create_existing_resolves_to_append(tmp_path):
+    """append_or_create with an existing dataset resolves to a physical append."""
+    uri = str(tmp_path / "existing")
+    lance.write_dataset(pa.table({"a": [1]}), uri)
+
+    sink = LanceDataSink(uri=uri, schema=pa.schema([("a", pa.int64())]), mode="append_or_create")
+    sink.start()
+    assert sink._write_mode == "append"

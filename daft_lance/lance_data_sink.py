@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # commit path reads the normalized value, because a check that forgets the new
 # mode fails silently (see resolve_storage_version, which would skip the
 # storage-version compatibility check entirely).
-LancePhysicalWriteMode = Literal["create", "append", "overwrite"]
+LancePhysicalWriteMode = Literal["create", "append", "overwrite", "append_or_create"]
 
 
 def _dataset_stats(dataset: lance.LanceDataset) -> MicroPartition:
@@ -75,7 +75,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         self,
         uri: str | pathlib.Path | None,
         schema: Schema | pa.Schema,
-        mode: Literal["create", "append", "overwrite", "insert_overwrite"] = "create",
+        mode: Literal["create", "append", "overwrite", "insert_overwrite", "append_or_create"] = "create",
         io_config: IOConfig | None = None,
         *,
         overwrite_where: str | None = None,
@@ -166,6 +166,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         existing = self._absorb_existing_dataset()
         existing_version = getattr(existing, "data_storage_version", None) if existing is not None else None
+        # _absorb_existing_dataset already resolved append_or_create to "create" or
+        # "append", so only the physical modes reach resolve_storage_version.
+        assert self._write_mode != "append_or_create"
         self._data_storage_version = resolve_storage_version(
             self._requested_storage_version,
             existing_version,
@@ -224,7 +227,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _resolve_table(self) -> ResolvedNamespaceTable:
         if self._uri is not None:
             return ResolvedNamespaceTable(uri=str(self._uri))
-        mode = self._write_mode if self._write_mode in ("create", "overwrite") else "read"
+        mode = self._write_mode if self._write_mode in ("create", "overwrite", "append_or_create") else "read"
         resolved = resolve_namespace_table(
             namespace_impl=self._namespace_impl,
             namespace_properties=self._namespace_properties,
@@ -248,7 +251,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
     @staticmethod
     def _reject_unsupported_modes(
-        mode: Literal["create", "append", "overwrite", "insert_overwrite"],
+        mode: Literal["create", "append", "overwrite", "insert_overwrite", "append_or_create"],
         use_legacy_format: bool | None,
     ) -> None:
         # This mode was never functional and customers must use merge_columns_df.
@@ -270,7 +273,7 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
     @staticmethod
     def _validate_insert_overwrite(
-        mode: Literal["create", "append", "overwrite", "insert_overwrite"],
+        mode: Literal["create", "append", "overwrite", "insert_overwrite", "append_or_create"],
         overwrite_where: str | None,
         use_mem_wal: bool,
     ) -> None:
@@ -360,6 +363,9 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         if dataset is None:
             if self._write_mode == "append":
                 raise ValueError(f"Cannot {self._mode} to non-existent Lance dataset.")
+            # Target does not exist: append_or_create degrades to "create".
+            if self._write_mode == "append_or_create":
+                self._write_mode = "create"
             if self._write_mode == "create" and self._storage_options is None and self._table_uri is not None:
                 p = pathlib.Path(self._table_uri)
                 if p.is_file():
@@ -375,6 +381,10 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
                 "Cannot create a Lance dataset at a location where one already exists. "
                 'Use mode="overwrite" to replace it or mode="append" to add to it.'
             )
+
+        # Target already exists: append_or_create degrades to "append".
+        if self._write_mode == "append_or_create":
+            self._write_mode = "append"
 
         if self._write_mode == "append" and not _pyarrow_schema_castable(
             blob_aware_schema_for_validation(self._pyarrow_schema, table_schema),
@@ -648,10 +658,13 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
 
         assert self._effective_pyarrow_schema is not None, "LanceDataSink.start() must run before finalize"
         operation: lance.LanceOperation.BaseOperation
-        if self._mode == "create" or self._mode == "overwrite":
-            operation = lance.LanceOperation.Overwrite(self._effective_pyarrow_schema, fragments)
-        elif self._mode == "append":
+        # insert_overwrite returned above. create/append/overwrite are used
+        # directly; append_or_create was already resolved to one of them by
+        # _absorb_existing_dataset() in start(), so this is the effective mode.
+        if self._write_mode == "append":
             operation = lance.LanceOperation.Append(fragments)
+        else:
+            operation = lance.LanceOperation.Overwrite(self._effective_pyarrow_schema, fragments)
 
         assert self._table_uri is not None, "LanceDataSink.start() must run before finalize"
         # Unlike lance.dataset(), commit() requires a str base_uri even when a
